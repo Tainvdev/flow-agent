@@ -151,6 +151,34 @@ func TestBrokerModeOptsIntoThePage(t *testing.T) {
 	}
 }
 
+func TestBrokerModeWiresProfileOperationToBrowserProviders(t *testing.T) {
+	profileOperation := func(context.Context, *cdp.Client, func() error) error { return nil }
+	built := BuildWithProfileOperation("broker", nil, cdp.New(nil), nil,
+		func() *cdp.Client { return cdp.New(nil) }, "", profileOperation)
+	chain, ok := built.(*Chain)
+	if !ok {
+		t.Fatalf("broker mode should build a chain, got %T", built)
+	}
+	for _, provider := range chain.providers {
+		switch p := provider.(type) {
+		case *FlowProvider:
+			if p.profileOperation == nil {
+				t.Error("flow.captcha provider is missing the profile operation guard")
+			}
+		case *BrokerProvider:
+			if p.profileOperation == nil {
+				t.Error("broker provider is missing the profile operation guard")
+			}
+		case *HTTPProvider:
+			// HTTP captcha does not use the browser tab and must not take its lock.
+		case EmptyProvider:
+			// Empty provider is the terminal no-token fallback.
+		default:
+			t.Errorf("unexpected provider type %T", provider)
+		}
+	}
+}
+
 // TestAutoChainOmitsTheFlowProviderWithoutAResolver keeps the old behaviour
 // reachable: a caller that cannot resolve a client gets the chain it had before.
 func TestAutoChainOmitsTheFlowProviderWithoutAResolver(t *testing.T) {

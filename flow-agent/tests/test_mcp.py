@@ -121,8 +121,11 @@ class FakeEngine:
         self.calls.append(("stats", {}))
         return self.result
 
-    async def upload_video(self, file_path):
-        self.calls.append(("upload", {"file_path": file_path}))
+    async def upload_video(self, file_path, account_id=None):
+        upload = {"file_path": file_path}
+        if account_id is not None:
+            upload["account_id"] = account_id
+        self.calls.append(("upload", upload))
         if self.raises:
             raise self.raises
         return self.result
@@ -146,7 +149,7 @@ async def test_tools_call_generates_an_image(fake_engine):
     assert "isError" not in body["result"]
     assert fake_engine.calls == [
         ("image", {"prompt": "a boat", "aspect": "16:9", "count": 2,
-                   "all_accounts": False})
+                   "all_accounts": False, "account_id": None})
     ]
 
 
@@ -170,6 +173,17 @@ async def test_tools_call_defaults_are_applied(fake_engine):
     assert kwargs["aspect"] == "16:9"
     assert kwargs["duration"] == "8s"
     assert kwargs["quality"] == "720p"
+
+
+async def test_tool_accepts_a_registered_account_id(fake_engine):
+    await reply(
+        "tools/call",
+        params={
+            "name": "flow_generate_image",
+            "arguments": {"prompt": "x", "account_id": "acct-1"},
+        },
+    )
+    assert fake_engine.calls[-1][1]["account_id"] == "acct-1"
 
 
 async def test_a_missing_argument_is_an_error_result_not_a_crash(fake_engine):
@@ -213,6 +227,20 @@ async def test_upload_passes_the_path_through(fake_engine):
         params={"name": "flow_upload_video", "arguments": {"file_path": "/tmp/a.mp4"}},
     )
     assert fake_engine.calls[-1] == ("upload", {"file_path": "/tmp/a.mp4"})
+
+
+async def test_upload_preserves_an_explicit_account_pin(fake_engine):
+    await reply(
+        "tools/call",
+        params={
+            "name": "flow_upload_video",
+            "arguments": {"file_path": "/tmp/a.mp4", "account_id": "acct-1"},
+        },
+    )
+    assert fake_engine.calls[-1] == (
+        "upload",
+        {"file_path": "/tmp/a.mp4", "account_id": "acct-1"},
+    )
 
 
 # --------------------------------------------------------------------------- #

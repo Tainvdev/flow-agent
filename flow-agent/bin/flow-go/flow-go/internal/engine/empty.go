@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/kodelyx/flow-go/flow-go/internal/batchexecute"
 )
@@ -52,6 +53,17 @@ type EmptyResultError struct {
 	// the transport.
 	Hint string
 }
+
+// Throttled identifies an explicit Flow rate refusal so the service can park
+// this account instead of immediately routing more work to it.
+func (e *EmptyResultError) Throttled() bool {
+	return strings.Contains(e.Rejected, "TOO_MUCH_TRAFFIC")
+}
+
+type InsufficientCreditsError struct{ Message string }
+
+func (e *InsufficientCreditsError) Error() string             { return e.Message }
+func (e *InsufficientCreditsError) InsufficientCredits() bool { return true }
 
 func (e *EmptyResultError) Error() string {
 	msg := fmt.Sprintf("engine: the transport accepted the %s request and returned no %s",

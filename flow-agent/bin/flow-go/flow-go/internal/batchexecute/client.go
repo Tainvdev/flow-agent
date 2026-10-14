@@ -415,6 +415,59 @@ type Client struct {
 	subNext time.Time
 }
 
+// SubmissionUnknownError marks an upstream write whose transport outcome cannot
+// prove whether Flow accepted it. Callers must not replay the write blindly.
+type SubmissionUnknownError struct {
+	RPCID string
+	Err   error
+}
+
+// HTTPThrottleError is an explicit HTTP rate rejection. Generation RPCs are
+// safe to resubmit after this response because Flow rejected the request before
+// accepting a generation; other RPCs still cool the account but are not replayed
+// automatically (for example, an upload may have partially completed).
+type HTTPThrottleError struct {
+	RPCID  string
+	Status int
+	Body   string
+}
+
+func (e *HTTPThrottleError) Error() string {
+	return fmt.Sprintf("batchexecute: %s returned %d: %s", e.RPCID, e.Status, e.Body)
+}
+
+func (e *HTTPThrottleError) SafeToRetry() bool {
+	return e.Status == 429 && submissionRPCs[e.RPCID]
+}
+
+func (e *HTTPThrottleError) RetryClass() string { return "account_throttle" }
+func (e *HTTPThrottleError) Throttled() bool    { return e.Status == 429 }
+
+func (e *SubmissionUnknownError) Error() string {
+	return fmt.Sprintf("batchexecute: %s submission outcome is unknown: %v", e.RPCID, e.Err)
+}
+
+func (e *SubmissionUnknownError) Unwrap() error           { return e.Err }
+func (e *SubmissionUnknownError) SubmissionUnknown() bool { return true }
+
+func submissionUnknown(rpcID string, err error) error {
+	if submissionRPCs[rpcID] || rpcID == RPCIDUploadMedia {
+		return &SubmissionUnknownError{RPCID: rpcID, Err: err}
+	}
+	return err
+}
+
+func responseStatusError(rpcID string, status int, body string) error {
+	err := fmt.Errorf("batchexecute: %s returned %d: %s", rpcID, status, body)
+	if status == 429 {
+		return &HTTPThrottleError{RPCID: rpcID, Status: status, Body: body}
+	}
+	if status >= 500 {
+		return submissionUnknown(rpcID, err)
+	}
+	return err
+}
+
 // SetAuthUser selects which signed-in Google account these calls act as.
 //
 // Zero is the default and needs no parameter, so it is emitted as nothing rather
@@ -1063,16 +1116,17 @@ func (c *Client) post(ctx context.Context, rpcID string,
 				AllowQUIC:   false,
 			})
 			if err != nil {
-				return nil, fmt.Errorf("batchexecute: %s request failed: %w", rpcID, err)
+				return nil, submissionUnknown(rpcID, fmt.Errorf("batchexecute: %s request failed: %w", rpcID, err))
 			}
 
 			if resp.Status == 200 {
 				return resp, nil
 			}
 
-			// A rejected first attempt may be carrying the anti-CSRF token we
-			// need. A 401 never does, so it falls through to the caller.
-			if attempt == 1 {
+			// Only the expected 400 anti-CSRF challenge is safe to resend here.
+			// In particular, do not treat an unrelated 429/5xx body that happens
+			// to contain an XSRF-looking value as permission to repeat a write.
+			if attempt == 1 && resp.Status == 400 {
 				if token := extractXSRF(resp.Text()); token != "" {
 					c.setToken(token)
 					// Worth a line: this resend is the path that used to
@@ -1098,8 +1152,8 @@ func (c *Client) post(ctx context.Context, rpcID string,
 	}
 
 	if resp.Status != 401 {
-		return nil, fmt.Errorf("batchexecute: %s returned %d: %s",
-			rpcID, resp.Status, truncate(resp.Text(), 300))
+		body := truncate(resp.Text(), 300)
+		return nil, responseStatusError(rpcID, resp.Status, body)
 	}
 
 	// A 401 is the session, not the request.
@@ -1313,7 +1367,15 @@ func retryIfEmpty(ctx context.Context, opts CallOptions, frames []Frame,
 	empty func([]Frame) bool,
 	submit func(token string) ([]Frame, error)) ([]Frame, error) {
 
-	if opts.RefreshCaptcha == nil || !empty(frames) {
+	if !empty(frames) {
+		return frames, nil
+	}
+	if reason := UpstreamError(frames); IsPolicyRefusal(reason) {
+		// A model/policy denial is an explicit decision about the request. A new
+		// captcha, another account, or an automatic retry cannot make it valid.
+		return frames, &RejectedError{Reason: reason, Frames: len(frames)}
+	}
+	if opts.RefreshCaptcha == nil {
 		return frames, nil
 	}
 
@@ -3000,6 +3062,15 @@ func (c *Client) ProjectAssets(ctx context.Context, projectID string) ([]Project
 // an error when the render is not ready yet, which the caller is expected to
 // retry.
 func (c *Client) ResolveVideoURL(ctx context.Context, projectID, mediaID string) (string, error) {
+	return c.resolveMediaURL(ctx, projectID, mediaID, "video")
+}
+
+// ResolveImageURL returns a fresh signed download URL for a generated image.
+func (c *Client) ResolveImageURL(ctx context.Context, projectID, mediaID string) (string, error) {
+	return c.resolveMediaURL(ctx, projectID, mediaID, "image")
+}
+
+func (c *Client) resolveMediaURL(ctx context.Context, projectID, mediaID, kind string) (string, error) {
 	assets, err := c.ProjectAssets(ctx, projectID)
 	if err != nil {
 		return "", err
@@ -3029,12 +3100,11 @@ func (c *Client) ResolveVideoURL(ctx context.Context, projectID, mediaID string)
 		return "", err
 	}
 	for _, item := range media {
-		if item.Kind == "video" && item.URL != "" {
+		if item.Kind == kind && item.URL != "" {
 			return item.URL, nil
 		}
 	}
-	return "", fmt.Errorf("batchexecute: no video URL for %s yet (still rendering?): %w",
-		mediaID, ErrAssetNotReady)
+	return "", fmt.Errorf("batchexecute: no %s URL for %s yet (still rendering?): %w", kind, mediaID, ErrAssetNotReady)
 }
 
 // ParseFrames walks a batchexecute response.
@@ -3146,6 +3216,16 @@ func UpstreamError(frames []Frame) string {
 // reason — a wrong model, a project belonging to another account — is answered
 // by changing the request, not by minting again.
 const ReasonUnusualActivity = "PUBLIC_ERROR_UNUSUAL_ACTIVITY"
+
+// ReasonModelAccessDenied is a request/model policy refusal. It must be
+// surfaced without retrying the generation with a fresh captcha or account.
+const ReasonModelAccessDenied = "PUBLIC_ERROR_MODEL_ACCESS_DENIED"
+
+// IsPolicyRefusal reports explicit model-access denials, including future
+// reason suffixes in the same family.
+func IsPolicyRefusal(reason string) bool {
+	return strings.HasPrefix(reason, ReasonModelAccessDenied)
+}
 
 // IsUnusualActivity reports whether a reason is the assessment refusing the
 // token, including the suffixed variants of that refusal.

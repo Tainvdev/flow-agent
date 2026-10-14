@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -70,9 +71,15 @@ type Bridge struct {
 	// BlockedMethods is the CDP deny-list handed to the extension.
 	BlockedMethods []string
 
-	mu      sync.RWMutex
-	clients map[string]*cdp.Client
-	current *cdp.Client
+	// OnCookieSync is called after a complete account bundle has been persisted.
+	// Long-lived services use it to invalidate that account's cached runtime.
+	// Set it before Listen starts.
+	OnCookieSync func(CookieUpdate)
+
+	mu             sync.RWMutex
+	clients        map[string]*cdp.Client
+	current        *cdp.Client
+	accountClients map[string]*cdp.Client
 
 	// lastJar is the most recent cookie set pulled from the browser.
 	lastJar *cookiejar.Jar
@@ -86,6 +93,16 @@ type Bridge struct {
 	// has closed still has an account the engine can resolve and route to, which
 	// is the same reason `cookies.json` is written to disk at all.
 	jars map[string]*cookiejar.Jar
+
+	// cookieSyncs serializes full snapshots per extension, including when an
+	// account-scoped engine refreshes the same browser session.
+	cookieSyncs *cookieSyncRegistry
+
+	// profileOperations serializes sequences that depend on or mutate the
+	// profile's currently attached tab. Different account views may share one
+	// extension client and therefore one mutable tab even though their jars and
+	// engines are isolated.
+	profileOperations *profileOperationRegistry
 
 	// cookieFile persists the last synced cookies so the engine can keep running
 	// after the browser closes, which is the whole point of syncing them.
@@ -103,10 +120,43 @@ type Bridge struct {
 	// stale together — a fleet hitting a 401 at the same moment would otherwise
 	// each attach to the same tab and wait out the whole pause. Serialising
 	// collapses that to one round trip.
-	refreshMu sync.Mutex
+	refreshMu  sync.Mutex
+	refreshing *sessionRefresh
 	// lastRefresh is when the last refresh completed, so a caller that arrived
 	// while one was in flight can reuse it rather than repeating it.
 	lastRefresh time.Time
+}
+
+type cookieSyncRegistry struct {
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
+}
+
+type profileOperationRegistry struct {
+	mu    sync.Mutex
+	locks map[string]*profileOperationLock
+}
+
+type profileOperationLock struct {
+	gate chan struct{}
+	refs int
+}
+
+type sessionRefresh struct {
+	done    chan struct{}
+	jar     *cookiejar.Jar
+	err     error
+	waiters int
+}
+
+// CookieUpdate is an authoritative cookie snapshot saved for one account.
+type CookieUpdate struct {
+	Client    *cdp.Client
+	AccountID string
+	Bundle    *cookiejar.Bundle
+	Jar       *cookiejar.Jar
+	Path      string
+	SyncedAt  time.Time
 }
 
 // RefreshCoalesceWindow is how long a completed session refresh is treated as
@@ -124,14 +174,73 @@ const DefaultListenAddr = "127.0.0.1:9222"
 // NewBridge builds a bridge with the given allowlists.
 func NewBridge(targets, cookieDomains []string, dataDir string) *Bridge {
 	return &Bridge{
-		Targets:        targets,
-		CookieDomains:  cookieDomains,
-		DataDir:        dataDir,
-		BlockedMethods: DefaultBlockedMethods,
-		clients:        make(map[string]*cdp.Client),
-		jars:           make(map[string]*cookiejar.Jar),
-		cookieFile:     filepath.Join(dataDir, "cookies.json"),
+		Targets:           targets,
+		CookieDomains:     cookieDomains,
+		DataDir:           dataDir,
+		BlockedMethods:    DefaultBlockedMethods,
+		clients:           make(map[string]*cdp.Client),
+		accountClients:    make(map[string]*cdp.Client),
+		jars:              make(map[string]*cookiejar.Jar),
+		cookieSyncs:       &cookieSyncRegistry{locks: make(map[string]*sync.Mutex)},
+		profileOperations: &profileOperationRegistry{locks: make(map[string]*profileOperationLock)},
+		cookieFile:        filepath.Join(dataDir, "cookies.json"),
 	}
+}
+
+func (b *Bridge) acquireProfileOperation(ctx context.Context, client *cdp.Client) (func(), error) {
+	if client == nil {
+		return nil, fmt.Errorf("bridge: no extension connected")
+	}
+	// RemoteAddr identifies a TCP peer, not a browser profile: test clients and
+	// local proxy connections can share it. AccountView deliberately reuses the
+	// same *cdp.Client for accounts on one profile, so client identity is the
+	// stable key for the mutable tab they share.
+	key := fmt.Sprintf("%p", client)
+	b.profileOperations.mu.Lock()
+	lock := b.profileOperations.locks[key]
+	if lock == nil {
+		lock = &profileOperationLock{gate: make(chan struct{}, 1)}
+		b.profileOperations.locks[key] = lock
+	}
+	lock.refs++
+	b.profileOperations.mu.Unlock()
+	select {
+	case lock.gate <- struct{}{}:
+		var once sync.Once
+		return func() {
+			once.Do(func() {
+				<-lock.gate
+				b.profileOperations.mu.Lock()
+				lock.refs--
+				if lock.refs == 0 && b.profileOperations.locks[key] == lock {
+					delete(b.profileOperations.locks, key)
+				}
+				b.profileOperations.mu.Unlock()
+			})
+		}, nil
+	case <-ctx.Done():
+		b.profileOperations.mu.Lock()
+		lock.refs--
+		if lock.refs == 0 && b.profileOperations.locks[key] == lock {
+			delete(b.profileOperations.locks, key)
+		}
+		b.profileOperations.mu.Unlock()
+		return nil, ctx.Err()
+	}
+}
+
+// WithProfileOperation runs one tab-dependent operation while preventing
+// another account view of the same CDP client from changing the current tab.
+func (b *Bridge) WithProfileOperation(ctx context.Context, client *cdp.Client, operation func() error) error {
+	if operation == nil {
+		return fmt.Errorf("bridge: profile operation is nil")
+	}
+	release, err := b.acquireProfileOperation(ctx, client)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return operation()
 }
 
 // EnsureToken is a no-op kept for backwards compatibility.
@@ -145,6 +254,7 @@ func (b *Bridge) claim() {}
 
 // Listen starts the WebSocket server. Blocks until ctx is cancelled.
 func (b *Bridge) Listen(ctx context.Context) error {
+	listenStarted := time.Now()
 	addr := b.ListenAddr
 	if addr == "" {
 		addr = DefaultListenAddr
@@ -155,6 +265,7 @@ func (b *Bridge) Listen(ctx context.Context) error {
 		Addr:  addr,
 		Token: "",
 		OnConnect: func(client *cdp.Client) {
+			log.Printf("service_metric phase=bridge_attach elapsed_ms=%d remote=%q", time.Since(listenStarted).Milliseconds(), client.RemoteAddr)
 			b.add(client)
 			go b.onConnect(ctx, client)
 		},
@@ -219,11 +330,37 @@ func (b *Bridge) onConnect(ctx context.Context, client *cdp.Client) {
 
 	// Watch for disconnects so `current` does not point at a dead socket.
 	events, cancel := client.Subscribe(32)
-	defer cancel()
 	go func() {
-		for ev := range events {
-			if ev.Name == "cdp.detached" {
+		defer cancel()
+		for {
+			var ev cdp.Event
+			select {
+			case <-ctx.Done():
+				return
+			case <-client.Done():
+				return
+			case next, ok := <-events:
+				if !ok {
+					return
+				}
+				ev = next
+			}
+			switch ev.Name {
+			case "cdp.detached":
 				log.Printf("bridge: extension detached: %s", string(ev.Params))
+			case "bridge.cookies_rotated":
+				// The event payload contains only cookie names for removals and
+				// values for additions. Pulling the scoped snapshot gives us the
+				// authoritative state, including domain/path and removals.
+				syncCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+				jar, syncErr := b.SyncCookies(syncCtx, client)
+				cancel()
+				if syncErr != nil {
+					log.Printf("bridge: cookie rotation sync failed for %s: %v", client.RemoteAddr, syncErr)
+					continue
+				}
+				log.Printf("bridge: refreshed %d cookies after browser rotation from %s",
+					jar.Count(), client.RemoteAddr)
 			}
 		}
 	}()
@@ -315,6 +452,21 @@ func (b *Bridge) SyncCookies(ctx context.Context, client *cdp.Client) (*cookieja
 	if client == nil {
 		return nil, fmt.Errorf("bridge: no extension connected")
 	}
+	releaseProfile, err := b.acquireProfileOperation(ctx, client)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseProfile()
+	return b.syncCookiesLocked(ctx, client)
+}
+
+// syncCookiesLocked reads a profile snapshot while the caller owns its
+// profile-operation permit. It still uses the narrower cookie-sync lock so two
+// callers cannot race bundle persistence through independent bridge views.
+func (b *Bridge) syncCookiesLocked(ctx context.Context, client *cdp.Client) (*cookiejar.Jar, error) {
+	lock := b.cookieSyncLock(client.RemoteAddr)
+	lock.Lock()
+	defer lock.Unlock()
 
 	// Query per domain so the extension's scope check passes, and so a failure
 	// on one domain does not lose the others.
@@ -380,11 +532,6 @@ func (b *Bridge) SyncCookies(ctx context.Context, client *cdp.Client) (*cookieja
 	}
 	jar := cookiejar.FromCookies(converted, source)
 
-	b.mu.Lock()
-	b.lastJar = jar
-	b.jars[client.RemoteAddr] = jar
-	b.mu.Unlock()
-
 	// Only ever per account.
 	//
 	// `cookies.json` used to be written here too, and it is what made a
@@ -398,24 +545,107 @@ func (b *Bridge) SyncCookies(ctx context.Context, client *cdp.Client) (*cookieja
 		// Nothing here identifies an account, so there is no file this could
 		// correctly be written to. Saying so beats inventing a name — a shared
 		// file is the thing being removed.
-		log.Printf("bridge: synced %d cookies (%d credential cookies, %d unrelated dropped) from %s, "+
-			"but none of them identify an account, so nothing was persisted",
-			jar.Count(), countAuth(jar), skipped, client.RemoteAddr)
-		return jar, nil
+		return nil, fmt.Errorf("bridge: synced cookies from %s but they do not identify a Flow account; refusing to publish an unbound session", client.RemoteAddr)
 	}
 
 	path := b.AccountCookieFile(key)
 	bundle := b.bundleFor(ctx, client, jar, path)
-	if err := bundle.Save(path); err != nil {
+	bundle.AccountID = key
+	if err := b.persistCookieSnapshot(client, jar, bundle, path); err != nil {
 		log.Printf("bridge: could not persist the account bundle for %s: %v", key, err)
-	} else {
-		log.Printf("bridge: synced %d cookies (%d credential cookies, %d unrelated dropped) from %s to %s "+
-			"(project %q, page tokens %t, fingerprint %t)",
-			jar.Count(), countAuth(jar), skipped, client.RemoteAddr, path,
-			bundle.ProjectID, bundle.At != "" && bundle.Fsid != "", !bundle.Fingerprint.Empty())
+		return nil, err
 	}
+	log.Printf("bridge: synced %d cookies (%d credential cookies, %d unrelated dropped) from %s to %s "+
+		"(project %q, page tokens %t, fingerprint %t)",
+		jar.Count(), countAuth(jar), skipped, client.RemoteAddr, path,
+		bundle.ProjectID, bundle.At != "" && bundle.Fsid != "", !bundle.Fingerprint.Empty())
 
 	return jar, nil
+}
+
+// persistCookieSnapshot makes a cookie snapshot authoritative only after its
+// complete account bundle has been durably saved.
+func (b *Bridge) persistCookieSnapshot(client *cdp.Client, jar *cookiejar.Jar, bundle *cookiejar.Bundle, path string) error {
+	existing, _ := cookiejar.LoadBundleFile(path)
+	if err := bundle.Save(path); err != nil {
+		return fmt.Errorf("bridge: persist fresh cookie bundle for account %s: %w", bundle.AccountID, err)
+	}
+	b.mu.Lock()
+	clientChanged := b.accountClients[bundle.AccountID] != client
+	b.lastJar = jar
+	b.jars[client.RemoteAddr] = jar
+	b.accountClients[bundle.AccountID] = client
+	b.mu.Unlock()
+	// Rebinding an account to a new extension connection is itself a runtime
+	// update. In particular, an account paused as needs_login must be able to
+	// bootstrap again after reconnect even when its persisted bundle is byte-for-
+	// byte unchanged. Repeated syncs on the same client remain coalesced.
+	if b.OnCookieSync != nil && (clientChanged || !reflect.DeepEqual(existing, bundle)) {
+		b.OnCookieSync(CookieUpdate{
+			Client: client, AccountID: bundle.AccountID, Bundle: bundle, Jar: jar,
+			Path: path, SyncedAt: time.Now(),
+		})
+	}
+	return nil
+}
+
+// SyncAccount refreshes one account from its browser profile if that profile is
+// still connected. connected=false means callers may use the persisted bundle.
+func (b *Bridge) SyncAccount(ctx context.Context, accountID string) (*cookiejar.Jar, bool, error) {
+	b.mu.RLock()
+	client := b.accountClients[accountID]
+	b.mu.RUnlock()
+	if client == nil || !client.Connected() {
+		return nil, false, nil
+	}
+	jar, err := b.SyncCookies(ctx, client)
+	return jar, true, err
+}
+
+// AccountConnected reports whether the extension client currently bound to an
+// account is live. It does not trigger a browser command or cookie refresh.
+func (b *Bridge) AccountConnected(accountID string) bool {
+	b.mu.RLock()
+	client := b.accountClients[accountID]
+	b.mu.RUnlock()
+	return client != nil && client.Connected()
+}
+
+func (b *Bridge) cookieSyncLock(key string) *sync.Mutex {
+	b.cookieSyncs.mu.Lock()
+	defer b.cookieSyncs.mu.Unlock()
+	if lock := b.cookieSyncs.locks[key]; lock != nil {
+		return lock
+	}
+	lock := &sync.Mutex{}
+	b.cookieSyncs.locks[key] = lock
+	return lock
+}
+
+// AccountView returns a bridge facade pinned to one persisted account. The
+// facade shares the live extension client and per-client cookie sync locks, so
+// session refreshes cannot borrow whichever profile connected most recently.
+func (b *Bridge) AccountView(accountID string) *Bridge {
+	b.mu.RLock()
+	client := b.accountClients[accountID]
+	var jar *cookiejar.Jar
+	if client != nil {
+		jar = b.jars[client.RemoteAddr]
+	}
+	b.mu.RUnlock()
+
+	view := NewBridge(b.Targets, b.CookieDomains, b.DataDir)
+	view.cookieSyncs = b.cookieSyncs
+	view.profileOperations = b.profileOperations
+	view.OnCookieSync = b.OnCookieSync
+	if client != nil {
+		view.clients[client.RemoteAddr] = client
+		view.current = client
+		view.accountClients[accountID] = client
+		view.jars[client.RemoteAddr] = jar
+		view.lastJar = jar
+	}
+	return view
 }
 
 // bundleFor assembles the self-contained account file for one client.
@@ -532,6 +762,21 @@ func pageTokensOf(ctx context.Context, client *cdp.Client) (at, fsid string) {
 // `discoverAccountJars` reads exactly this shape.
 func (b *Bridge) AccountCookieFile(key string) string {
 	return filepath.Join(filepath.Dir(b.cookieFile), "account_"+key+".json")
+}
+
+// CookieSyncAge reports how long ago the durable account bundle was written.
+// The file timestamp survives service restarts and does not initiate a browser
+// operation, so it is safe to use from readiness/statistics endpoints.
+func (b *Bridge) CookieSyncAge(accountID string) (time.Duration, bool) {
+	info, err := os.Stat(b.AccountCookieFile(accountID))
+	if err != nil || info.IsDir() {
+		return 0, false
+	}
+	age := time.Since(info.ModTime())
+	if age < 0 {
+		age = 0
+	}
+	return age, true
 }
 
 // JarFor returns the most recent cookies synced from one connected extension, or
@@ -715,20 +960,50 @@ func (b *Bridge) RefreshSession(ctx context.Context) (*cookiejar.Jar, error) {
 	// This is checked before the connection test on purpose — a jar refreshed
 	// moments ago is fresh whether or not the extension is still attached.
 	b.refreshMu.Lock()
-	defer b.refreshMu.Unlock()
-
 	if age := time.Since(b.lastRefresh); !b.lastRefresh.IsZero() && age < RefreshCoalesceWindow {
 		if jar := b.Jar(); jar != nil {
+			b.refreshMu.Unlock()
 			log.Printf("bridge: reusing the session refresh from %s ago",
 				age.Round(time.Millisecond))
 			return jar, nil
 		}
 	}
+	if flight := b.refreshing; flight != nil {
+		flight.waiters++
+		b.refreshMu.Unlock()
+		select {
+		case <-flight.done:
+			return flight.jar, flight.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	flight := &sessionRefresh{done: make(chan struct{})}
+	b.refreshing = flight
+	b.refreshMu.Unlock()
 
+	jar, err := b.refreshSessionOnce(ctx)
+	b.refreshMu.Lock()
+	flight.jar, flight.err = jar, err
+	if err == nil {
+		b.lastRefresh = time.Now()
+	}
+	b.refreshing = nil
+	close(flight.done)
+	b.refreshMu.Unlock()
+	return jar, err
+}
+
+func (b *Bridge) refreshSessionOnce(ctx context.Context) (*cookiejar.Jar, error) {
 	client := b.Current()
 	if client == nil || !client.Connected() {
 		return nil, fmt.Errorf("bridge: no extension connected")
 	}
+	releaseProfile, err := b.acquireProfileOperation(ctx, client)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseProfile()
 
 	attachCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
@@ -747,13 +1022,10 @@ func (b *Bridge) RefreshSession(ctx context.Context) (*cookiejar.Jar, error) {
 		return nil, ctx.Err()
 	}
 
-	jar, err := b.SyncCookies(ctx, client)
+	jar, err := b.syncCookiesLocked(ctx, client)
 	if err != nil {
 		return nil, err
 	}
-	// Only a completed refresh resets the window; a failure must not make the
-	// next caller think a good refresh just happened.
-	b.lastRefresh = time.Now()
 	return jar, nil
 }
 
@@ -802,7 +1074,15 @@ func (b *Bridge) DiscoverProjects(ctx context.Context, accountIndex int) ([]stri
 	if client == nil || !client.Connected() {
 		return nil, fmt.Errorf("bridge: no extension connected")
 	}
+	releaseProfile, err := b.acquireProfileOperation(ctx, client)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseProfile()
+	return b.discoverProjectsLocked(ctx, client, accountIndex)
+}
 
+func (b *Bridge) discoverProjectsLocked(ctx context.Context, client *cdp.Client, accountIndex int) ([]string, error) {
 	raw, err := client.FlowProjects(ctx, projectLinkExpression)
 	if err != nil {
 		return nil, fmt.Errorf("bridge: could not read the project list: %w", err)
@@ -846,7 +1126,15 @@ func (b *Bridge) EnsureProjectTab(ctx context.Context, accountIndex int) (*cdp.T
 	if client == nil || !client.Connected() {
 		return nil, fmt.Errorf("bridge: no extension connected")
 	}
+	releaseProfile, err := b.acquireProfileOperation(ctx, client)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseProfile()
+	return b.ensureProjectTabLocked(ctx, client, accountIndex)
+}
 
+func (b *Bridge) ensureProjectTabLocked(ctx context.Context, client *cdp.Client, accountIndex int) (*cdp.Tab, error) {
 	tabs, err := client.ListTabs(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("bridge: could not list tabs: %w", err)
@@ -911,7 +1199,7 @@ func (b *Bridge) EnsureProjectTab(ctx context.Context, accountIndex int) (*cdp.T
 
 		// Then wait for the list itself to render.
 		for time.Now().Before(deadline) {
-			if ids, err := b.DiscoverProjects(ctx, accountIndex); err == nil && len(ids) > 0 {
+			if ids, err := b.discoverProjectsLocked(ctx, client, accountIndex); err == nil && len(ids) > 0 {
 				break
 			}
 			select {
@@ -923,7 +1211,7 @@ func (b *Bridge) EnsureProjectTab(ctx context.Context, accountIndex int) (*cdp.T
 	}
 
 	// Otherwise find a project ID from the list, then open its editor.
-	ids, err := b.DiscoverProjects(ctx, accountIndex)
+	ids, err := b.discoverProjectsLocked(ctx, client, accountIndex)
 	if err != nil {
 		return nil, err
 	}
@@ -1011,7 +1299,12 @@ func (b *Bridge) Fingerprint(ctx context.Context) (*Fingerprint, error) {
 		return nil, fmt.Errorf("bridge: no extension connected")
 	}
 
-	raw, err := client.FlowFingerprint(ctx, fingerprintExpression)
+	var raw json.RawMessage
+	err := b.WithProfileOperation(ctx, client, func() error {
+		var readErr error
+		raw, readErr = client.FlowFingerprint(ctx, fingerprintExpression)
+		return readErr
+	})
 	if err != nil {
 		return nil, fmt.Errorf("bridge: could not read the browser fingerprint: %w", err)
 	}

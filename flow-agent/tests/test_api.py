@@ -7,6 +7,7 @@ test that spends a credit is not a test anyone will run.
 
 import json
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -40,6 +41,11 @@ class FakeEngine:
         self.projects = projects if projects is not None else []
         self.raises = raises
         self.calls = []
+        self.events_response = httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            content=b'id: 4\nevent: status\ndata: {"status":"succeeded"}\n\n',
+        )
 
     async def generate_image(self, **kwargs):
         self.calls.append(("image", kwargs))
@@ -61,9 +67,24 @@ class FakeEngine:
         self.calls.append(("stats", {}))
         return {"generations": [], "totals": {}}
 
-    async def get_projects(self, cookies=None):
-        self.calls.append(("projects", {"cookies": cookies}))
+    async def get_projects(self, cookies=None, account_id=None):
+        self.calls.append(("projects", {"cookies": cookies, "account_id": account_id}))
         return self.projects
+
+    async def enqueue_service_job(self, kind, payload, idempotency_key=None):
+        self.calls.append(("enqueue_service_job", {"kind": kind, "payload": payload, "idempotency_key": idempotency_key}))
+        return {"job_id": "native-job", "status": "queued"}
+
+    async def get_service_job(self, job_id):
+        self.calls.append(("get_service_job", {"job_id": job_id}))
+        return {"job_id": job_id, "status": "queued", "events_url": f"/api/v1/jobs/{job_id}/events"}
+
+    async def open_service_job_events(self, job_id, last_event_id=None):
+        self.calls.append(("open_service_job_events", {"job_id": job_id, "last_event_id": last_event_id}))
+        return self.events_response
+
+    async def cancel_service_job(self, job_id):
+        self.calls.append(("cancel_service_job", {"job_id": job_id}))
 
     def available(self):
         return True
@@ -343,6 +364,7 @@ def test_native_video_route(client):
         "start_image": None,
         "all_accounts": False,
         "cookies": None,
+        "account_id": None,
     }
     # Verify /v1/generate/video alias
     assert client.post("/v1/generate/video", json={"prompt": "x"}).status_code == 200
@@ -350,6 +372,30 @@ def test_native_video_route(client):
 
 def test_native_image_route_rejects_a_count_out_of_range(client):
     assert client.post("/api/v1/image", json={"prompt": "x", "count": 0}).status_code == 422
+
+
+def test_native_async_job_exposes_public_status_and_events_urls(client):
+    response = client.post("/api/v1/jobs", json={"kind": "image", "payload": {"prompt": "x"}})
+    assert response.status_code == 202
+    assert response.headers["location"] == "/api/v1/jobs/native-job"
+    assert response.json() == {
+        "job_id": "native-job",
+        "status": "queued",
+        "status_url": "/api/v1/jobs/native-job",
+        "events_url": "/api/v1/jobs/native-job/events",
+    }
+
+
+def test_native_job_events_proxy_streams_and_forwards_resume_cursor(client):
+    response = client.get("/api/v1/jobs/native-job/events", headers={"Last-Event-ID": "3"})
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["x-accel-buffering"] == "no"
+    assert response.content.startswith(b"id: 4")
+    assert client.fake.calls[-1] == (
+        "open_service_job_events", {"job_id": "native-job", "last_event_id": "3"}
+    )
 
 
 # --------------------------------------------------------------------------- #

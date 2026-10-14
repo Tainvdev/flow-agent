@@ -1,0 +1,15 @@
+{
+  "servers": {
+    "flowAgent": {
+      "type": "stdio",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}/.vscode/run-flow-mcp.ps1"
+      ]
+    }
+  }
+}

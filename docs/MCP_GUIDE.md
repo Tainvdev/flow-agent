@@ -8,6 +8,8 @@ Complete integration guide for connecting **Flow Agent** to AI assistants (Claud
 
 Flow Agent implements the MCP standard (`protocolVersion: 2024-11-05`) over **JSON-RPC 2.0**. It exposes five native generation, balance, and asset tools to LLM agents.
 
+For persistent multi-account operation, start `flow-go service` once and run MCP in explicit service mode. The MCP process submits through the Go service's durable queue; it does not start a Go subprocess for each tool call. Start the service with the Flow Bridge extension connected, then pass `FLOW_ENGINE_MODE=service`, `FLOW_SERVICE_URL`, and the matching `FLOW_INTERNAL_TOKEN` to every MCP process. Keep the same absolute `FLOW_OUTPUT_DIR` in the Go service and MCP process so generated files resolve to the same paths.
+
 The MCP server supports two transport mechanisms:
 1. **Stdio (Standard Input / Output)**: Used by local desktop clients such as Claude Desktop, Cursor, and IDE extensions.
 2. **SSE (Server-Sent Events over HTTP)**: Used by web applications and distributed agent systems.
@@ -31,13 +33,21 @@ Add the `flow-agent` entry:
       "args": [
         "/Users/akashyadav/Akash/Flow-Agent-Work/flow-agent/main.py",
         "mcp"
-      ]
+      ],
+      "env": {
+        "FLOW_ENGINE_MODE": "service",
+        "FLOW_SERVICE_URL": "http://127.0.0.1:9223",
+        "FLOW_INTERNAL_TOKEN": "replace-with-the-service-token",
+        "FLOW_OUTPUT_DIR": "/absolute/path/to/flow-agent/output"
+      }
     }
   }
 }
 ```
 
-Restart Claude Desktop. You will see the **Flow tools** available in Claude's tool picker.
+This configuration selects the persistent Go service. Replace the token with the same value used to start `flow-go service`, and use the same absolute output directory in both processes. Restart Claude Desktop; you will see the **Flow tools** in its tool picker.
+
+The Go service runs separately and must use the same token and output directory. If you intentionally select subprocess rollback mode, remove `FLOW_SERVICE_URL` and set `FLOW_ENGINE_MODE` to `subprocess`.
 
 ---
 
@@ -49,7 +59,13 @@ In your IDE settings or MCP configuration:
   "name": "flow-agent",
   "command": "python3",
   "args": ["/Users/akashyadav/Akash/Flow-Agent-Work/flow-agent/main.py", "mcp"],
-  "transport": "stdio"
+  "transport": "stdio",
+  "env": {
+    "FLOW_ENGINE_MODE": "service",
+    "FLOW_SERVICE_URL": "http://127.0.0.1:9223",
+    "FLOW_INTERNAL_TOKEN": "replace-with-the-service-token",
+    "FLOW_OUTPUT_DIR": "/absolute/path/to/flow-agent/output"
+  }
 }
 ```
 
@@ -59,6 +75,10 @@ In your IDE settings or MCP configuration:
 To run the MCP server over HTTP Server-Sent Events (default port `8002`):
 
 ```bash
+export FLOW_ENGINE_MODE=service
+export FLOW_SERVICE_URL=http://127.0.0.1:9223
+export FLOW_INTERNAL_TOKEN="the-same-token-used-by-flow-go-service"
+export FLOW_OUTPUT_DIR="/absolute/path/to/flow-agent/output"
 python main.py mcp --sse --port 8002
 ```
 

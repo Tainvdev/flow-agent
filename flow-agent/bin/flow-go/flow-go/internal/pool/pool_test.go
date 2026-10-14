@@ -148,6 +148,25 @@ func TestAcquireFailsFastWhenEveryWorkerIsParked(t *testing.T) {
 	}
 }
 
+func TestAcquireWakesWhenCooldownExpires(t *testing.T) {
+	p := New()
+	w := newTestWorker("cooldown-expiry")
+	w.RestoreCooldown(time.Now().Add(35 * time.Millisecond))
+	p.Register(w)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	started := time.Now()
+	got, err := p.Acquire(ctx, 0)
+	if err != nil {
+		t.Fatalf("Acquire after cooldown expiry: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed < 20*time.Millisecond || elapsed > 500*time.Millisecond {
+		t.Errorf("Acquire elapsed %s, want it to wake near the 35ms cooldown deadline", elapsed)
+	}
+	p.Release(got, 0, nil)
+}
+
 // TestAcquireStillWaitsForABusyWorker guards the case the wait exists for.
 //
 // Fail-fast on the structural cases is only correct if it does not also break
@@ -157,19 +176,19 @@ func TestAcquireFailsFastWhenEveryWorkerIsParked(t *testing.T) {
 func TestAcquireStillWaitsForABusyWorker(t *testing.T) {
 	p := New()
 	w := newTestWorker("w1")
+	w.Concurrency = 1
 	p.Register(w)
 
-	// Fill the worker to its limit.
-	for i := 0; i < MaxInFlight; i++ {
-		if _, err := p.Acquire(context.Background(), 0); err != nil {
-			t.Fatalf("Acquire %d failed: %v", i, err)
-		}
+	if _, err := p.Acquire(context.Background(), 0); err != nil {
+		t.Fatalf("initial Acquire failed: %v", err)
 	}
 
 	// Free a slot shortly after the caller starts waiting.
+	released := make(chan time.Time, 1)
 	go func() {
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(25 * time.Millisecond)
 		p.Release(w, 0, nil)
+		released <- time.Now()
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -181,6 +200,61 @@ func TestAcquireStillWaitsForABusyWorker(t *testing.T) {
 	}
 	if got.ID != "w1" {
 		t.Errorf("acquired %q, want w1", got.ID)
+	}
+	releaseAt := <-released
+	if waited := time.Since(releaseAt); waited > 120*time.Millisecond {
+		t.Errorf("Acquire took %s after the worker was released; availability changes should wake it promptly", waited)
+	}
+	p.Release(got, 0, nil)
+}
+
+func TestReleaseWakesAllAcquireWaiters(t *testing.T) {
+	p := New()
+	workers := []*Worker{newTestWorker("w1"), newTestWorker("w2")}
+	for _, worker := range workers {
+		worker.Concurrency = 1
+		p.Register(worker)
+		if _, err := p.Acquire(context.Background(), 0); err != nil {
+			t.Fatalf("occupy %s: %v", worker.ID, err)
+		}
+	}
+
+	type result struct {
+		worker *Worker
+		err    error
+	}
+	started := make(chan struct{}, len(workers))
+	results := make(chan result, len(workers))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	for range workers {
+		go func() {
+			started <- struct{}{}
+			worker, err := p.Acquire(ctx, 0)
+			results <- result{worker: worker, err: err}
+		}()
+	}
+	for range workers {
+		<-started
+	}
+	time.Sleep(25 * time.Millisecond)
+	releasedAt := time.Now()
+	for _, worker := range workers {
+		p.Release(worker, 0, nil)
+	}
+	for range workers {
+		select {
+		case got := <-results:
+			if got.err != nil || got.worker == nil {
+				t.Fatalf("Acquire after broadcast=(%v,%v), want worker", got.worker, got.err)
+			}
+			p.Release(got.worker, 0, nil)
+		case <-time.After(120 * time.Millisecond):
+			t.Fatal("broadcast availability signal did not wake every Acquire waiter promptly")
+		}
+	}
+	if waited := time.Since(releasedAt); waited > 120*time.Millisecond {
+		t.Errorf("all waiters took %s after multiple slots were released", waited)
 	}
 }
 

@@ -1,13 +1,45 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
+
+func TestAccountCooldownPersistsAndCanBeCleared(t *testing.T) {
+	st := openTemp(t)
+	if err := st.UpsertAccount(Account{AccountID: "acct-cooldown"}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().UTC().Add(45 * time.Second).Round(0)
+	if err := st.SetAccountCooldown(context.Background(), "acct-cooldown", deadline, "throttled"); err != nil {
+		t.Fatal(err)
+	}
+	path := st.Path()
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen cooldown database: %v", err)
+	}
+	defer reopened.Close()
+	got, reason, exists, err := reopened.AccountCooldown(context.Background(), "acct-cooldown")
+	if err != nil || !exists || reason != "throttled" || !got.Equal(deadline) {
+		t.Fatalf("cooldown=(%v,%q,%v,%v), want (%v,throttled,true,nil)", got, reason, exists, err, deadline)
+	}
+	if err := reopened.ClearAccountCooldown(context.Background(), "acct-cooldown"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, exists, err := reopened.AccountCooldown(context.Background(), "acct-cooldown"); err != nil || exists {
+		t.Fatalf("cleared cooldown=(exists %v, err %v)", exists, err)
+	}
+}
 
 // openTemp opens a store in a private temporary file.
 //
@@ -28,7 +60,7 @@ func openTemp(t *testing.T) *Store {
 // TestOpenSetsBusyTimeout is the regression test for a startup race.
 //
 // Five CLI processes were launched at once; four came up and one died with
-// "store: ping ...: database is locked (261)" — SQLITE_BUSY with nothing to wait
+// "store: ping ...: database is locked (261)"  ESQLITE_BUSY with nothing to wait
 // on. The setting lived only in schema.sql, which migrate applies *after* the
 // ping, so the ping was the one statement with no timeout.
 func TestOpenSetsBusyTimeout(t *testing.T) {
@@ -46,7 +78,7 @@ func TestOpenSetsBusyTimeout(t *testing.T) {
 // TestConcurrentOpensOnAFreshDatabaseAllSucceed reproduces the live failure.
 //
 // Every process runs migrate, and migrate switches journal_mode to WAL, which
-// takes a lock — so the second one in has to wait. Without a busy timeout on the
+// takes a lock  Eso the second one in has to wait. Without a busy timeout on the
 // connection it does not wait, it dies: that is the "database is locked (261)"
 // a fifth concurrent CLI process reported at startup.
 //
@@ -83,7 +115,7 @@ func TestConcurrentOpensOnAFreshDatabaseAllSucceed(t *testing.T) {
 	}
 }
 
-// The positive case is covered by the concurrency test above — if isBusy never
+// The positive case is covered by the concurrency test above  Eif isBusy never
 // matched, nothing would be retried and that test would fail. This pins the other
 // direction, so a plain failure is still reported rather than retried for two
 // seconds first.
@@ -271,6 +303,33 @@ func TestMediaRecording(t *testing.T) {
 	}
 }
 
+func TestLookupMediaOwnershipUsesGenerationAndLatestAttemptProject(t *testing.T) {
+	st := openTemp(t)
+	rowID, err := st.RecordGeneration(Generation{JobID: "owned-media-job", AccountID: "account-a", Kind: "image"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateJob(context.Background(), Job{ID: "owned-media-job", Kind: "image", Payload: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.StartJobAttempt(context.Background(), "owned-media-job", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateJobAttempt(context.Background(), "owned-media-job", 1, "succeeded", "account-a", "project-a", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RecordMedia(Media{GenerationID: &rowID, MediaID: "owned-media-id", Kind: "image"}); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := st.LookupMediaOwnership(context.Background(), " owned-media-id ")
+	if err != nil || !found || got.AccountID != "account-a" || got.ProjectID != "project-a" {
+		t.Fatalf("ownership=(%+v,%v,%v), want account-a/project-a", got, found, err)
+	}
+	if _, found, err := st.LookupMediaOwnership(context.Background(), "external-id"); err != nil || found {
+		t.Fatalf("external ownership found=%v err=%v, want unknown", found, err)
+	}
+}
+
 func TestAccountOutcomes(t *testing.T) {
 	st := openTemp(t)
 
@@ -332,8 +391,8 @@ func TestCreditsAreNotInvented(t *testing.T) {
 // TestUpsertAccountKeepsTheCookieHashWhenOmitted pins the partial-update
 // contract that cookie_hash used to break.
 //
-// The hash is the account's identity — Bootstrap writes jar.Hash() and derives
-// the account id from it — so a writer that only means to record a balance has
+// The hash is the account's identity  EBootstrap writes jar.Hash() and derives
+// the account id from it  Eso a writer that only means to record a balance has
 // nothing to say about it and must not clear it. Engine.RefreshCredits passes an
 // empty CookieHash for exactly that reason, and because the column was assigned
 // unconditionally, that write erased the hash instead of leaving it alone. The
@@ -369,14 +428,14 @@ func TestUpsertAccountKeepsTheCookieHashWhenOmitted(t *testing.T) {
 		t.Fatalf("expected 1 account, got %d", len(accounts))
 	}
 	if accounts[0].CookieHash != "hash-from-bootstrap" {
-		t.Errorf("CookieHash = %q, want it left alone — an omitted hash must not clear the stored one",
+		t.Errorf("CookieHash = %q, want it left alone  Ean omitted hash must not clear the stored one",
 			accounts[0].CookieHash)
 	}
 	if accounts[0].SKU != "G1_TIER1" {
 		t.Errorf("SKU = %q, want it left alone", accounts[0].SKU)
 	}
 	if accounts[0].Credits == nil || *accounts[0].Credits != 1050 {
-		t.Errorf("Credits = %v, want 1050 — the update it was actually for", accounts[0].Credits)
+		t.Errorf("Credits = %v, want 1050  Ethe update it was actually for", accounts[0].Credits)
 	}
 }
 
@@ -395,7 +454,7 @@ func TestUpsertAccountStillOverwritesASuppliedHash(t *testing.T) {
 
 	accounts, _ := st.ListAccounts()
 	if accounts[0].CookieHash != "new" {
-		t.Errorf("CookieHash = %q, want %q — a supplied hash must still overwrite",
+		t.Errorf("CookieHash = %q, want %q  Ea supplied hash must still overwrite",
 			accounts[0].CookieHash, "new")
 	}
 }
@@ -412,7 +471,7 @@ func TestStoresAreIsolated(t *testing.T) {
 
 	statsB, _ := b.Stats()
 	if statsB.TotalGenerations != 0 {
-		t.Errorf("store B sees %d generations, expected 0 — stores are not isolated", statsB.TotalGenerations)
+		t.Errorf("store B sees %d generations, expected 0  Estores are not isolated", statsB.TotalGenerations)
 	}
 
 	statsA, _ := a.Stats()
@@ -475,7 +534,7 @@ func TestGenerationByJobMissing(t *testing.T) {
 //
 // The engine opens the database on every start, so migrate runs on every start.
 // A bare ALTER TABLE ADD COLUMN would therefore succeed once and then fail with
-// "duplicate column name" forever after — the engine would be unable to start
+// "duplicate column name" forever after  Ethe engine would be unable to start
 // the second time it was ever run. That is the whole reason addedColumns exists
 // and is guarded by PRAGMA table_info, and this is the regression test for it.
 func TestOpenIsIdempotentAcrossRestarts(t *testing.T) {
@@ -484,7 +543,7 @@ func TestOpenIsIdempotentAcrossRestarts(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		st, err := Open(path)
 		if err != nil {
-			t.Fatalf("Open #%d failed — a restart must not fail the migration: %v", i+1, err)
+			t.Fatalf("Open #%d failed  Ea restart must not fail the migration: %v", i+1, err)
 		}
 		// Write something on each pass so a later run is migrating a populated
 		// database, which is the case that actually matters.
@@ -519,7 +578,7 @@ func TestOpenIsIdempotentAcrossRestarts(t *testing.T) {
 // way the previous release would have, and then opens it with the current code.
 //
 // It also guards the ordering that broke first. CREATE INDEX on a column a
-// pre-existing table does not have yet is not a no-op — SQLite rejects it, and
+// pre-existing table does not have yet is not a no-op  ESQLite rejects it, and
 // because schema.sql runs before the ALTERs, having the identity index there
 // made Open fail outright on any older database. An index creation that must
 // follow a column addition cannot live in the schema script.
@@ -611,8 +670,7 @@ func TestMigrationUpgradesADatabaseFromBeforeTheIdentityColumns(t *testing.T) {
 		t.Errorf("identity_source = %q, want legacy-jar-hash", got.IdentitySource)
 	}
 	// last_authuser has to be 0 rather than NULL. NULL would hide the row from
-	// the re-anchor rule, and the next boot would mint a duplicate beside it —
-	// which is the churn this change exists to stop.
+	// the re-anchor rule, and the next boot would mint a duplicate beside it  E	// which is the churn this change exists to stop.
 	if got.LastAuthuser == nil {
 		t.Error("last_authuser is NULL; the row is invisible to the re-anchor rule and will be duplicated")
 	} else if *got.LastAuthuser != 0 {
@@ -622,6 +680,50 @@ func TestMigrationUpgradesADatabaseFromBeforeTheIdentityColumns(t *testing.T) {
 	// one: "no evidence" and "proven to match" are different claims.
 	if got.SapisidFingerprint != "" {
 		t.Errorf("sapisid_fingerprint = %q, want empty for a row that never had one", got.SapisidFingerprint)
+	}
+}
+
+func TestMigrationAddsNewJobColumnsToExistingQueue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "queue-before-parent-jobs.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`CREATE TABLE jobs (
+		job_id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, idempotency_key TEXT UNIQUE,
+		status TEXT NOT NULL DEFAULT 'queued', result TEXT, error TEXT, lease_owner TEXT, lease_until DATETIME,
+		attempts INTEGER NOT NULL DEFAULT 0, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, finished_at DATETIME)`)
+	if err != nil {
+		t.Fatalf("create old jobs table: %v", err)
+	}
+	if _, err := legacy.Exec(`INSERT INTO jobs(job_id,kind,payload) VALUES('legacy-job','image','{"prompt":"legacy"}')`); err != nil {
+		t.Fatalf("insert old job: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("upgrade existing queue schema: %v", err)
+	}
+	defer st.Close()
+	for _, column := range []string{"parent_id", "child_index", "payload_version", "error_code"} {
+		present, err := hasColumn(st.db, "jobs", column)
+		if err != nil || !present {
+			t.Fatalf("migration column %s present=%v err=%v", column, present, err)
+		}
+	}
+	job, err := st.JobByID(context.Background(), "legacy-job")
+	if err != nil || job.PayloadVersion != CurrentJobPayloadVersion {
+		t.Fatalf("migrated job=(%+v,%v), want payload version %d", job, err, CurrentJobPayloadVersion)
+	}
+	if job.ErrorCode != 0 {
+		t.Fatalf("migrated job error code=%d, want 0", job.ErrorCode)
+	}
+	var index string
+	if err := st.db.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name='idx_jobs_parent'`).Scan(&index); err != nil {
+		t.Fatalf("parent index missing after migration: %v", err)
 	}
 }
 
@@ -657,7 +759,7 @@ func TestMigrationBackfillLeavesMigratedRowsAlone(t *testing.T) {
 		t.Fatalf("expected 1 account, got %d", len(accounts))
 	}
 	if accounts[0].IdentityKey != "core-abc" {
-		t.Errorf("identity_key = %q, want core-abc — the backfill overwrote a real anchor",
+		t.Errorf("identity_key = %q, want core-abc  Ethe backfill overwrote a real anchor",
 			accounts[0].IdentityKey)
 	}
 	if accounts[0].IdentitySource != "cookie-core" {
@@ -675,8 +777,7 @@ func TestMigrationBackfillLeavesMigratedRowsAlone(t *testing.T) {
 // TestFinishGenerationAttributesTheAccount is the reporting fix.
 //
 // The row is inserted at submit time, before the pool has picked a worker, so
-// account_id is genuinely unknown then. It is only known once the job runs —
-// which is when FinishGeneration is called. Every generations row in the live
+// account_id is genuinely unknown then. It is only known once the job runs  E// which is when FinishGeneration is called. Every generations row in the live
 // database was empty because nothing ever passed it, so per-account history was
 // impossible to reconstruct after the fact.
 func TestFinishGenerationAttributesTheAccount(t *testing.T) {
@@ -694,7 +795,7 @@ func TestFinishGenerationAttributesTheAccount(t *testing.T) {
 		t.Fatalf("GenerationByJob: %v", err)
 	}
 	if before.AccountID != "" {
-		t.Errorf("account_id = %q at submit time, want empty — the pool has not picked yet", before.AccountID)
+		t.Errorf("account_id = %q at submit time, want empty  Ethe pool has not picked yet", before.AccountID)
 	}
 
 	credits := 12
@@ -707,7 +808,7 @@ func TestFinishGenerationAttributesTheAccount(t *testing.T) {
 		t.Fatalf("GenerationByJob: %v", err)
 	}
 	if after.AccountID != "acct-8c4f11aa22bb" {
-		t.Errorf("account_id = %q, want acct-8c4f11aa22bb — the job was not attributed", after.AccountID)
+		t.Errorf("account_id = %q, want acct-8c4f11aa22bb  Ethe job was not attributed", after.AccountID)
 	}
 	if after.Status != "succeeded" {
 		t.Errorf("status = %q, want succeeded", after.Status)
@@ -765,7 +866,7 @@ func TestFinishGenerationStillOverwritesASuppliedAccount(t *testing.T) {
 
 	job, _ := st.GenerationByJob("job-1")
 	if job.AccountID != "acct-second" {
-		t.Errorf("account_id = %q, want acct-second — a supplied account must still overwrite", job.AccountID)
+		t.Errorf("account_id = %q, want acct-second  Ea supplied account must still overwrite", job.AccountID)
 	}
 }
 
@@ -778,7 +879,7 @@ func TestFinishGenerationStillOverwritesASuppliedAccount(t *testing.T) {
 //
 // The schema comments are English prose and contain semicolons. A plain
 // strings.Split on ";" cuts a statement in half at one of them; the fragment is
-// then handed to SQLite, which rejects it as "incomplete input" — and because
+// then handed to SQLite, which rejects it as "incomplete input"  Eand because
 // migrate runs on every Open, the engine could not open its own database at all.
 func TestSplitStatementsIgnoresSemicolonsInCommentsAndLiterals(t *testing.T) {
 	cases := []struct {
@@ -858,7 +959,7 @@ func TestSchemaSplitsIntoExecutableStatements(t *testing.T) {
 //
 // The status buckets are summed individually rather than reconciled against the
 // total, so any status the query does not name appears in no bucket at all.
-// 'empty' was not named — and seven of the fourteen jobs in the live database
+// 'empty' was not named  Eand seven of the fourteen jobs in the live database
 // were 'empty', so succeeded + failed + in_flight came to seven and a run that
 // was half failing looked like a run with nothing wrong with it.
 //
@@ -898,13 +999,13 @@ func TestStatsAccountForEveryRow(t *testing.T) {
 	}
 
 	if stats.Empty != 1 {
-		t.Errorf("Empty = %d, want 1 — an 'empty' job is a failure and has to be counted "+
+		t.Errorf("Empty = %d, want 1  Ean 'empty' job is a failure and has to be counted "+
 			"somewhere", stats.Empty)
 	}
 	// 'ready' is a success, so it belongs in the succeeded count rather than
 	// beside it. Two rows carry a terminal success here: 'succeeded' and 'ready'.
 	if stats.Succeeded != 2 {
-		t.Errorf("Succeeded = %d, want 2 — a 'ready' job is a render that completed and "+
+		t.Errorf("Succeeded = %d, want 2  Ea 'ready' job is a render that completed and "+
 			"was downloaded, which is a success", stats.Succeeded)
 	}
 
@@ -935,7 +1036,7 @@ func TestRecordUploadRoundTrips(t *testing.T) {
 		t.Fatalf("RecordUpload: %v", err)
 	}
 
-	got, err := st.FindUpload(want.FileHash, want.ProjectID)
+	got, err := st.FindUpload("", want.FileHash, want.ProjectID)
 	if err != nil {
 		t.Fatalf("FindUpload: %v", err)
 	}
@@ -956,7 +1057,7 @@ func TestRecordUploadRoundTrips(t *testing.T) {
 		t.Errorf("bytes = %d, want %d", got.Bytes, want.Bytes)
 	}
 	if got.CreatedAt.IsZero() {
-		t.Error("created_at did not survive the round trip — the column defaults to " +
+		t.Error("created_at did not survive the round trip  Ethe column defaults to " +
 			"CURRENT_TIMESTAMP and is read back as text, so a miss here is the parse failing")
 	}
 }
@@ -990,7 +1091,7 @@ func TestFindUploadMissesAreNilAndNotAnError(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := st.FindUpload(tc.hash, tc.projectID)
+			got, err := st.FindUpload("", tc.hash, tc.projectID)
 			if err != nil {
 				t.Errorf("a miss should not be an error: %v", err)
 			}
@@ -1001,8 +1102,8 @@ func TestFindUploadMissesAreNilAndNotAnError(t *testing.T) {
 	}
 }
 
-// The newest row wins. A file uploaded twice — after a --force-upload, or into a
-// project that was cleared — has two rows, and only the later one can be expected
+// The newest row wins. A file uploaded twice  Eafter a --force-upload, or into a
+// project that was cleared  Ehas two rows, and only the later one can be expected
 // to still resolve.
 func TestFindUploadReturnsTheNewestRow(t *testing.T) {
 	st := openTemp(t)
@@ -1019,7 +1120,7 @@ func TestFindUploadReturnsTheNewestRow(t *testing.T) {
 		}
 	}
 
-	got, err := st.FindUpload("same-hash", "proj-1")
+	got, err := st.FindUpload("", "same-hash", "proj-1")
 	if err != nil {
 		t.Fatalf("FindUpload: %v", err)
 	}
@@ -1051,7 +1152,7 @@ func TestUploadsAreScopedToTheProject(t *testing.T) {
 	}
 
 	for projectID, want := range map[string]string{"proj-1": "media-in-one", "proj-2": "media-in-two"} {
-		got, err := st.FindUpload("same-hash", projectID)
+		got, err := st.FindUpload("", "same-hash", projectID)
 		if err != nil {
 			t.Fatalf("FindUpload(%s): %v", projectID, err)
 		}
@@ -1061,5 +1162,31 @@ func TestUploadsAreScopedToTheProject(t *testing.T) {
 		if got.MediaID != want {
 			t.Errorf("project %s gave media id %q, want %q", projectID, got.MediaID, want)
 		}
+	}
+}
+
+func TestUploadsAreScopedToAccountAndProject(t *testing.T) {
+	st := openTemp(t)
+	for _, row := range []UploadRecord{
+		{FilePath: "/clip.mp4", FileHash: "same", MediaID: "media-a", AccountID: "account-a", ProjectID: "shared-project", Bytes: 1},
+		{FilePath: "/clip.mp4", FileHash: "same", MediaID: "media-b", AccountID: "account-b", ProjectID: "shared-project", Bytes: 1},
+	} {
+		if err := st.RecordUpload(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for account, want := range map[string]string{"account-a": "media-a", "account-b": "media-b"} {
+		got, err := st.FindUpload(account, "same", "shared-project")
+		if err != nil || got == nil || got.MediaID != want {
+			t.Fatalf("account %s upload=(%+v,%v), want %s", account, got, err, want)
+		}
+		owner, found, err := st.LookupMediaOwnership(context.Background(), want)
+		if err != nil || !found || owner.AccountID != account || owner.ProjectID != "shared-project" {
+			t.Fatalf("account %s media ownership=(%+v,%v,%v)", account, owner, found, err)
+		}
+	}
+	got, err := st.FindUpload("account-c", "same", "shared-project")
+	if err != nil || got != nil {
+		t.Fatalf("unrelated account cache result=(%+v,%v), want nil", got, err)
 	}
 }

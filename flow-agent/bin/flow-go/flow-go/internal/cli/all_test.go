@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/kodelyx/flow-go/flow-go/internal/app"
+	"github.com/kodelyx/flow-go/flow-go/internal/engine"
 )
 
 // One account failing must not stop the others — that is the whole point of
@@ -132,9 +134,9 @@ func TestASkippedAccountReportsNoDuration(t *testing.T) {
 	}
 
 	run := runForAccount(context.Background(), commonFlags{}, path,
-		func(context.Context, *app.App) ([]string, error) {
+		func(context.Context, *app.App) (accountGenerationResult, error) {
 			t.Error("a skipped account reached the generator")
-			return nil, nil
+			return accountGenerationResult{}, nil
 		})
 
 	if run.Status != runSkipped {
@@ -148,6 +150,57 @@ func TestASkippedAccountReportsNoDuration(t *testing.T) {
 	}
 	if run.Err == "" {
 		t.Error("the skip reason is not recorded, so the table would say nothing about why")
+	}
+}
+
+func TestAggregateAccountRunsProducesPythonCompatiblePartialResult(t *testing.T) {
+	runs := []accountRun{
+		{
+			AccountID: "account-a", Status: runOK, Files: []string{"output/a.png"},
+			Result: &engine.BatchOutcome{
+				AccountID: "account-a", Status: "succeeded",
+				Files: []engine.MediaFile{{MediaID: "media-a", Path: "output/a.png", Bytes: 128}},
+			},
+		},
+		{
+			AccountID: "account-video", Status: runOK,
+			Result: &engine.BatchVideoOutcome{
+				AccountID: "account-video", Status: "succeeded",
+				MediaIDs: []string{"video-media"}, URLs: []string{"https://media.test/video"},
+			},
+		},
+		{AccountID: "account-b", Status: runFailed, Err: "needs login"},
+	}
+	encoded, err := json.Marshal(aggregateAccountRuns(runs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Status   string `json:"status"`
+		Accounts []struct {
+			AccountID string `json:"account_id"`
+			Status    string `json:"status"`
+			Error     string `json:"error"`
+		} `json:"accounts"`
+		Files []struct {
+			AccountID string `json:"account_id"`
+			Path      string `json:"path"`
+			MediaID   string `json:"media_id"`
+		} `json:"files"`
+		MediaIDs []string `json:"media_ids"`
+		URLs     []string `json:"urls"`
+	}
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatalf("aggregate is not valid JSON: %s: %v", encoded, err)
+	}
+	if got.Status != "partial" || len(got.Accounts) != 3 || got.Accounts[2].Error != "needs login" {
+		t.Fatalf("aggregate status/accounts=%+v, want partial result with per-account error", got)
+	}
+	if len(got.Files) != 1 || got.Files[0].AccountID != "account-a" || got.Files[0].Path != "output/a.png" || got.Files[0].MediaID != "media-a" {
+		t.Fatalf("flattened files=%+v, want account-bound media path and ID", got.Files)
+	}
+	if len(got.MediaIDs) != 1 || got.MediaIDs[0] != "video-media" || len(got.URLs) != 1 {
+		t.Fatalf("flattened video result IDs/URLs=(%v,%v)", got.MediaIDs, got.URLs)
 	}
 }
 

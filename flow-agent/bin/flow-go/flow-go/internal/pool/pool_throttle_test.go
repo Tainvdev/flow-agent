@@ -3,9 +3,23 @@ package pool
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/kodelyx/flow-go/flow-go/internal/flowapi"
 )
+
+func TestRestoredCooldownParksWorkerUntilDeadline(t *testing.T) {
+	w := newTestWorker("restored")
+	deadline := time.Now().Add(time.Minute)
+	w.RestoreCooldown(deadline)
+	if w.State() != StateCircuitOpen || !w.CooldownUntil().Equal(deadline) {
+		t.Fatalf("restored worker state=(%s,%v), want open until %v", w.State(), w.CooldownUntil(), deadline)
+	}
+	w.ClearCooldown()
+	if w.State() != StateIdle {
+		t.Fatalf("cleared worker state=%s, want idle", w.State())
+	}
+}
 
 // TestThrottleParksOnTheFirstFailure pins the rule that separates a throttle from
 // an ordinary failure.
@@ -100,5 +114,23 @@ func TestThrottleParksThroughRelease(t *testing.T) {
 
 	if w.State() != StateCircuitOpen {
 		t.Errorf("Release with a 429 should park the worker, got %s", w.State())
+	}
+}
+
+type syntheticThrottle struct{}
+
+func (syntheticThrottle) Error() string   { return "Flow said TOO_MUCH_TRAFFIC" }
+func (syntheticThrottle) Throttled() bool { return true }
+
+func TestTypedThrottleParksThroughRelease(t *testing.T) {
+	p := New()
+	w := newTestWorker("w1")
+	p.Register(w)
+	if _, err := p.Acquire(context.Background(), 0); err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	p.Release(w, 0, syntheticThrottle{})
+	if w.State() != StateCircuitOpen {
+		t.Fatalf("a typed throttle should park the worker, got %s", w.State())
 	}
 }

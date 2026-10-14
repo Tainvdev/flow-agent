@@ -260,6 +260,30 @@ func (w *Worker) State() State {
 	return StateIdle
 }
 
+// CooldownUntil reports the absolute circuit deadline, or zero when not parked.
+func (w *Worker) CooldownUntil() time.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.circuitOpenUntil
+}
+
+// RestoreCooldown restores a persisted circuit deadline during service startup.
+func (w *Worker) RestoreCooldown(until time.Time) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if until.After(w.circuitOpenUntil) {
+		w.circuitOpenUntil = until
+	}
+}
+
+// ClearCooldown clears a persisted cooldown after its cause has been resolved.
+func (w *Worker) ClearCooldown() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.circuitOpenUntil = time.Time{}
+	w.consecutiveFails = 0
+}
+
 func (w *Worker) limit() int {
 	if w.Concurrency > 0 {
 		return w.Concurrency
@@ -361,7 +385,8 @@ func (w *Worker) recordFailure(err error) {
 	// not measure a balance", not "the balance is zero"; recording it would take
 	// every worker out of rotation on its first successful job. The balance is
 	// only written from a source that actually knows it — this, or SetCredits.
-	if flowapi.IsOutOfCredits(err) {
+	var insufficient interface{ InsufficientCredits() bool }
+	if flowapi.IsOutOfCredits(err) || (errors.As(err, &insufficient) && insufficient.InsufficientCredits()) {
 		w.credits = 0
 		w.creditsKnown = true
 		w.circuitOpenUntil = time.Now().Add(CreditsCooldown)
@@ -374,6 +399,12 @@ func (w *Worker) recordFailure(err error) {
 		w.circuitOpenUntil = time.Now().Add(ThrottleCooldown)
 		log.Printf("pool: worker %s throttled (%d %s) — parked for %s",
 			w.ID, apiErr.Status, apiErr.Reason, ThrottleCooldown)
+		return
+	}
+	var throttle interface{ Throttled() bool }
+	if errors.As(err, &throttle) && throttle.Throttled() {
+		w.circuitOpenUntil = time.Now().Add(ThrottleCooldown)
+		log.Printf("pool: worker %s throttled by Flow; parked for %s", w.ID, ThrottleCooldown)
 		return
 	}
 
@@ -415,37 +446,86 @@ type Stats struct {
 
 // Pool routes work across workers.
 type Pool struct {
-	mu      sync.RWMutex
-	workers []*Worker
-	rr      int
+	mu       sync.RWMutex
+	workers  []*Worker
+	rr       int
+	changeMu sync.Mutex
+	waiters  []chan struct{}
 }
 
 // New builds an empty pool.
 func New() *Pool { return &Pool{} }
 
+// NotifyAvailabilityChanged wakes one Acquire call waiting for a newly
+// available worker. Call it after mutating registered worker credits or
+// cooldowns outside Pool.
+func (p *Pool) NotifyAvailabilityChanged() {
+	p.changeMu.Lock()
+	if len(p.waiters) > 0 {
+		waiter := p.waiters[0]
+		p.waiters[0] = nil
+		p.waiters = p.waiters[1:]
+		close(waiter)
+	}
+	p.changeMu.Unlock()
+}
+
+func (p *Pool) notifyAllWaiters() {
+	p.changeMu.Lock()
+	for _, waiter := range p.waiters {
+		close(waiter)
+	}
+	p.waiters = nil
+	p.changeMu.Unlock()
+}
+
+func (p *Pool) registerWaiter() (<-chan struct{}, func()) {
+	waiter := make(chan struct{})
+	p.changeMu.Lock()
+	p.waiters = append(p.waiters, waiter)
+	p.changeMu.Unlock()
+	remove := func() {
+		p.changeMu.Lock()
+		for i, pending := range p.waiters {
+			if pending == waiter {
+				p.waiters[i] = nil
+				p.waiters = append(p.waiters[:i], p.waiters[i+1:]...)
+				break
+			}
+		}
+		p.changeMu.Unlock()
+	}
+	return waiter, remove
+}
+
 // Register adds a worker. Re-registering an ID replaces it.
 func (p *Pool) Register(w *Worker) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	for i, existing := range p.workers {
 		if existing.ID == w.ID {
 			p.workers[i] = w
+			p.mu.Unlock()
+			p.NotifyAvailabilityChanged()
 			return
 		}
 	}
 	p.workers = append(p.workers, w)
+	p.mu.Unlock()
+	p.NotifyAvailabilityChanged()
 }
 
 // Remove drops a worker.
 func (p *Pool) Remove(id string) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	for i, w := range p.workers {
 		if w.ID == id {
 			p.workers = append(p.workers[:i], p.workers[i+1:]...)
+			p.mu.Unlock()
+			p.notifyAllWaiters()
 			return
 		}
 	}
+	p.mu.Unlock()
 }
 
 // Retain drops every worker except the named one.
@@ -466,7 +546,6 @@ func (p *Pool) Remove(id string) {
 // cheaper than rebuilding the pool. It is covered by retain_test.go.
 func (p *Pool) Retain(id string) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	kept := p.workers[:0]
 	for _, w := range p.workers {
 		if w.ID == id {
@@ -474,6 +553,8 @@ func (p *Pool) Retain(id string) {
 		}
 	}
 	p.workers = kept
+	p.mu.Unlock()
+	p.notifyAllWaiters()
 }
 
 // Workers returns a snapshot of the registered workers.
@@ -510,6 +591,27 @@ func (p *Pool) Acquire(ctx context.Context, cost int) (*Worker, error) {
 	return p.acquireExcluding(ctx, cost, nil)
 }
 
+// AcquireAccount reserves a slot on exactly id and never substitutes another account.
+func (p *Pool) AcquireAccount(ctx context.Context, id string, cost int) (*Worker, error) {
+	if id == "" {
+		return nil, &NoWorkerError{Reason: "an explicit account id is required"}
+	}
+	workers := p.Workers()
+	found := false
+	exclude := make(map[string]bool, len(workers))
+	for _, worker := range workers {
+		if worker.ID == id {
+			found = true
+		} else {
+			exclude[worker.ID] = true
+		}
+	}
+	if !found {
+		return nil, &NoWorkerError{Reason: fmt.Sprintf("account %s is not registered or ready", id)}
+	}
+	return p.acquireExcluding(ctx, cost, exclude)
+}
+
 // AcquireTimeout bounds how long Acquire waits for a worker to become free.
 //
 // It is a wait for the *transient* case — every worker is busy and one will
@@ -518,9 +620,6 @@ func (p *Pool) Acquire(ctx context.Context, cost int) (*Worker, error) {
 // this window, cannot be fixed by waiting, and spending the full 30 seconds to
 // say so is what turned a clear failure into a slow one.
 const AcquireTimeout = 30 * time.Second
-
-// acquirePollInterval is how often a waiting Acquire re-checks for a free worker.
-const acquirePollInterval = 200 * time.Millisecond
 
 // NoWorkerError reports that no worker can take the job, and why.
 //
@@ -532,8 +631,11 @@ type NoWorkerError struct {
 	// Reason states the cause in the operator's terms.
 	Reason string
 	// RetryAfter is when a parked worker would come back, when that is known.
-	RetryAfter time.Time
+	RetryAfter   time.Time
+	OutOfCredits bool
 }
+
+func (e *NoWorkerError) InsufficientCredits() bool { return e.OutOfCredits }
 
 func (e *NoWorkerError) Error() string {
 	msg := "pool: no worker available — " + e.Reason
@@ -549,28 +651,63 @@ func (p *Pool) acquireExcluding(ctx context.Context, cost int, exclude map[strin
 	deadline := time.Now().Add(AcquireTimeout)
 
 	for {
+		changed, removeWaiter := p.registerWaiter()
 		if w := p.pick(cost, exclude); w != nil {
+			removeWaiter()
 			return w, nil
 		}
 
 		// Waiting only helps if something could free up. Ask before paying for
 		// the wait rather than after it.
 		if err := p.whyNothingAvailable(exclude, cost, deadline); err != nil {
+			removeWaiter()
 			return nil, err
 		}
 
 		if time.Now().After(deadline) {
+			removeWaiter()
 			return nil, &NoWorkerError{
 				Reason: fmt.Sprintf("all %d registered worker(s) stayed busy for the full %s",
 					p.Size(), AcquireTimeout),
 			}
 		}
 
+		wakeAt := deadline
+		now := time.Now()
+		for _, worker := range p.Workers() {
+			if exclude != nil && exclude[worker.ID] {
+				continue
+			}
+			until := worker.parkedUntil()
+			if until.After(now) && until.Before(wakeAt) {
+				wakeAt = until
+			}
+		}
+		wait := time.Until(wakeAt)
+		if wait < 0 {
+			wait = 0
+		}
+		timer := time.NewTimer(wait)
 		select {
-		case <-time.After(acquirePollInterval):
+		case <-changed:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-timer.C:
 		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			removeWaiter()
 			return nil, ctx.Err()
 		}
+		removeWaiter()
 	}
 }
 
@@ -633,6 +770,7 @@ func (p *Pool) whyNothingAvailable(exclude map[string]bool, cost int, deadline t
 		return &NoWorkerError{
 			Reason: fmt.Sprintf("every registered worker (%d) is out of credits for a %d-credit "+
 				"job; add credits, or register another account", candidates, cost),
+			OutOfCredits: true,
 		}
 	}
 
@@ -735,6 +873,7 @@ func (p *Pool) Release(w *Worker, credits int, err error) {
 		w.recordSuccess(credits)
 	}
 	w.release()
+	p.NotifyAvailabilityChanged()
 }
 
 // Execute acquires a worker, runs op, and fails over to another worker when the
@@ -831,6 +970,7 @@ func (p *Pool) RefreshCredits(ctx context.Context) {
 			continue
 		}
 		w.SetCredits(balance.Credits, balance.SKU)
+		p.NotifyAvailabilityChanged()
 	}
 }
 

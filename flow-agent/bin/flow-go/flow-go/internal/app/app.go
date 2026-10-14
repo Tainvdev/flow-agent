@@ -3,10 +3,14 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/kodelyx/flow-go/flow-go/internal/bridge"
@@ -14,6 +18,7 @@ import (
 	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
 	"github.com/kodelyx/flow-go/flow-go/internal/engine"
 	"github.com/kodelyx/flow-go/flow-go/internal/flowapi"
+	"github.com/kodelyx/flow-go/flow-go/internal/service"
 	"github.com/kodelyx/flow-go/flow-go/internal/store"
 )
 
@@ -226,4 +231,351 @@ func (a *App) RunBridge(ctx context.Context) error {
 		log.Println("app: shutting down")
 	}
 	return nil
+}
+
+// RunService starts one bridge owner, warm account runtimes, a durable job
+// queue, and the authenticated internal HTTP API.
+func (a *App) RunService(ctx context.Context, listenAddr, token string, workers int) error {
+	serviceStart := time.Now()
+	if strings.TrimSpace(listenAddr) == "" {
+		listenAddr = "127.0.0.1:9223"
+	}
+	instanceLock, err := service.AcquireInstanceLock(a.Store.DatabasePath() + ".service.lock")
+	if err != nil {
+		return err
+	}
+	defer instanceLock.Close()
+	queueLimit, err := positiveEnvInt("FLOW_MAX_OUTSTANDING_JOBS", 1000)
+	if err != nil {
+		return err
+	}
+	drainSeconds, err := serviceDrainSecondsFromEnv()
+	if err != nil {
+		return err
+	}
+	if err := a.Store.SetMaxOutstandingJobs(queueLimit); err != nil {
+		return err
+	}
+	retentionDays, err := positiveEnvInt("FLOW_JOB_RETENTION_DAYS", 30)
+	if err != nil {
+		return err
+	}
+	if _, err := a.Store.DeleteTerminalJobsBefore(ctx, time.Now().Add(-time.Duration(retentionDays)*24*time.Hour)); err != nil {
+		return fmt.Errorf("app: apply configured %d-day job retention: %w", retentionDays, err)
+	}
+	maxAttempts, err := jobMaxAttemptsFromEnv()
+	if err != nil {
+		return err
+	}
+	pollLimit, err := mediaConcurrencyFromEnv("FLOW_MEDIA_POLL_CONCURRENCY", workers*2)
+	if err != nil {
+		return err
+	}
+	downloadLimit, err := mediaConcurrencyFromEnv("FLOW_MEDIA_DOWNLOAD_CONCURRENCY", workers)
+	if err != nil {
+		return err
+	}
+	manager, err := service.NewAccountManagerWithMediaLimits(a.Store, a.Bridge, workers, pollLimit, downloadLimit)
+	if err != nil {
+		return err
+	}
+	queueWorkers, err := queueWorkersFromEnv(workers)
+	if err != nil {
+		return err
+	}
+	jobs, err := service.NewJobs(a.Store, manager, token, queueWorkers)
+	if err != nil {
+		return err
+	}
+	if err := jobs.SetMaxAttempts(maxAttempts); err != nil {
+		return err
+	}
+	for _, retryClass := range []struct{ class, env string }{
+		{class: "pre_submit_deadline", env: "FLOW_JOB_MAX_PRE_SUBMIT_ATTEMPTS"},
+		{class: "resume_media", env: "FLOW_JOB_MAX_RESUME_ATTEMPTS"},
+		{class: "account_throttle", env: "FLOW_JOB_MAX_THROTTLE_ATTEMPTS"},
+	} {
+		budget, err := jobRetryBudgetFromEnv(retryClass.env, maxAttempts)
+		if err != nil {
+			return err
+		}
+		if err := jobs.SetRetryBudget(retryClass.class, budget); err != nil {
+			return err
+		}
+	}
+	a.Bridge.OnCookieSync = manager.Notify
+	clearPairingMarker()
+	// Keep service workers alive after the caller requests shutdown so the
+	// bounded drain can finish active jobs before stop() cancels their runtime.
+	serviceCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+
+	mux := http.NewServeMux()
+	mux.Handle("/internal/v1/jobs", jobs)
+	mux.Handle("/internal/v1/jobs/", jobs)
+	mux.Handle("/internal/v1/balance", service.RequireToken(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		result, err := manager.Balance(r.Context(), r.URL.Query().Get("refresh") == "true")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(result)
+	})))
+	mux.Handle("/internal/v1/projects", service.RequireToken(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		accountID := r.URL.Query().Get("account_id")
+		if r.URL.Query().Get("cookies") != "" {
+			http.Error(w, "use account_id; cookie paths are not accepted by the service API", http.StatusUnprocessableEntity)
+			return
+		}
+		result, err := manager.ListProjects(r.Context(), accountID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(result)
+	})))
+	mux.Handle("/internal/v1/stats", service.RequireToken(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recent, err := a.Store.RecentGenerations(50)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		byStatus, byKind, err := a.Store.GenerationBreakdown()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		latency, latencyByKind, err := a.Store.PhaseLatencyBreakdown(r.Context(), 5000)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		queue, err := a.Store.JobQueueStats(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		summary, err := a.Store.Stats()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		generations := make([]map[string]any, 0, len(recent))
+		for _, g := range recent {
+			var elapsed any
+			if g.ElapsedMS != nil {
+				elapsed = float64(*g.ElapsedMS) / 1000
+			}
+			generations = append(generations, map[string]any{
+				"job_id": g.JobID, "account_id": g.AccountID, "kind": g.Kind,
+				"model": g.Model, "aspect": g.Aspect, "status": g.Status,
+				"credits_spent": g.CreditsSpent, "elapsed_seconds": elapsed,
+			})
+		}
+		var total int64
+		for _, count := range byStatus {
+			total += count
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"generations": generations,
+			"totals": map[string]any{"generations": total, "by_status": byStatus,
+				"by_kind": byKind, "media_files": summary.TotalMedia, "credits_spent": summary.CreditsSpent},
+			"latency":         latency,
+			"latency_by_kind": latencyByKind,
+			"service": map[string]any{
+				"queue": queue, "ready_accounts": manager.ReadyAccounts(),
+				"connected_accounts":      manager.ConnectedAccounts(),
+				"strict_cookie_freshness": manager.RequiresLiveCookieSync(),
+				"cookie_sync_age_seconds": manager.CookieSyncAges(),
+			},
+		})
+	})))
+	mux.Handle("/health", serviceHealthHandler(manager, false))
+	mux.Handle("/readyz", serviceHealthHandler(manager, true))
+	server := &http.Server{
+		Addr: listenAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second,
+	}
+	bridgeErr := make(chan error, 1)
+	serverErr := make(chan error, 1)
+	managerDone := make(chan struct{})
+	jobsDone := make(chan struct{})
+	bridgeDone := make(chan struct{})
+	cleanupDone := make(chan struct{})
+	go func() { manager.Start(serviceCtx); close(managerDone) }()
+	go func() { jobs.Start(serviceCtx); close(jobsDone) }()
+	go func() {
+		defer close(cleanupDone)
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-serviceCtx.Done():
+				return
+			case <-ticker.C:
+				cutoff := time.Now().Add(-time.Duration(retentionDays) * 24 * time.Hour)
+				if _, err := a.Store.DeleteTerminalJobsBefore(serviceCtx, cutoff); err != nil && serviceCtx.Err() == nil {
+					log.Printf("app: periodic job retention cleanup failed: %v", err)
+				}
+			}
+		}
+	}()
+	go func() {
+		bridgeErr <- a.Bridge.Listen(serviceCtx)
+		close(bridgeDone)
+	}()
+	go func() {
+		err := server.ListenAndServe()
+		if err != nil && err != http.ErrServerClosed {
+			serverErr <- err
+		}
+	}()
+
+	log.Printf("app: generation service listening on http://%s with bridge ws://%s",
+		listenAddr, a.Bridge.ListenAddr)
+	log.Printf("service_metric phase=service_start_to_listening elapsed_ms=%d", time.Since(serviceStart).Milliseconds())
+	var runErr error
+	select {
+	case <-ctx.Done():
+	case err := <-bridgeErr:
+		runErr = err
+	case err := <-serverErr:
+		runErr = err
+	}
+	// Close the intake and prevent new leases first. Let active handlers finish
+	// briefly, then drain already leased jobs while the bridge and account
+	// manager remain alive so they can use fresh cookie/session updates.
+	jobs.StopClaiming()
+	httpShutdownCtx, cancelHTTP := context.WithTimeout(context.Background(), 3*time.Second)
+	shutdownErr := server.Shutdown(httpShutdownCtx)
+	cancelHTTP()
+	if shutdownErr != nil {
+		_ = server.Close()
+	}
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), time.Duration(drainSeconds)*time.Second)
+	drainErr := jobs.Drain(drainCtx)
+	cancelDrain()
+	if drainErr != nil {
+		log.Printf("app: job drain deadline reached; persisting remaining work for recovery: %v", drainErr)
+		if shutdownErr == nil {
+			shutdownErr = fmt.Errorf("app: job drain: %w", drainErr)
+		}
+	}
+	stop()
+	<-jobsDone
+	manager.WaitBackground()
+	<-managerDone
+	<-bridgeDone
+	<-cleanupDone
+	if runErr != nil {
+		return runErr
+	}
+	return shutdownErr
+}
+
+func serviceDrainSecondsFromEnv() (int, error) {
+	const name = "FLOW_SERVICE_DRAIN_SECONDS"
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return 30, nil
+	}
+	seconds, err := strconv.Atoi(raw)
+	if err != nil || seconds < 1 || seconds > 3600 {
+		return 0, fmt.Errorf("app: %s must be an integer from 1 to 3600", name)
+	}
+	return seconds, nil
+}
+
+func serviceHealthHandler(manager *service.AccountManager, readiness bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		readyAccounts := manager.ReadyAccounts()
+		initialized := manager.Initialized()
+		status := "ok"
+		if readiness && (!initialized || readyAccounts == 0) {
+			status = "not_ready"
+			w.WriteHeader(http.StatusServiceUnavailable)
+		} else if readiness {
+			status = "ready"
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": status, "initialized": initialized,
+			"ready_accounts": readyAccounts, "connected_accounts": manager.ConnectedAccounts(),
+			"strict_cookie_freshness": manager.RequiresLiveCookieSync(),
+		})
+	})
+}
+
+func positiveEnvInt(name string, fallback int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 1 {
+		return 0, fmt.Errorf("app: %s must be a positive integer", name)
+	}
+	return value, nil
+}
+
+func jobMaxAttemptsFromEnv() (int, error) {
+	value, err := positiveEnvInt("FLOW_JOB_MAX_ATTEMPTS", 3)
+	if err != nil {
+		return 0, err
+	}
+	if value > 20 {
+		return 0, fmt.Errorf("app: FLOW_JOB_MAX_ATTEMPTS must be between 1 and 20")
+	}
+	return value, nil
+}
+
+func jobRetryBudgetFromEnv(name string, fallback int) (int, error) {
+	value, err := positiveEnvInt(name, fallback)
+	if err != nil {
+		return 0, err
+	}
+	if value > 20 {
+		return 0, fmt.Errorf("app: %s must be between 1 and 20", name)
+	}
+	return value, nil
+}
+
+func queueWorkersFromEnv(serviceWorkers int) (int, error) {
+	if serviceWorkers < 1 {
+		serviceWorkers = 1
+	}
+	defaultWorkers := serviceWorkers * 4
+	if defaultWorkers < 16 {
+		defaultWorkers = 16
+	}
+	if defaultWorkers > 256 {
+		defaultWorkers = 256
+	}
+	value, err := positiveEnvInt("FLOW_QUEUE_WORKERS", defaultWorkers)
+	if err != nil {
+		return 0, err
+	}
+	if value > 256 {
+		return 0, fmt.Errorf("app: FLOW_QUEUE_WORKERS must be between 1 and 256")
+	}
+	return value, nil
+}
+
+func mediaConcurrencyFromEnv(name string, fallback int) (int, error) {
+	if fallback < 1 {
+		fallback = 1
+	}
+	if fallback > 256 {
+		fallback = 256
+	}
+	value, err := positiveEnvInt(name, fallback)
+	if err != nil {
+		return 0, err
+	}
+	if value > 256 {
+		return 0, fmt.Errorf("app: %s must be between 1 and 256", name)
+	}
+	return value, nil
 }

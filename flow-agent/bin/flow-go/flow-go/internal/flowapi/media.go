@@ -6,14 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/kodelyx/flow-go/flow-go/internal/atomicfile"
 	"github.com/kodelyx/flow-go/flow-go/internal/config"
 	"github.com/kodelyx/flow-go/flow-go/internal/httpx"
 )
@@ -203,10 +202,6 @@ func (c *Client) resolveRedirect(ctx context.Context, path, mediaID string) (str
 // a 403 — which is the single most common download failure in this kind of
 // client.
 func (c *Client) Download(ctx context.Context, mediaURL, targetPath string) (int64, error) {
-	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
-		return 0, err
-	}
-
 	cookieHeader := c.auth.Jar().HeaderForDomain(config.LabsBase)
 	currentURL := mediaURL
 
@@ -238,18 +233,11 @@ func (c *Client) Download(ctx context.Context, mediaURL, targetPath string) (int
 			return 0, fmt.Errorf("flow: download failed with status %d", resp.Status)
 		}
 
-		tmp := targetPath + ".part"
-		written, err := writeFile(tmp, resp.Body)
-		if err != nil {
-			_ = os.Remove(tmp)
-			return 0, err
-		}
+		written := int64(len(resp.Body))
 		if written < 1000 {
-			_ = os.Remove(tmp)
 			return 0, fmt.Errorf("flow: downloaded only %d bytes; treating as a failed download", written)
 		}
-		if err := os.Rename(tmp, targetPath); err != nil {
-			_ = os.Remove(tmp)
+		if err := atomicfile.Write(targetPath, resp.Body, 0o644); err != nil {
 			return 0, err
 		}
 
@@ -258,19 +246,6 @@ func (c *Client) Download(ctx context.Context, mediaURL, targetPath string) (int
 	}
 
 	return 0, fmt.Errorf("flow: too many redirects downloading %s", truncate(mediaURL, 80))
-}
-
-func writeFile(path string, data []byte) (int64, error) {
-	f, err := os.Create(path)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	n, err := io.Copy(f, strings.NewReader(string(data)))
-	if err != nil {
-		return n, err
-	}
-	return n, nil
 }
 
 // LegacyMediaBase64 fetches a media item from the older inline endpoint, which

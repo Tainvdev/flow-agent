@@ -110,7 +110,9 @@ type pendingCall struct {
 
 // Client is one extension connection.
 type Client struct {
-	conn *websocket.Conn
+	conn     *websocket.Conn
+	done     chan struct{}
+	doneOnce sync.Once
 
 	mu      sync.Mutex
 	pending map[string]*pendingCall
@@ -156,6 +158,7 @@ type Client struct {
 func New(conn *websocket.Conn) *Client {
 	c := &Client{
 		conn:    conn,
+		done:    make(chan struct{}),
 		pending: make(map[string]*pendingCall),
 		subs:    make(map[int]chan Event),
 	}
@@ -430,6 +433,7 @@ func (c *Client) Close() error {
 	inFlight := c.pending
 	c.pending = make(map[string]*pendingCall)
 	c.mu.Unlock()
+	c.doneOnce.Do(func() { close(c.done) })
 
 	for _, p := range inFlight {
 		close(p.ch)
@@ -536,6 +540,7 @@ func (c *Client) failAll(cause error) {
 	inFlight := c.pending
 	c.pending = make(map[string]*pendingCall)
 	c.mu.Unlock()
+	c.doneOnce.Do(func() { close(c.done) })
 
 	if conn != nil {
 		_ = conn.Close()
@@ -546,6 +551,11 @@ func (c *Client) failAll(cause error) {
 	if cause != nil && !errors.Is(cause, websocket.ErrCloseSent) {
 		log.Printf("cdp: socket closed: %v", cause)
 	}
+}
+
+// Done is closed when the underlying extension connection is closed.
+func (c *Client) Done() <-chan struct{} {
+	return c.done
 }
 
 /* ------------------------------------------------------------------ *

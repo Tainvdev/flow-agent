@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -305,6 +306,49 @@ func TestUploadVideoReportsARefusedUpload(t *testing.T) {
 	if !strings.Contains(err.Error(), "403") {
 		t.Errorf("the error should carry the status: %v", err)
 	}
+	assertUploadOutcomeUnknown(t, err, false)
+}
+
+func TestUploadVideoMarksServerErrorOutcomeUnknown(t *testing.T) {
+	path, _ := videoFixture(t, "clip.mp4", "data")
+	server, _ := uploadServer(t, http.StatusOK, http.StatusBadGateway, `gateway error`)
+	pointUploadAt(t, server)
+
+	_, err := uploadEngine(t).UploadVideo(context.Background(), path, UploadOptions{})
+	if err == nil || !strings.Contains(err.Error(), "502") {
+		t.Fatalf("upload error=%v, want HTTP 502", err)
+	}
+	assertUploadOutcomeUnknown(t, err, true)
+}
+
+func TestUploadVideo429CoolsAccountWithoutRetryingAmbiguousData(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		sessionStatus int
+		resultStatus  int
+	}{
+		{name: "session", sessionStatus: http.StatusTooManyRequests, resultStatus: http.StatusOK},
+		{name: "data", sessionStatus: http.StatusOK, resultStatus: http.StatusTooManyRequests},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path, _ := videoFixture(t, "clip.mp4", "data")
+			server, _ := uploadServer(t, tc.sessionStatus, tc.resultStatus, "rate limited")
+			pointUploadAt(t, server)
+			_, err := uploadEngine(t).UploadVideo(context.Background(), path, UploadOptions{})
+			if err == nil {
+				t.Fatal("HTTP 429 should fail the upload")
+			}
+			var throttle interface{ Throttled() bool }
+			if !errors.As(err, &throttle) || !throttle.Throttled() {
+				t.Fatalf("error=%v, want account throttle classification", err)
+			}
+			var safe interface{ SafeToRetry() bool }
+			if errors.As(err, &safe) && safe.SafeToRetry() {
+				t.Fatalf("error=%v must not replay a video upload", err)
+			}
+			assertUploadOutcomeUnknown(t, err, false)
+		})
+	}
 }
 
 // An upload that succeeded but answered with nothing addressable must not be
@@ -325,6 +369,16 @@ func TestUploadVideoReportsAnUnreadableResult(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "may have succeeded") {
 		t.Errorf("the error should say the upload itself may have worked: %v", err)
+	}
+	assertUploadOutcomeUnknown(t, err, true)
+}
+
+func assertUploadOutcomeUnknown(t *testing.T, err error, want bool) {
+	t.Helper()
+	var unknown interface{ SubmissionUnknown() bool }
+	got := errors.As(err, &unknown) && unknown.SubmissionUnknown()
+	if got != want {
+		t.Errorf("submission unknown=%v, want %v (err=%v)", got, want, err)
 	}
 }
 
@@ -733,6 +787,7 @@ func TestUploadVideoReportsAHangingUpload(t *testing.T) {
 	if !strings.Contains(err.Error(), "UPLOAD_TIMEOUT") {
 		t.Errorf("the error should name the knob that bounds it: %v", err)
 	}
+	assertUploadOutcomeUnknown(t, err, true)
 }
 
 // A connection that dies mid-upload has no status to report, so the transport's
@@ -767,4 +822,5 @@ func TestUploadVideoReportsABrokenStream(t *testing.T) {
 	if !strings.Contains(err.Error(), "the upload failed") {
 		t.Errorf("want the transport failure reported: %v", err)
 	}
+	assertUploadOutcomeUnknown(t, err, true)
 }

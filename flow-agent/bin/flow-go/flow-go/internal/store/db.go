@@ -13,6 +13,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	_ "embed"
 	"encoding/json"
@@ -32,9 +33,30 @@ var schemaSQL string
 
 // Store wraps the database handle.
 type Store struct {
-	db   *sql.DB
-	path string
+	db                 *sql.DB
+	path               string
+	maxOutstandingJobs int
 }
+
+// SetMaxOutstandingJobs configures queue admission. Set it during service
+// startup before accepting requests; a positive value is required.
+func (s *Store) SetMaxOutstandingJobs(limit int) error {
+	if limit < 1 {
+		return fmt.Errorf("store: max outstanding jobs must be positive")
+	}
+	s.maxOutstandingJobs = limit
+	return nil
+}
+
+func (s *Store) queueLimit() int {
+	if s.maxOutstandingJobs < 1 {
+		return maxOutstandingJobs
+	}
+	return s.maxOutstandingJobs
+}
+
+// DatabasePath returns the absolute SQLite path owned by this store.
+func (s *Store) DatabasePath() string { return s.path }
 
 // busyTimeout is how long a statement waits for another process's lock before
 // giving up, in milliseconds.
@@ -160,7 +182,7 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 
-	return &Store{db: db, path: path}, nil
+	return &Store{db: db, path: path, maxOutstandingJobs: maxOutstandingJobs}, nil
 }
 
 // Close releases the database.
@@ -192,6 +214,11 @@ var addedColumns = []struct{ table, column, decl string }{
 	{"accounts", "superseded_by", "TEXT"},
 	{"accounts", "last_authuser", "INTEGER"},
 	{"accounts", "sapisid_fingerprint", "TEXT"},
+	{"jobs", "parent_id", "TEXT REFERENCES jobs(job_id) ON DELETE CASCADE"},
+	{"jobs", "child_index", "INTEGER NOT NULL DEFAULT 0"},
+	{"jobs", "payload_version", "INTEGER NOT NULL DEFAULT 1"},
+	{"jobs", "error_code", "INTEGER NOT NULL DEFAULT 0"},
+	{"uploads", "account_id", "TEXT NOT NULL DEFAULT ''"},
 }
 
 func migrate(db *sql.DB) error {
@@ -219,14 +246,114 @@ func migrate(db *sql.DB) error {
 			return fmt.Errorf("store: index after column migration: %w", err)
 		}
 	}
+	for _, trigger := range postSchemaTriggers {
+		if _, err := db.Exec(trigger); err != nil {
+			return fmt.Errorf("store: create phase event trigger: %w", err)
+		}
+	}
 
-	return backfillIdentity(db)
+	if err := backfillIdentity(db); err != nil {
+		return err
+	}
+	if err := backfillJobAttemptPhases(db); err != nil {
+		return err
+	}
+	return backfillJobEvents(db)
+}
+
+// Triggers are installed separately because schema.sql's statement splitter is
+// intentionally simple and treats semicolons as statement boundaries.
+var postSchemaTriggers = []string{
+	`CREATE TRIGGER IF NOT EXISTS trg_job_event_insert
+	AFTER INSERT ON jobs
+	BEGIN
+		INSERT INTO job_events(job_id, event_type, data, occurred_at)
+		VALUES(NEW.job_id, 'status', json_object(
+			'job_id', NEW.job_id, 'status', NEW.status, 'attempts', NEW.attempts,
+			'updated_at', NEW.updated_at), NEW.updated_at);
+	END`,
+	`CREATE TRIGGER IF NOT EXISTS trg_job_event_status_update
+	AFTER UPDATE OF status, error_code ON jobs
+	WHEN OLD.status IS NOT NEW.status OR OLD.error_code IS NOT NEW.error_code
+	BEGIN
+		INSERT INTO job_events(job_id, event_type, data, occurred_at)
+		VALUES(NEW.job_id, 'status', json_object(
+			'job_id', NEW.job_id, 'status', NEW.status, 'attempts', NEW.attempts,
+			'error_code', NEW.error_code, 'updated_at', NEW.updated_at), NEW.updated_at);
+	END`,
+	`CREATE TRIGGER IF NOT EXISTS trg_job_attempt_phase_insert
+	AFTER INSERT ON job_attempts
+	BEGIN
+		INSERT INTO job_attempt_phase_events(job_id, attempt_no, phase, occurred_at)
+		VALUES(NEW.job_id, NEW.attempt_no, NEW.phase, NEW.started_at);
+		INSERT INTO job_events(job_id, event_type, data, occurred_at)
+		VALUES(NEW.job_id, 'phase', json_object(
+			'job_id', NEW.job_id, 'attempt_no', NEW.attempt_no, 'phase', NEW.phase,
+			'account_id', NEW.account_id, 'project_id', NEW.project_id), NEW.started_at);
+	END`,
+	`CREATE TRIGGER IF NOT EXISTS trg_job_attempt_phase_update
+	AFTER UPDATE OF phase ON job_attempts
+	WHEN OLD.phase IS NOT NEW.phase
+	BEGIN
+		INSERT INTO job_attempt_phase_events(job_id, attempt_no, phase, occurred_at)
+		VALUES(NEW.job_id, NEW.attempt_no, NEW.phase, NEW.updated_at);
+		INSERT INTO job_events(job_id, event_type, data, occurred_at)
+		VALUES(NEW.job_id, 'phase', json_object(
+			'job_id', NEW.job_id, 'attempt_no', NEW.attempt_no, 'phase', NEW.phase,
+			'account_id', NEW.account_id, 'project_id', NEW.project_id), NEW.updated_at);
+	END`,
+}
+
+// backfillJobAttemptPhases seeds one baseline event for attempts persisted by
+// earlier versions before phase transitions were recorded. Historical phases
+// cannot be reconstructed, but the current state and start time remain useful.
+func backfillJobAttemptPhases(db *sql.DB) error {
+	_, err := db.Exec(`INSERT INTO job_attempt_phase_events(job_id, attempt_no, phase, occurred_at)
+		SELECT a.job_id, a.attempt_no, a.phase, a.started_at FROM job_attempts a
+		WHERE NOT EXISTS (
+			SELECT 1 FROM job_attempt_phase_events e
+			WHERE e.job_id=a.job_id AND e.attempt_no=a.attempt_no)`)
+	if err != nil {
+		return fmt.Errorf("store: backfill job attempt phases: %w", err)
+	}
+	return nil
+}
+
+// backfillJobEvents seeds streams for jobs created before the unified event
+// log. The NOT EXISTS checks make this safe on every database open.
+func backfillJobEvents(db *sql.DB) error {
+	if _, err := db.Exec(`INSERT INTO job_events(job_id, event_type, data, occurred_at)
+		SELECT j.job_id, 'status', json_object(
+			'job_id', j.job_id, 'status', j.status, 'attempts', j.attempts,
+			'error_code', j.error_code, 'updated_at', j.updated_at), j.updated_at
+		FROM jobs j
+		WHERE NOT EXISTS (
+			SELECT 1 FROM job_events e WHERE e.job_id=j.job_id AND e.event_type='status')`); err != nil {
+		return fmt.Errorf("store: backfill job status events: %w", err)
+	}
+	if _, err := db.Exec(`INSERT INTO job_events(job_id, event_type, data, occurred_at)
+		SELECT e.job_id, 'phase', json_object(
+			'job_id', e.job_id, 'attempt_no', e.attempt_no, 'phase', e.phase,
+			'account_id', a.account_id, 'project_id', a.project_id), e.occurred_at
+		FROM job_attempt_phase_events e
+		JOIN job_attempts a ON a.job_id=e.job_id AND a.attempt_no=e.attempt_no
+		WHERE NOT EXISTS (
+			SELECT 1 FROM job_events s
+			WHERE s.job_id=e.job_id AND s.event_type='phase'
+				AND json_extract(s.data, '$.attempt_no')=e.attempt_no
+				AND json_extract(s.data, '$.phase')=e.phase
+				AND s.occurred_at=e.occurred_at)`); err != nil {
+		return fmt.Errorf("store: backfill job phase events: %w", err)
+	}
+	return nil
 }
 
 // postColumnIndexes are created after addedColumns has run, for the reason given
 // on the loop above.
 var postColumnIndexes = []string{
 	`CREATE INDEX IF NOT EXISTS idx_accounts_identity ON accounts(identity_key)`,
+	`CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_id, child_index)`,
+	`CREATE INDEX IF NOT EXISTS idx_uploads_account_lookup ON uploads(account_id, file_hash, project_id, id DESC)`,
 }
 
 // ensureColumn adds a column when it is missing and does nothing when it is
@@ -494,6 +621,45 @@ func (s *Store) RecordAccountOutcome(accountID string, failed bool, errMessage s
 	return err
 }
 
+// SetAccountCooldown persists a scheduler park until an absolute deadline.
+func (s *Store) SetAccountCooldown(ctx context.Context, accountID string, until time.Time, reason string) error {
+	if strings.TrimSpace(accountID) == "" || until.IsZero() || strings.TrimSpace(reason) == "" {
+		return fmt.Errorf("store: account id, cooldown deadline, and reason are required")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO account_cooldowns(account_id,until_at,reason,updated_at)
+		VALUES(?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET
+		until_at=excluded.until_at, reason=excluded.reason, updated_at=excluded.updated_at`,
+		accountID, dbTimestamp(until), reason, dbTimestamp(time.Now().UTC()))
+	if err != nil {
+		return fmt.Errorf("store: persist cooldown for account %s: %w", accountID, err)
+	}
+	return nil
+}
+
+// AccountCooldown returns the persisted cooldown when one exists.
+func (s *Store) AccountCooldown(ctx context.Context, accountID string) (time.Time, string, bool, error) {
+	var raw string
+	var reason string
+	err := s.db.QueryRowContext(ctx, `SELECT until_at,reason FROM account_cooldowns WHERE account_id=?`, accountID).Scan(&raw, &reason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, "", false, nil
+	}
+	if err != nil {
+		return time.Time{}, "", false, err
+	}
+	until, ok := parseSQLiteTime(raw)
+	if !ok {
+		return time.Time{}, "", false, fmt.Errorf("store: invalid cooldown timestamp for account %s", accountID)
+	}
+	return until, reason, true, nil
+}
+
+// ClearAccountCooldown removes a cooldown after a successful account operation.
+func (s *Store) ClearAccountCooldown(ctx context.Context, accountID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM account_cooldowns WHERE account_id=?`, accountID)
+	return err
+}
+
 // ListAccounts returns every account, newest first.
 func (s *Store) ListAccounts() ([]Account, error) {
 	rows, err := s.db.Query(`
@@ -546,6 +712,13 @@ func (s *Store) ListAccounts() ([]Account, error) {
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// AccountStatus reads one account's durable readiness state.
+func (s *Store) AccountStatus(accountID string) (string, error) {
+	var status string
+	err := s.db.QueryRow(`SELECT status FROM accounts WHERE account_id=?`, accountID).Scan(&status)
+	return status, err
 }
 
 /* ------------------------------------------------------------------ *
@@ -882,6 +1055,47 @@ func (s *Store) RecentGenerations(limit int) ([]Generation, error) {
 	return out, rows.Err()
 }
 
+// GenerationBreakdown returns exact historical counts used by the API summary.
+func (s *Store) GenerationBreakdown() (map[string]int64, map[string]int64, error) {
+	statuses := make(map[string]int64)
+	kinds := make(map[string]int64)
+	rows, err := s.db.Query(`SELECT status, COUNT(*) FROM generations GROUP BY status`)
+	if err != nil {
+		return nil, nil, err
+	}
+	for rows.Next() {
+		var key string
+		var count int64
+		if err := rows.Scan(&key, &count); err != nil {
+			rows.Close()
+			return nil, nil, err
+		}
+		statuses[key] = count
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, nil, err
+	}
+	rows.Close()
+	rows, err = s.db.Query(`SELECT kind, COUNT(*) FROM generations GROUP BY kind`)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key string
+		var count int64
+		if err := rows.Scan(&key, &count); err != nil {
+			return nil, nil, err
+		}
+		kinds[key] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return statuses, kinds, nil
+}
+
 /* ------------------------------------------------------------------ *
  * Media
  * ------------------------------------------------------------------ */
@@ -907,6 +1121,36 @@ type Media struct {
 	URL          string `json:"url"`
 	Resolution   string `json:"resolution"`
 	Bytes        int64  `json:"bytes"`
+}
+
+// MediaOwnership reports the account and project that produced a known media ID.
+// IDs not present in the local history are external and return found=false.
+type MediaOwnership struct {
+	AccountID string
+	ProjectID string
+}
+
+func (s *Store) LookupMediaOwnership(ctx context.Context, mediaID string) (MediaOwnership, bool, error) {
+	var owner MediaOwnership
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(g.account_id,''), COALESCE((
+			SELECT a.project_id FROM job_attempts a
+			WHERE a.job_id=g.job_id AND a.project_id IS NOT NULL AND a.project_id<>''
+			ORDER BY a.attempt_no DESC LIMIT 1
+		), '')
+		FROM media m LEFT JOIN generations g ON g.id=m.generation_id
+		WHERE m.media_id=? ORDER BY m.id DESC LIMIT 1
+	`, strings.TrimSpace(mediaID)).Scan(&owner.AccountID, &owner.ProjectID)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = s.db.QueryRowContext(ctx, `SELECT account_id, project_id FROM uploads WHERE media_id=? ORDER BY id DESC LIMIT 1`, strings.TrimSpace(mediaID)).Scan(&owner.AccountID, &owner.ProjectID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return MediaOwnership{}, false, nil
+		}
+	}
+	if err != nil {
+		return MediaOwnership{}, false, err
+	}
+	return owner, true, nil
 }
 
 // RecordMedia inserts an asset row.
@@ -970,6 +1214,7 @@ type UploadRecord struct {
 	// id is only addressable inside the project it was created in.
 	FileHash  string    `json:"file_hash"`
 	MediaID   string    `json:"media_id"`
+	AccountID string    `json:"account_id"`
 	ProjectID string    `json:"project_id"`
 	Bytes     int64     `json:"bytes"`
 	CreatedAt time.Time `json:"created_at"`
@@ -978,9 +1223,9 @@ type UploadRecord struct {
 // RecordUpload inserts an upload row.
 func (s *Store) RecordUpload(u UploadRecord) error {
 	_, err := s.db.Exec(`
-		INSERT INTO uploads (file_path, file_hash, media_id, project_id, bytes)
-		VALUES (?, ?, ?, ?, ?)
-	`, u.FilePath, u.FileHash, u.MediaID, u.ProjectID, u.Bytes)
+		INSERT INTO uploads (file_path, file_hash, media_id, account_id, project_id, bytes)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, u.FilePath, u.FileHash, u.MediaID, u.AccountID, u.ProjectID, u.Bytes)
 	return err
 }
 
@@ -999,14 +1244,14 @@ func (s *Store) RecordUpload(u UploadRecord) error {
 // A hit is a claim about the past: it says this media id was valid when it was
 // written, and nothing here re-checks that. See the note on the uploads table in
 // schema.sql.
-func (s *Store) FindUpload(fileHash, projectID string) (*UploadRecord, error) {
+func (s *Store) FindUpload(accountID, fileHash, projectID string) (*UploadRecord, error) {
 	rows, err := s.db.Query(`
-		SELECT id, file_path, file_hash, media_id, project_id, COALESCE(bytes, 0), created_at
+		SELECT id, file_path, file_hash, media_id, account_id, project_id, COALESCE(bytes, 0), created_at
 		  FROM uploads
-		 WHERE file_hash = ? AND project_id = ?
+		 WHERE account_id = ? AND file_hash = ? AND project_id = ?
 		 ORDER BY id DESC
 		 LIMIT 1
-	`, fileHash, projectID)
+	`, accountID, fileHash, projectID)
 	if err != nil {
 		return nil, err
 	}
@@ -1018,7 +1263,7 @@ func (s *Store) FindUpload(fileHash, projectID string) (*UploadRecord, error) {
 
 	var u UploadRecord
 	var createdAt sql.NullString
-	if err := rows.Scan(&u.ID, &u.FilePath, &u.FileHash, &u.MediaID, &u.ProjectID,
+	if err := rows.Scan(&u.ID, &u.FilePath, &u.FileHash, &u.MediaID, &u.AccountID, &u.ProjectID,
 		&u.Bytes, &createdAt); err != nil {
 		return nil, err
 	}
@@ -1229,7 +1474,7 @@ func (s *Store) Stats() (SystemStats, error) {
 // Reset deletes all rows. Exposed for tests and for an explicit operator action;
 // it is never called by the engine itself.
 func (s *Store) Reset() error {
-	for _, table := range []string{"media", "generations", "request_logs", "accounts"} {
+	for _, table := range []string{"job_attempts", "jobs", "media", "generations", "request_logs", "accounts"} {
 		if _, err := s.db.Exec("DELETE FROM " + table); err != nil {
 			return fmt.Errorf("store: reset %s: %w", table, err)
 		}

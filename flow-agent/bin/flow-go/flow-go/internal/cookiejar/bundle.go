@@ -3,6 +3,7 @@ package cookiejar
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 )
 
 // Fingerprint is the browser identity a bundle carries.
@@ -68,14 +69,40 @@ func LoadBundleFile(path string) (*Bundle, error) {
 
 // Save writes the bundle, creating parent directories.
 func (b *Bundle) Save(path string) error {
-	if err := os.MkdirAll(dirOf(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(b, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+
+	// Write beside the destination and replace it only after the full JSON has
+	// reached disk. Readers in another process then see either the old complete
+	// bundle or the new complete bundle, never a truncated cookie file.
+	tmp, err := os.CreateTemp(dir, ".bundle-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 // Jar is the bundle's cookies as a jar.

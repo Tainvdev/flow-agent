@@ -1,10 +1,15 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
 	"github.com/kodelyx/flow-go/flow-go/internal/pool"
 )
 
@@ -22,6 +27,87 @@ func readyEngine(t *testing.T) *Engine {
 	e.ready = true
 	e.pool.Register(pool.NewWorker("acct-test", nil))
 	return e
+}
+
+func TestEngineSessionRecoveryCoalescesRefreshAndBootstrap(t *testing.T) {
+	const callers = 12
+	e := readyEngine(t)
+	jar := cookiejar.FromRaw("SAPISID=fresh", ".google.com", "test")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	refresh := func(context.Context) (*cookiejar.Jar, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		return jar, nil
+	}
+
+	start := make(chan struct{})
+	results := make(chan *cookiejar.Jar, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			got, err := e.coalesceSessionRefresh(context.Background(), refresh)
+			if err != nil {
+				t.Errorf("coalesced session recovery: %v", err)
+			}
+			results <- got
+		}()
+	}
+	close(start)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("session recovery did not start")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		e.refreshMu.Lock()
+		waiters := 0
+		if e.refreshing != nil {
+			waiters = e.refreshing.waiters
+		}
+		e.refreshMu.Unlock()
+		if waiters == callers-1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	e.refreshMu.Lock()
+	waiters := 0
+	if e.refreshing != nil {
+		waiters = e.refreshing.waiters
+	}
+	e.refreshMu.Unlock()
+	if waiters != callers-1 {
+		close(release)
+		t.Fatalf("session recovery waiters=%d, want %d", waiters, callers-1)
+	}
+	close(release)
+	wg.Wait()
+	close(results)
+	for got := range results {
+		if got == nil || got.Hash() != jar.Hash() {
+			t.Errorf("recovery returned jar %v, want the fresh account jar", got)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("refresh/bootstrap recovery executions=%d, want 1", got)
+	}
+	if got, err := e.coalesceSessionRefresh(context.Background(), func(context.Context) (*cookiejar.Jar, error) {
+		calls.Add(1)
+		return nil, errors.New("must not bootstrap again inside the recovery window")
+	}); err != nil || got == nil || got.Hash() != jar.Hash() {
+		t.Fatalf("recent session recovery=(%v,%v), want the cached fresh jar", got, err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("recent recovery ran bootstrap again: calls=%d", got)
+	}
 }
 
 // TestPreflightPassesWithoutABrowser is the boundary the design turns on.

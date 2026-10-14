@@ -68,6 +68,34 @@ func TestABundleRoundTrips(t *testing.T) {
 	}
 }
 
+func TestSaveAtomicallyReplacesExistingBundle(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "account_test.json")
+	first := &Bundle{AccountID: "acct-1", Cookies: []Cookie{bundleCookie("SAPISID", "old")}}
+	if err := first.Save(path); err != nil {
+		t.Fatalf("save first bundle: %v", err)
+	}
+
+	second := &Bundle{AccountID: "acct-1", Cookies: []Cookie{bundleCookie("SAPISID", "new")}}
+	if err := second.Save(path); err != nil {
+		t.Fatalf("replace bundle: %v", err)
+	}
+
+	got, err := LoadBundleFile(path)
+	if err != nil {
+		t.Fatalf("load replaced bundle: %v", err)
+	}
+	if len(got.Cookies) != 1 || got.Cookies[0].Value != "new" {
+		t.Fatalf("bundle after replacement = %+v, want latest cookie snapshot", got.Cookies)
+	}
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("read bundle directory: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(path) {
+		t.Fatalf("temporary bundle files remain after replacement: %v", entries)
+	}
+}
+
 // TestTheFileSpellsTheKeysTheWayTheFormatDoes pins the wire spelling. These
 // names are read by other tools, so a Go field rename must not silently change
 // the file.

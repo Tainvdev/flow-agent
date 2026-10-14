@@ -80,9 +80,9 @@ def test_extract_json_raises_on_a_truncated_object():
 
 
 def test_command_drops_arguments_that_were_not_given():
-    engine = FlowEngine(root="/tmp", binary="/bin/echo")
+    engine = FlowEngine(root="/tmp", binary="flow-test-binary")
     assert engine._command("image", "a boat", None, "", "x2") == [
-        "/bin/echo",
+        "flow-test-binary",
         "image",
         "a boat",
         "x2",
@@ -91,8 +91,8 @@ def test_command_drops_arguments_that_were_not_given():
 
 def test_command_keeps_falsy_values_that_are_not_absent():
     """`0` is a value. Only None and "" mean "not given"."""
-    engine = FlowEngine(root="/tmp", binary="/bin/echo")
-    assert engine._command("image", "p", 0) == ["/bin/echo", "image", "p", "0"]
+    engine = FlowEngine(root="/tmp", binary="flow-test-binary")
+    assert engine._command("image", "p", 0) == ["flow-test-binary", "image", "p", "0"]
 
 
 # --------------------------------------------------------------------------- #
@@ -278,3 +278,10 @@ def test_find_binary_selects_platform_executable(tmp_path, monkeypatch):
     mac_bin.write_text("dummy")
     monkeypatch.setattr("platform.system", lambda: "Darwin")
     assert FlowEngine._find_binary(tmp_path) == mac_bin
+
+    # Apple Silicon gets its native build when packaged; Intel retains the
+    # existing flow-macos fallback.
+    mac_arm_bin = bin_dir / "flow-macos-arm64"
+    mac_arm_bin.write_text("dummy")
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+    assert FlowEngine._find_binary(tmp_path) == mac_arm_bin

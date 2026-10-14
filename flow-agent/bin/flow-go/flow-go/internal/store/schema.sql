@@ -48,6 +48,15 @@ CREATE TABLE IF NOT EXISTS accounts (
 
 CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
 
+-- Scheduler cooldowns survive a Go service restart. Expiration is absolute UTC
+-- time so a restart does not silently return throttled accounts to rotation.
+CREATE TABLE IF NOT EXISTS account_cooldowns (
+    account_id   TEXT PRIMARY KEY REFERENCES accounts(account_id) ON DELETE CASCADE,
+    until_at     DATETIME NOT NULL,
+    reason       TEXT NOT NULL,
+    updated_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 -- NOTE: there is deliberately no index on accounts(identity_key) here.
 --
 -- This script runs before migrate() adds the identity columns to a database
@@ -156,6 +165,7 @@ CREATE TABLE IF NOT EXISTS uploads (
     file_path   TEXT NOT NULL,                     -- as given; for a human, not for matching
     file_hash   TEXT NOT NULL,                     -- SHA-256 of the file's contents
     media_id    TEXT NOT NULL,                     -- what the edit RPC takes
+    account_id  TEXT NOT NULL DEFAULT '',          -- prevents cache reuse across accounts
     project_id  TEXT NOT NULL,                     -- media ids are project-scoped
     bytes       INTEGER NOT NULL,
     created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -163,7 +173,7 @@ CREATE TABLE IF NOT EXISTS uploads (
 
 -- The lookup is always (hash, project), newest first, so the index carries both
 -- in that order and the id breaks the tie.
-CREATE INDEX IF NOT EXISTS idx_uploads_lookup ON uploads(file_hash, project_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_uploads_lookup ON uploads(account_id, file_hash, project_id, id DESC);
 
 -- ----------------------------------------------------------------------------
 -- request_logs: upstream call accounting, used for latency and error reporting.
@@ -195,3 +205,74 @@ CREATE TABLE IF NOT EXISTS settings (
     value               TEXT NOT NULL,
     updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- ----------------------------------------------------------------------------
+-- jobs: durable queue owned by the long-lived service.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS jobs (
+    job_id              TEXT PRIMARY KEY,
+    kind                TEXT NOT NULL,
+    payload             TEXT NOT NULL,
+    payload_version     INTEGER NOT NULL DEFAULT 1,
+    idempotency_key     TEXT UNIQUE,
+    status              TEXT NOT NULL DEFAULT 'queued',
+    result              TEXT,
+    error               TEXT,
+    error_code          INTEGER NOT NULL DEFAULT 0,
+    lease_owner         TEXT,
+    lease_until         DATETIME,
+    attempts            INTEGER NOT NULL DEFAULT 0,
+    parent_id           TEXT REFERENCES jobs(job_id) ON DELETE CASCADE,
+    child_index         INTEGER NOT NULL DEFAULT 0,
+    created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    finished_at         DATETIME
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_claim ON jobs(status, lease_until, created_at);
+
+-- One row per worker execution. Preparing attempts are safe to retry after a
+-- crash; executing attempts are ambiguous unless a completed result was saved.
+CREATE TABLE IF NOT EXISTS job_attempts (
+    attempt_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id              TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    attempt_no          INTEGER NOT NULL,
+    account_id          TEXT,
+    project_id          TEXT,
+    session_revision    TEXT,
+    phase               TEXT NOT NULL DEFAULT 'preparing',
+    upstream_ids        TEXT,
+    result              TEXT,
+    error               TEXT,
+    started_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    finished_at         DATETIME,
+    UNIQUE(job_id, attempt_no)
+);
+CREATE INDEX IF NOT EXISTS idx_job_attempts_job ON job_attempts(job_id, attempt_no);
+
+-- Durable phase transitions make queue wait, submit latency, render latency and
+-- download latency measurable after a restart. SQLite triggers capture every
+-- actual phase change, including transitions performed by lease recovery SQL.
+CREATE TABLE IF NOT EXISTS job_attempt_phase_events (
+    event_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id          TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    attempt_no      INTEGER NOT NULL,
+    phase           TEXT NOT NULL,
+    occurred_at     DATETIME NOT NULL,
+    FOREIGN KEY(job_id, attempt_no) REFERENCES job_attempts(job_id, attempt_no) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_job_attempt_phase_events_attempt
+    ON job_attempt_phase_events(job_id, attempt_no, event_id);
+
+-- Unified durable stream for status and attempt phase changes. event_id is a
+-- monotonic cursor used by SSE Last-Event-ID across reconnects.
+CREATE TABLE IF NOT EXISTS job_events (
+    event_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id          TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    event_type      TEXT NOT NULL,
+    data            TEXT NOT NULL,
+    occurred_at     DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_job_events_job_cursor
+    ON job_events(job_id, event_id);

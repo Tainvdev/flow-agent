@@ -24,6 +24,16 @@ def _print(value) -> None:
         print(json.dumps(value, indent=2, default=str))
 
 
+def _run_async(coro):
+    async def managed():
+        try:
+            return await coro
+        finally:
+            await engine.aclose()
+
+    return asyncio.run(managed())
+
+
 # --------------------------------------------------------------------------- #
 # subcommands
 # --------------------------------------------------------------------------- #
@@ -53,7 +63,7 @@ def cmd_mcp(args) -> int:
 
 def cmd_image(args) -> int:
     _print(
-        asyncio.run(
+        _run_async(
             engine.generate_image(
                 prompt=args.prompt,
                 aspect=args.aspect,
@@ -69,7 +79,7 @@ def cmd_image(args) -> int:
 
 def cmd_video(args) -> int:
     _print(
-        asyncio.run(
+        _run_async(
             engine.generate_video(
                 prompt=args.prompt,
                 aspect=args.aspect,
@@ -86,17 +96,17 @@ def cmd_video(args) -> int:
 
 
 def cmd_balance(args) -> int:
-    _print(asyncio.run(engine.get_balance(refresh=args.refresh)))
+    _print(_run_async(engine.get_balance(refresh=args.refresh)))
     return 0
 
 
 def cmd_stats(args) -> int:
-    _print(asyncio.run(engine.get_stats()))
+    _print(_run_async(engine.get_stats()))
     return 0
 
 
 def cmd_projects(args) -> int:
-    _print(asyncio.run(engine.get_projects(cookies=args.cookies)))
+    _print(_run_async(engine.get_projects(cookies=args.cookies)))
     return 0
 
 

@@ -80,7 +80,8 @@ Generates one or more images from a text prompt using Google Flow's image models
 | `aspect` | string | ❌ | `"1:1"` | Aspect ratio — see values below |
 | `count` | integer | ❌ | `1` | Number of variations — `1` to `4` |
 | `model` | string | ❌ | `"narwhal"` | Model key — `"narwhal"`, `"harbor_seal"`, `"gem_pix_2"` |
-| `all_accounts` | boolean | ❌ | `false` | Run on every account in `cookies/` concurrently |
+| `all_accounts` | boolean | ❌ | `false` | Snapshot eligible accounts at acceptance, create one durable child job per account, then return per-account results and partial failures |
+| `account_id` | string | Optional | `null` | Run on one registered account; preferred selector in service mode. |
 | `cookies` | string | ❌ | `null` | Path to a specific account bundle, e.g. `"cookies/account_abc.json"` |
 
 **`aspect` valid values:**
@@ -154,7 +155,8 @@ Generates a video clip from text, or animates a starting image into video.
 | `quality` | string | ❌ | `"720p"` | Resolution: `"360p"`, `"720p"` |
 | `count` | integer | ❌ | `1` | Number of variations — `1` to `4` |
 | `start_image` | string | ❌ | `null` | Local image path or uploaded media ID for image-to-video |
-| `all_accounts` | boolean | ❌ | `false` | Run on every account concurrently |
+| `all_accounts` | boolean | ❌ | `false` | Snapshot eligible accounts at acceptance and fan out through durable child jobs |
+| `account_id` | string | Optional | `null` | Run on one registered account; preferred selector in service mode. |
 | `cookies` | string | ❌ | `null` | Path to a specific account bundle |
 
 #### Response `200 OK`
@@ -246,21 +248,53 @@ Returns the full generation history and cumulative metrics stored in `data/flow.
     "by_kind": { "image": 1 },
     "media_files": 1,
     "credits_spent": 0
+  },
+  "latency": {
+    "prepare_to_submit": {"samples": 42, "p50_ms": 820, "p95_ms": 1910},
+    "submit_to_media": {"samples": 39, "p50_ms": 23600, "p95_ms": 48100},
+    "render_wait": {"samples": 18, "p50_ms": 16400, "p95_ms": 39200},
+    "download": {"samples": 18, "p50_ms": 740, "p95_ms": 1800}
+  },
+  "latency_by_kind": {
+    "image": {
+      "submit_to_media": {"samples": 21, "p50_ms": 1100, "p95_ms": 2450}
+    },
+    "video": {
+      "submit_to_media": {"samples": 18, "p50_ms": 23600, "p95_ms": 48100}
+    }
+  },
+  "service": {
+    "queue": {
+      "queued": 2,
+      "running": 3,
+      "waiting_children": 0,
+      "outstanding": 5,
+      "capacity": 1000,
+      "submission_unknown": 1,
+      "oldest_queued_age_seconds": 4.2
+    },
+    "ready_accounts": 5,
+    "connected_accounts": 4,
+    "strict_cookie_freshness": true,
+    "cookie_sync_age_seconds": {"acct-e50d5ecec52e": 1.8, "acct-a818c2ffcf31": 49.1}
   }
 }
 ```
 
 > `credits_spent` is `null` when Google Flow does not return a credit deduction value for that job.
+> `latency` reports p50/p95 milliseconds from the latest 5,000 attempts with complete phase pairs; absent stages are omitted until samples exist.
+> `latency_by_kind` reports the same bounded phase summaries grouped by job kind (`image`, `video`, or upload kinds) to compare queue wait, preparation, upstream acceptance, render, download and request completion.
+> In Go service mode, `service.queue` reports durable job state counts and the age of the oldest queued job; account counts and cookie bundle ages are point-in-time readiness signals. Missing bundle ages are omitted.
 
 ---
 
 ### 2.5 List Projects
 
 ```
-GET /api/v1/projects
+GET /api/v1/projects?account_id=acct-e50d5ecec52e
 ```
 
-Lists Google Flow projects associated with the active account. Useful for confirming project IDs before generation.
+Lists Google Flow projects for the selected registered account. Omit `account_id` to let the service select an eligible account. `cookies` path selection at the FastAPI compatibility boundary is translated to the registered account ID before calling the Go service.
 
 #### Response `200 OK`
 
@@ -435,7 +469,7 @@ When `stream: true`, the response is an SSE stream of `data: {...}` chunks follo
 GET /health
 ```
 
-Confirms the server is running and the underlying `flow` binary is reachable.
+Confirms the Python server is running and its configured engine backend is reachable.
 
 #### Response `200 OK`
 
@@ -443,6 +477,7 @@ Confirms the server is running and the underlying `flow` binary is reachable.
 {
   "status": "ok",
   "engine": true,
+  "mode": "service",
   "binary": "/Users/.../flow-agent/bin/flow-macos"
 }
 ```
@@ -450,8 +485,12 @@ Confirms the server is running and the underlying `flow` binary is reachable.
 | Field | Description |
 | :--- | :--- |
 | `status` | Always `"ok"` if server is up |
-| `engine` | `true` if the engine binary was found and is executable |
-| `binary` | Absolute path to the resolved engine binary |
+| `engine` | `true` if the Go service answers health checks in service mode, or the binary exists in subprocess mode |
+| `ready_accounts` | Warm account runtimes available in service mode |
+| `connected_accounts` | Accounts with a live extension peer; strict cookie sync needs these |
+| `strict_cookie_freshness` | Whether service jobs require live extension sync before submit |
+| `mode` | `service` or `subprocess` |
+| `binary` | Absolute path selected for subprocess mode; informational in service mode |
 
 ---
 
@@ -494,6 +533,23 @@ All errors return a JSON body with a `detail` field:
 ---
 
 ## 7. Client Examples
+
+### Native asynchronous jobs (service mode)
+
+The compatibility generation endpoints above continue waiting for their final result. For callers that want an early acknowledgement, service mode exposes:
+
+- `POST /api/v1/jobs` with `{ "kind": "image|video|upload-video", "payload": { ... } }`; returns HTTP 202 and a `job_id`/`status_url`.
+- `GET /api/v1/jobs/{job_id}` to read durable status and result.
+- `GET /api/v1/jobs/{job_id}/events` streams status and attempt-phase events as SSE. Event IDs are monotonic; send `Last-Event-ID` to resume after reconnecting. The stream ends after the terminal status event.
+- Job status includes `attempt_history`; each attempt now carries ordered `phase_events` with timestamps so callers can measure preparation, submission, rendering, and download intervals across restarts.
+- `POST /api/v1/jobs/{job_id}/cancel` to request cancellation. Disconnecting from the POST does not cancel accepted work.
+- If Go committed a job but its POST acknowledgement was lost, the Python adapter recovers it with the same idempotency key. If it cannot resolve the outcome, the response carries `Idempotency-Key` so the caller can safely retry with the same key.
+- If a compatibility generation wait reaches its deadline after acceptance, the response includes `X-Flow-Job-ID`; use that ID with `GET /api/v1/jobs/{job_id}` to continue tracking the durable job.
+- Fan-out parents may initially report `waiting_children`; each account/count child is independently queued, and the parent becomes `succeeded`, `partial`, or `failed` after all children are terminal.
+- Image `count` children share one account selected when the parent is accepted, and their generated media/files are combined into the parent result.
+- Service mode validates generation payloads locally before accepting a durable job. Missing prompts/upload paths and invalid image count, aspect, or video duration return HTTP 422 without consuming queue capacity.
+
+Send an `Idempotency-Key` header when retrying an uncertain client request. The compatibility generation routes forward that header too. These routes require `FLOW_ENGINE_MODE=service`, `FLOW_SERVICE_URL` and `FLOW_INTERNAL_TOKEN` on the FastAPI process. Set the same absolute `FLOW_OUTPUT_DIR` in the Go service and FastAPI process so generated files are served from the shared output directory.
 
 ### Python — OpenAI SDK
 

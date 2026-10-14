@@ -335,13 +335,18 @@ func (p *HTTPProvider) releaseVersion(ctx context.Context) (string, error) {
 // after the provider is built, and the editor URL depends on it.
 type PageURLResolver func() string
 
+// ProfileOperation serializes browser-page operations shared by account views
+// that use the same extension client.
+type ProfileOperation func(context.Context, *cdp.Client, func() error) error
+
 // BrokerProvider asks the attached extension to run the page's own
 // grecaptcha.enterprise.execute(). This is the highest-scoring strategy, because
 // it runs in a real signed-in page with the account's own fingerprint.
 type BrokerProvider struct {
-	client  *cdp.Client
-	siteKey string
-	timeout time.Duration
+	client           *cdp.Client
+	siteKey          string
+	timeout          time.Duration
+	profileOperation ProfileOperation
 	// pageURL supplies a page that loads the reCAPTCHA client. Optional: without
 	// it the broker uses whatever tab it is given.
 	pageURL PageURLResolver
@@ -349,13 +354,20 @@ type BrokerProvider struct {
 
 // NewBroker builds a broker provider driven by a browser-Cdp client.
 func NewBroker(client *cdp.Client, siteKey string, pageURL PageURLResolver) *BrokerProvider {
+	return NewBrokerWithProfileOperation(client, siteKey, pageURL, nil)
+}
+
+func NewBrokerWithProfileOperation(client *cdp.Client, siteKey string, pageURL PageURLResolver, profileOperation ProfileOperation) *BrokerProvider {
 	if siteKey == "" {
 		siteKey = os.Getenv("FLOW_RECAPTCHA_SITE_KEY")
 	}
 	if siteKey == "" {
 		siteKey = DefaultSiteKey
 	}
-	return &BrokerProvider{client: client, siteKey: siteKey, timeout: 30 * time.Second, pageURL: pageURL}
+	return &BrokerProvider{
+		client: client, siteKey: siteKey, timeout: 30 * time.Second,
+		pageURL: pageURL, profileOperation: profileOperation,
+	}
 }
 
 // Name identifies the provider in logs.
@@ -415,6 +427,22 @@ func (p *BrokerProvider) gotoRecaptchaPage(ctx context.Context) error {
 
 // Token evaluates grecaptcha.enterprise.execute in the attached tab.
 func (p *BrokerProvider) Token(ctx context.Context, action string) (string, error) {
+	var token string
+	mint := func() error {
+		var err error
+		token, err = p.token(ctx, action)
+		return err
+	}
+	if p.profileOperation != nil {
+		if err := p.profileOperation(ctx, p.client, mint); err != nil {
+			return "", err
+		}
+		return token, nil
+	}
+	return token, mint()
+}
+
+func (p *BrokerProvider) token(ctx context.Context, action string) (string, error) {
 	if p.client == nil || !p.client.Connected() {
 		return "", fmt.Errorf("recaptcha: the broker has no browser-Cdp connection")
 	}
@@ -619,12 +647,17 @@ func NewPageProvider(broker *cdp.Client, pageURL PageURLResolver, current func()
 // reconnects or another takes over — and a stale client reads as "no connection"
 // while a perfectly good one is attached.
 type FlowProvider struct {
-	current func() *cdp.Client
+	current          func() *cdp.Client
+	profileOperation ProfileOperation
 }
 
 // NewFlow builds a provider over the Flow bridge's own captcha operation.
 func NewFlow(current func() *cdp.Client) *FlowProvider {
 	return &FlowProvider{current: current}
+}
+
+func NewFlowWithProfileOperation(current func() *cdp.Client, profileOperation ProfileOperation) *FlowProvider {
+	return &FlowProvider{current: current, profileOperation: profileOperation}
 }
 
 func (p *FlowProvider) Name() string { return "flow.captcha" }
@@ -638,7 +671,18 @@ func (p *FlowProvider) Token(ctx context.Context, action string) (string, error)
 		return "", fmt.Errorf("recaptcha: no extension attached")
 	}
 
-	result, err := client.FlowCaptcha(ctx, action, "")
+	var result *cdp.FlowCaptchaResult
+	mint := func() error {
+		var err error
+		result, err = client.FlowCaptcha(ctx, action, "")
+		return err
+	}
+	var err error
+	if p.profileOperation != nil {
+		err = p.profileOperation(ctx, client, mint)
+	} else {
+		err = mint()
+	}
 	if err != nil {
 		return "", err
 	}
@@ -664,6 +708,10 @@ func (p *FlowProvider) Token(ctx context.Context, action string) (string, error)
 // current resolves the attached extension at call time. It may be nil, and a
 // provider built from it fails cleanly rather than minting nothing.
 func Build(mode string, hc *httpx.Client, broker *cdp.Client, pageURL PageURLResolver, current func() *cdp.Client, userAgent string) Provider {
+	return BuildWithProfileOperation(mode, hc, broker, pageURL, current, userAgent, nil)
+}
+
+func BuildWithProfileOperation(mode string, hc *httpx.Client, broker *cdp.Client, pageURL PageURLResolver, current func() *cdp.Client, userAgent string, profileOperation ProfileOperation) Provider {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "off", "none", "empty":
 		return EmptyProvider{}
@@ -675,10 +723,10 @@ func Build(mode string, hc *httpx.Client, broker *cdp.Client, pageURL PageURLRes
 		// should get it rather than a silent fallback to the transport.
 		providers := make([]Provider, 0, 4)
 		if current != nil {
-			providers = append(providers, NewFlow(current))
+			providers = append(providers, NewFlowWithProfileOperation(current, profileOperation))
 		}
 		if broker != nil {
-			providers = append(providers, NewBroker(broker, "", pageURL))
+			providers = append(providers, NewBrokerWithProfileOperation(broker, "", pageURL, profileOperation))
 		}
 		providers = append(providers, NewHTTP(hc, "", "").WithUserAgent(userAgent), EmptyProvider{})
 		return NewChain(providers...)

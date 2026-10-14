@@ -14,8 +14,8 @@ Google Flow employs enterprise-grade anti-automation defenses:
 Rather than running heavy, detectable headless browsers on every generation call, Flow Agent uses an **out-of-band capture architecture**:
 1. You sign in once to Google Flow in your real browser (Chrome / Chromium).
 2. The lightweight browser extension synchronizes session credentials to your local machine.
-3. The Go engine binary saves these into `cookies/account_<hash>.json`.
-4. Subsequent generations run completely headless, at native API speed (sub-second submission).
+3. The long-lived Go service saves these into `cookies/account_<hash>.json` and binds the extension client to that account runtime.
+4. FastAPI and MCP submit through the service's durable queue; account generations use the matching runtime and do not start a Go process per request.
 
 ---
 
@@ -27,7 +27,7 @@ sequenceDiagram
     actor User as Developer / User
     participant Browser as Chrome Browser (Google Flow Tab)
     participant Ext as Chrome Extension (extension/)
-    participant Bridge as Bridge Server (bin/flow bridge)
+    participant Bridge as Go Service Bridge (flow service)
     participant Storage as File Storage (cookies/ & data/flow.db)
 
     Bridge->>Bridge: Starts listening on ws://127.0.0.1:9222
@@ -38,8 +38,14 @@ sequenceDiagram
     Bridge->>Bridge: Refreshes Labs session token if needed
     Bridge->>Storage: Writes cookies/account_<key>.json
     Bridge->>Storage: Upserts data/flow.db accounts table
-    Note over Bridge,Storage: Account is now primed and ready for headless generation
+    Ext-->>Bridge: bridge.cookies_rotated on credential change
+    Bridge->>Ext: Pulls a full scoped cookie snapshot
+    Bridge->>Storage: Atomically replaces account bundle
+    Bridge->>Bridge: Invalidates and reloads only that account runtime
+    Note over Bridge,Storage: Fresh snapshot is durable before the runtime can use it
 ```
+
+The extension sends cookie rotation events as a signal to resync, not as a cookie delta. The bridge fetches the complete scoped cookie set, writes the account bundle atomically, then publishes the update to the account registry. A failed sync or failed bundle write does not publish the new session. Cookie freshness defaults to strict: service mode requires a live sync before submission. `FLOW_COOKIE_FRESHNESS=cached` explicitly allows use of a persisted snapshot while the extension is offline.
 
 ---
 
@@ -48,9 +54,9 @@ sequenceDiagram
 1. In Google Chrome, navigate to `chrome://extensions`.
 2. Toggle on **Developer mode** (top right corner).
 3. Click **Load unpacked** (top left).
-4. Select the directory:
+4. Select the canonical source directory:
    ```text
-   /Users/akashyadav/Akash/Flow-Agent-Work/extension
+   <flow-agent>/flow-extension
    ```
 5. Pin the **Flow Extension** icon in your toolbar.
 
@@ -58,11 +64,13 @@ sequenceDiagram
 
 ## 4. Starting the Bridge
 
-Inside `flow-agent`, run:
+For persistent API/MCP operation, start the service (it owns the bridge, account runtimes and shared queue):
 
 ```bash
-./bin/flow bridge
+./bin/flow service --token "$FLOW_INTERNAL_TOKEN" --workers 8
 ```
+
+Use `./bin/flow bridge` only when you need the standalone legacy bridge command; do not run it alongside the service on the same bridge port.
 
 You will see:
 ```text

@@ -1,7 +1,8 @@
 # Flow Engine Binaries
 
 This directory contains pre-compiled binaries for each major operating system:
-- `flow-macos` (Universal Mach-O binary for both Apple Silicon arm64 & Intel x86_64)
+- `flow-macos` (Mach-O binary for macOS Intel x86_64)
+- `flow-macos-arm64` (Mach-O binary for Apple Silicon arm64)
 - `flow-linux` (ELF 64-bit executable for Linux x86_64)
 - `flow-windows.exe` (PE32+ executable for Windows x64)
 - `flow` (macOS executable)

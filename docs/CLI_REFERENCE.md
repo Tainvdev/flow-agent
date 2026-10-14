@@ -3,7 +3,7 @@
 Complete command-line documentation for **Flow Agent** and the underlying **Flow Engine** binary.
 
 - **Python CLI**: `python main.py <command>` or `python -m flow_agent <command>`
-- **Engine Binary**: `./bin/flow` (auto-selects `flow-macos` / `flow-linux` / `flow-windows.exe` by platform)
+- **Engine Binary**: `./bin/flow` (auto-selects Windows/Linux binaries and the macOS binary matching machine architecture)
 
 ---
 
@@ -239,7 +239,7 @@ python main.py projects --cookies cookies/account_abc.json
 
 ## 2. Engine Binary (`./bin/flow`)
 
-The low-level Go binary (`flow-macos` on macOS, `flow-linux` on Linux, `flow-windows.exe` on Windows) is invoked automatically by the Python layer. It can also be used directly for advanced workflows.
+The low-level Go binary (`flow-macos` on Intel macOS, `flow-macos-arm64` on Apple Silicon, `flow-linux` on Linux, `flow-windows.exe` on Windows) is invoked automatically by the Python layer. It can also be used directly for advanced workflows.
 
 ### 2.1 Doctor — Environment Self-Test
 
@@ -329,7 +329,27 @@ Uploads a local video file to Google Flow project storage. Returns a reusable `m
 # → media_id: "4cb43f55-2897-47cd-b2bf-117f2e5f450c"
 ```
 
-### 2.9 Bridge — Chrome Extension WebSocket
+### 2.9 Service — Persistent generation service
+
+Starts one long-lived bridge owner, warm account runtimes, durable job queue and internal HTTP API. Set a strong `FLOW_INTERNAL_TOKEN` in the environment or pass `--token`. Keep the HTTP listener on loopback unless it is protected by a trusted network boundary.
+
+```bash
+./bin/flow service --token "$FLOW_INTERNAL_TOKEN" --workers 8
+```
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `--listen` | `127.0.0.1:9223` | Internal API bind address |
+| `--token` | `$FLOW_INTERNAL_TOKEN` | Required bearer token |
+| `--workers` | `8` | Maximum active jobs across accounts; one generation per account |
+
+Internal endpoints include `POST /internal/v1/jobs`, `GET /internal/v1/jobs/{job_id}`, `GET /internal/v1/jobs/{job_id}/events` (SSE with monotonic event IDs and `Last-Event-ID` resume), `GET /internal/v1/jobs/by-key?key={idempotency_key}`, `POST /internal/v1/jobs/{job_id}/cancel`, `GET /internal/v1/balance`, `GET /internal/v1/projects`, `GET /internal/v1/stats`, `GET /health` (liveness), and `GET /readyz` (readiness; HTTP 503 until initial account discovery finishes and at least one account can accept work). The by-key lookup recovers a durable job when the submit acknowledgement was lost; it requires the same bearer token as other internal endpoints. The service admits up to 1,000 queued or running jobs; further new jobs receive HTTP 429 until capacity is available. A repeated idempotency key still returns its existing job. An OS lock beside the database prevents a second service process from owning the same store.
+
+Set `FLOW_SERVICE_URL=http://127.0.0.1:9223` and the same `FLOW_INTERNAL_TOKEN` for Python/FastAPI/MCP callers. The service persists requests before acknowledgement, so callers can poll a job after the initial HTTP request ends.
+
+When both variables are set, Go CLI `image`, `generate`/`video` (including `--reference`), and `upload-video` submit to this same queue and wait for the terminal job result; they do not bootstrap a second local engine. `--all` is expanded by the service into account-pinned child jobs. If a submit acknowledgement cannot be resolved, rerun the exact command with `--idempotency-key <key>` printed in the error so it can look up the accepted job without submitting again. Without `FLOW_SERVICE_URL`, these commands retain their direct-engine behavior.
+
+### 2.10 Bridge — Chrome Extension WebSocket
 
 ```bash
 ./bin/flow bridge
@@ -337,7 +357,7 @@ Uploads a local video file to Google Flow project storage. Returns a reusable `m
 
 Starts the WebSocket bridge on `ws://127.0.0.1:9222` that the Chrome Flow extension connects to. Used for high-trust reCAPTCHA token minting when running headlessly. Normally you do **not** need to call this directly — it starts automatically during generation when `--captcha broker` is set.
 
-### 2.10 Version
+### 2.11 Version
 
 ```bash
 ./bin/flow version
@@ -354,6 +374,18 @@ Starts the WebSocket bridge on `ws://127.0.0.1:9222` that the Chrome Flow extens
 | `FLOW_COOKIES_DIR` | `cookies/` | Directory to scan for account JSON bundles. |
 | `FLOW_OUTPUT_DIR` | `output/` | Directory where generated images and videos are saved. |
 | `FLOW_DB_PATH` | `data/flow.db` | SQLite database path for generation history. |
+| `FLOW_ENGINE_MODE` | required | Explicitly select `service` or `subprocess`; service mode requires `FLOW_SERVICE_URL` and `FLOW_INTERNAL_TOKEN`. |
+| `FLOW_SERVICE_URL` | unset | Base URL of the persistent Go service; required when `FLOW_ENGINE_MODE=service`. |
+| `FLOW_INTERNAL_TOKEN` | unset | Bearer token shared by the Go service and Python callers. |
+| `FLOW_MAX_OUTSTANDING_JOBS` | `1000` | Maximum queued, running, and waiting-child jobs accepted by the Go service. |
+| `FLOW_QUEUE_WORKERS` | `max(16, workers * 4)` | Queue execution goroutines (1–256), separate from active account submissions; larger values keep slow renders from occupying every queue worker. |
+| `FLOW_MEDIA_POLL_CONCURRENCY` | `workers * 2` | Shared cap (1–256) for concurrent video readiness polling across account runtimes. |
+| `FLOW_MEDIA_DOWNLOAD_CONCURRENCY` | `workers` | Shared cap (1–256) for concurrent generated-media downloads across account runtimes. |
+| `FLOW_JOB_RETENTION_DAYS` | `30` | Age after which terminal jobs are removed at service startup. |
+| `FLOW_SERVICE_DRAIN_SECONDS` | `30` | Maximum time the service lets already leased jobs finish during shutdown; remaining jobs are persisted for recovery. Range: 1–3600. |
+| `FLOW_JOB_MAX_PRE_SUBMIT_ATTEMPTS` | inherits global | Total executions for deadlines proven before upstream submission (1–20). |
+| `FLOW_JOB_MAX_RESUME_ATTEMPTS` | inherits global | Total executions while resuming accepted media lookup/download (1–20). |
+| `FLOW_JOB_MAX_ATTEMPTS` | `3` | Total executions per job (1–20); automatic retries require proof the prior attempt was safe to replay. |
 
 ---
 

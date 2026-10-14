@@ -9,6 +9,7 @@ transports cannot drift apart in what they answer.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import sys
 import uuid
@@ -56,6 +57,7 @@ TOOLS: list[dict] = [
                     "default": False,
                     "description": "Run on every account in cookies/ at once.",
                 },
+                "account_id": {"type": "string", "description": "Run on one registered account ID."},
             },
             "required": ["prompt"],
         },
@@ -87,6 +89,7 @@ TOOLS: list[dict] = [
                     "description": "720p costs more credits per render than 360p.",
                 },
                 "all_accounts": {"type": "boolean", "default": False},
+                "account_id": {"type": "string", "description": "Run on one registered account ID."},
             },
             "required": ["prompt"],
         },
@@ -123,7 +126,8 @@ TOOLS: list[dict] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "file_path": {"type": "string", "description": "Absolute path to a local video."}
+                "file_path": {"type": "string", "description": "Absolute path to a local video."},
+                "account_id": {"type": "string", "description": "Upload into one registered account's project."},
             },
             "required": ["file_path"],
         },
@@ -152,6 +156,7 @@ async def call_tool(name: str, arguments: dict) -> dict:
                 aspect=arguments.get("aspect", "1:1"),
                 count=int(arguments.get("count", 1) or 1),
                 all_accounts=bool(arguments.get("all_accounts", False)),
+                account_id=arguments.get("account_id"),
             )
         elif name == "flow_generate_video":
             result = await engine.generate_video(
@@ -160,13 +165,17 @@ async def call_tool(name: str, arguments: dict) -> dict:
                 duration=arguments.get("duration", "8s"),
                 quality=arguments.get("quality", "720p"),
                 all_accounts=bool(arguments.get("all_accounts", False)),
+                account_id=arguments.get("account_id"),
             )
         elif name == "flow_get_balance":
             result = await engine.get_balance(refresh=bool(arguments.get("refresh", False)))
         elif name == "flow_get_stats":
             result = await engine.get_stats()
         elif name == "flow_upload_video":
-            result = await engine.upload_video(arguments["file_path"])
+            upload_options = {}
+            if arguments.get("account_id") is not None:
+                upload_options["account_id"] = arguments["account_id"]
+            result = await engine.upload_video(arguments["file_path"], **upload_options)
         else:
             return {**_text(f"unknown tool {name!r}"), "isError": True}
     except KeyError as exc:
@@ -254,17 +263,20 @@ async def run_stdio() -> None:
     a malformed message, so anything diagnostic belongs on stderr.
     """
     loop = asyncio.get_running_loop()
-    while True:
-        line = await loop.run_in_executor(None, sys.stdin.readline)
-        if not line:
-            break
-        line = line.strip()
-        if not line:
-            continue
-        reply = await handle_message(line)
-        if reply is not None:
-            sys.stdout.write(reply + "\n")
-            sys.stdout.flush()
+    try:
+        while True:
+            line = await loop.run_in_executor(None, sys.stdin.readline)
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            reply = await handle_message(line)
+            if reply is not None:
+                sys.stdout.write(reply + "\n")
+                sys.stdout.flush()
+    finally:
+        await engine.aclose()
 
 
 # --------------------------------------------------------------------------- #
@@ -283,7 +295,14 @@ def create_sse_app():
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse, StreamingResponse
 
-    app = FastAPI(title="flow-agent MCP (SSE)")
+    @asynccontextmanager
+    async def lifespan(_app):
+        try:
+            yield
+        finally:
+            await engine.aclose()
+
+    app = FastAPI(title="flow-agent MCP (SSE)", lifespan=lifespan)
     sessions: dict[str, asyncio.Queue] = {}
 
     @app.get("/sse")

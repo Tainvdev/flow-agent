@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/kodelyx/flow-go/flow-go/internal/atomicfile"
 	"github.com/kodelyx/flow-go/flow-go/internal/auth"
 	"github.com/kodelyx/flow-go/flow-go/internal/batchexecute"
 	"github.com/kodelyx/flow-go/flow-go/internal/bridge"
@@ -43,6 +44,12 @@ import (
 
 // Options configures the engine.
 type Options struct {
+	// MediaPollGate bounds concurrent upstream media readiness lookups across
+	// account runtimes. Nil leaves standalone CLI behavior unchanged.
+	MediaPollGate chan struct{}
+	// MediaDownloadGate bounds concurrent generated-media downloads across
+	// account runtimes. Nil leaves standalone CLI behavior unchanged.
+	MediaDownloadGate chan struct{}
 	// ProjectID is the Flow project to generate into. This is the caller's
 	// explicit choice and outranks every other source. Empty means "work it
 	// out", which asks the browser and then falls back to DefaultProjectID.
@@ -111,15 +118,20 @@ type Options struct {
 	// this, a browserless run can mint a perfectly good token and still have it
 	// thrown away, and the only clue is an empty result.
 	Fingerprint *flowapi.BrowserFingerprint
+	// SchedulerOwnsFailover lets the persistent service scheduler move a safe
+	// throttle retry between account runtimes; standalone CLI keeps local rotation.
+	SchedulerOwnsFailover bool
 }
 
 // Engine is the running system.
 type Engine struct {
-	store  *store.Store
-	pool   *pool.Pool
-	bridge *bridge.Bridge
-	hc     *httpx.Client
-	opts   Options
+	store             *store.Store
+	pool              *pool.Pool
+	bridge            *bridge.Bridge
+	hc                *httpx.Client
+	opts              Options
+	mediaPollGate     chan struct{}
+	mediaDownloadGate chan struct{}
 
 	mu        sync.RWMutex
 	accountID string
@@ -188,8 +200,19 @@ type Engine struct {
 	// reached that call may already hold mu for reading. Reusing mu would make
 	// the lock ordering depend on which engine method happened to be in flight,
 	// which is the kind of thing that works until the day it does not.
-	sessionMu   sync.Mutex
-	sessionDead sessionDeath
+	sessionMu    sync.Mutex
+	sessionDead  sessionDeath
+	refreshMu    sync.Mutex
+	refreshing   *engineSessionRefresh
+	lastRefresh  time.Time
+	refreshedJar *cookiejar.Jar
+}
+
+type engineSessionRefresh struct {
+	done    chan struct{}
+	jar     *cookiejar.Jar
+	err     error
+	waiters int
 }
 
 // BearerPathAvailable reports whether the bearer path has a credential.
@@ -371,29 +394,63 @@ func (e *Engine) newBatchexecuteClient(jar *cookiejar.Jar, hc *httpx.Client) *ba
 	//
 	// Without this a 401 is terminal: every later call fails the same way until
 	// an operator re-syncs from the browser with `flow-go bridge`.
-	client.SetUnauthorizedHandler(func(ctx context.Context) (*cookiejar.Jar, error) {
-		if e.bridge == nil || !e.bridge.Connected() {
-			// The moment the engine learns the session cannot be recovered.
-			// Recorded, because the alternative is that every later request
-			// repeats this whole sequence — balance read, captcha mint, priming
-			// retries — to discover the same fact. See session.go.
-			e.markSessionDead(deadSessionReason())
-			return nil, &UnavailableError{
-				Reason: deadSessionReason(),
-				Hint:   sessionHint,
-			}
-		}
-		jar, err := e.bridge.RefreshSession(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if err := e.Bootstrap(ctx); err != nil {
-			return nil, err
-		}
-		return jar, nil
-	})
+	client.SetUnauthorizedHandler(e.refreshSession)
 
 	return client
+}
+
+func (e *Engine) refreshSession(ctx context.Context) (*cookiejar.Jar, error) {
+	return e.coalesceSessionRefresh(ctx, e.refreshSessionOnce)
+}
+
+func (e *Engine) coalesceSessionRefresh(ctx context.Context, refresh func(context.Context) (*cookiejar.Jar, error)) (*cookiejar.Jar, error) {
+	e.refreshMu.Lock()
+	if age := time.Since(e.lastRefresh); !e.lastRefresh.IsZero() && age < bridge.RefreshCoalesceWindow && e.refreshedJar != nil {
+		jar := e.refreshedJar
+		e.refreshMu.Unlock()
+		return jar, nil
+	}
+	if flight := e.refreshing; flight != nil {
+		flight.waiters++
+		e.refreshMu.Unlock()
+		select {
+		case <-flight.done:
+			return flight.jar, flight.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	flight := &engineSessionRefresh{done: make(chan struct{})}
+	e.refreshing = flight
+	e.refreshMu.Unlock()
+
+	jar, err := refresh(ctx)
+	e.refreshMu.Lock()
+	flight.jar, flight.err = jar, err
+	if err == nil && jar != nil {
+		e.refreshedJar = jar
+		e.lastRefresh = time.Now()
+	}
+	e.refreshing = nil
+	close(flight.done)
+	e.refreshMu.Unlock()
+	return jar, err
+}
+
+func (e *Engine) refreshSessionOnce(ctx context.Context) (*cookiejar.Jar, error) {
+	if e.bridge == nil || !e.bridge.Connected() {
+		e.markSessionDead(deadSessionReason())
+		return nil, &UnavailableError{Reason: deadSessionReason(), Hint: sessionHint}
+	}
+	jar, err := e.bridge.RefreshSession(ctx)
+	if err != nil {
+		e.markSessionDead("the Google session was rejected and the extension could not refresh it")
+		return nil, err
+	}
+	if err := e.Bootstrap(ctx); err != nil {
+		return nil, err
+	}
+	return jar, nil
 }
 
 // New builds an engine. Call Bootstrap to make it usable.
@@ -407,12 +464,14 @@ func New(st *store.Store, br *bridge.Bridge, opts Options) (*Engine, error) {
 	}
 
 	return &Engine{
-		store:        st,
-		pool:         pool.New(),
-		bridge:       br,
-		hc:           hc,
-		opts:         opts,
-		accountIndex: storedAccountIndex(st, opts.AccountIndex),
+		store:             st,
+		pool:              pool.New(),
+		bridge:            br,
+		hc:                hc,
+		opts:              opts,
+		mediaPollGate:     opts.MediaPollGate,
+		mediaDownloadGate: opts.MediaDownloadGate,
+		accountIndex:      storedAccountIndex(st, opts.AccountIndex),
 		pacing: newSubmissionPacing(
 			time.Duration(config.RequestMinInterval*float64(time.Second)),
 			maxSubmissionGap),
@@ -885,7 +944,7 @@ func (e *Engine) RawCreditsRPC(ctx context.Context, authUser int) ([]json.RawMes
 	})
 }
 
-// SessionSnapshot is the browser-derived state one process hands to another.
+// SessionSnapshot is the account-bound state one process hands to another.
 //
 // The browser is reachable through exactly one host — whichever process owns the
 // bridge port — and everything the engine needs from it is short-lived: the
@@ -924,7 +983,10 @@ func (e *Engine) SessionSnapshot(ctx context.Context) (*SessionSnapshot, error) 
 	if !e.Ready() {
 		return nil, fmt.Errorf("engine: not ready — call Bootstrap first")
 	}
-	jar := e.bridge.Jar()
+	// Use this engine's captured jar, not the bridge's process-wide last jar.
+	// In a multi-account service the bridge may have most recently synced a
+	// different profile, while this engine remains bound to its own snapshot.
+	jar := e.Jar()
 	if jar == nil {
 		return nil, fmt.Errorf("engine: no cookies loaded")
 	}
@@ -1047,13 +1109,18 @@ func (e *Engine) emptySubmissionHint() string {
 
 // CaptchaToken obtains a fresh reCAPTCHA token for the given action.
 func (e *Engine) CaptchaToken(ctx context.Context, action string) (string, error) {
+	started := time.Now()
 	e.mu.RLock()
 	provider := e.captcha
 	e.mu.RUnlock()
 	if provider == nil {
-		return "", fmt.Errorf("engine: no reCAPTCHA provider configured")
+		err := fmt.Errorf("engine: no reCAPTCHA provider configured")
+		log.Printf("service_metric phase=captcha account=%q action=%q elapsed_ms=%d error=true", e.AccountID(), action, time.Since(started).Milliseconds())
+		return "", err
 	}
-	return provider.Token(ctx, action)
+	token, err := provider.Token(ctx, action)
+	log.Printf("service_metric phase=captcha account=%q action=%q elapsed_ms=%d error=%t", e.AccountID(), action, time.Since(started).Milliseconds(), err != nil)
+	return token, err
 }
 
 // captchaOptions adds the captcha refresher to a captcha-carrying call.
@@ -1194,8 +1261,8 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	// mismatch this engine's own notes warn about. It was pinned to a Windows
 	// build while the browser here is macOS, so the HTTP provider declared a
 	// different machine than the one the generation call came from.
-	captchaProvider := recaptcha.Build(e.opts.CaptchaMode, e.hc, e.bridge.Current(),
-		e.captchaPageURL, e.bridge.Current, userAgentOf(browserFP))
+	captchaProvider := recaptcha.BuildWithProfileOperation(e.opts.CaptchaMode, e.hc, e.bridge.Current(),
+		e.captchaPageURL, e.bridge.Current, userAgentOf(browserFP), e.bridge.WithProfileOperation)
 
 	// The escalation provider: the page-minting strategies only, with no
 	// transport fallback.
@@ -1637,8 +1704,8 @@ func (e *Engine) registerConnectedExtensions(ctx context.Context, fp *flowapi.Br
 		// this engine's notes already warn about. Unlike the primary provider
 		// this resolver deliberately captures its client — for a per-account
 		// provider "whichever is attached" would be the wrong account.
-		captcha := recaptcha.Build(e.opts.CaptchaMode, e.hc, client, e.captchaPageURL,
-			func() *cdp.Client { return client }, userAgentOf(fp))
+		captcha := recaptcha.BuildWithProfileOperation(e.opts.CaptchaMode, e.hc, client, e.captchaPageURL,
+			func() *cdp.Client { return client }, userAgentOf(fp), e.bridge.WithProfileOperation)
 
 		// The bundle the bridge has just written for this account, so a project
 		// or an identity recorded there is adopted rather than rediscovered.
@@ -2209,7 +2276,12 @@ func (e *Engine) pageTokens(ctx context.Context, bundle *cookiejar.Bundle) (at, 
 	atCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
-	raw, err := client.FlowAt(atCtx, "")
+	var raw json.RawMessage
+	err := e.bridge.WithProfileOperation(atCtx, client, func() error {
+		var readErr error
+		raw, readErr = client.FlowAt(atCtx, "")
+		return readErr
+	})
 	if err != nil {
 		log.Printf("engine: could not read the page's batchexecute tokens (%v) and none are "+
 			"recorded for this account; batchexecute will prime for a token instead", err)
@@ -3009,16 +3081,17 @@ type BatchVideoRequest struct {
 
 // BatchVideoOutcome is the result of a video submission.
 type BatchVideoOutcome struct {
-	JobID     string      `json:"job_id"`
-	AccountID string      `json:"account_id"`
-	ProjectID string      `json:"project_id"`
-	Model     string      `json:"model"`
-	MediaIDs  []string    `json:"media_ids"`
-	URLs      []string    `json:"urls,omitempty"`
-	Files     []MediaFile `json:"files,omitempty"`
-	Credits   int         `json:"credits_remaining"`
-	ElapsedS  float64     `json:"elapsed_seconds"`
-	Status    string      `json:"status"`
+	JobID        string      `json:"job_id"`
+	AccountID    string      `json:"account_id"`
+	ProjectID    string      `json:"project_id"`
+	Model        string      `json:"model"`
+	MediaIDs     []string    `json:"media_ids"`
+	URLs         []string    `json:"urls,omitempty"`
+	Files        []MediaFile `json:"files,omitempty"`
+	Credits      int         `json:"credits_remaining"`
+	CreditsKnown bool        `json:"credits_known"`
+	ElapsedS     float64     `json:"elapsed_seconds"`
+	Status       string      `json:"status"`
 	// Quality is the quality the render was submitted at, reported so a caller can
 	// confirm it got what it asked for. The engine does not substitute a different
 	// quality: an unaffordable request is refused rather than quietly rendered
@@ -3210,8 +3283,8 @@ func (e *Engine) refuseIfShort(target generationTarget, cost int, job string) er
 	if !target.Known || target.Balance >= cost {
 		return nil
 	}
-	return fmt.Errorf("insufficient credits: %s costs %d and account %s has %d",
-		job, cost, e.AccountID(), target.Balance)
+	return &InsufficientCreditsError{Message: fmt.Sprintf("insufficient credits: %s costs %d and account %s has %d",
+		job, cost, e.AccountID(), target.Balance)}
 }
 
 // decideVideoPlan is the whole affordability decision, given a balance that has
@@ -3513,7 +3586,7 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 	// unaffordable quality is refused rather than quietly downgraded.
 	plan := decideVideoPlan(req.Duration, req.Count, model, quality, target.Balance)
 	if !plan.Affordable() {
-		err := fmt.Errorf("engine: %s", plan.Reason)
+		err := &InsufficientCreditsError{Message: "engine: " + plan.Reason}
 		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		return nil, err
 	}
@@ -3547,6 +3620,7 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 			return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
 		}
 
+		reportPhase(ctx, "submitting", "sending video generation request")
 		frames, err = client.GenerateVideo(ctx, batchexecute.GenerateVideoRequest{
 			ProjectID:    projectID,
 			Model:        model,
@@ -3581,6 +3655,12 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 			break
 		}
 
+		if rejected != nil && batchexecute.IsUnusualActivity(rejected.Reason) && e.opts.SchedulerOwnsFailover {
+			client.SetSubmissionGap(e.pacing.gap())
+			err := &AccountThrottleError{Cause: rejected}
+			e.finishJob(jobID, "failed", nil, start, err, accountID)
+			return nil, err
+		}
 		if rejected != nil && batchexecute.IsUnusualActivity(rejected.Reason) && attempt < maxAttempts {
 			// Push the widened spacing onto the client this run is already using.
 			//
@@ -3644,6 +3724,10 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 	for _, frame := range frames {
 		outcome.MediaIDs = append(outcome.MediaIDs, batchexecute.ParseGeneratedMediaIDs(frame.Payload)...)
 	}
+	if len(outcome.MediaIDs) > 0 {
+		reportUpstreamIDs(ctx, outcome.MediaIDs)
+		reportPhase(ctx, "media_available", "upstream returned video media ids")
+	}
 
 	// Non-nil exactly when nothing came back, and returned alongside the outcome
 	// at the end of this function. Declared here so the two cannot drift apart:
@@ -3673,6 +3757,7 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 	cancelCredits()
 	if credErr == nil {
 		outcome.Credits = credits
+		outcome.CreditsKnown = true
 	} else {
 		log.Printf("engine: could not read the balance after submitting (%v); the submission "+
 			"itself is unaffected", credErr)
@@ -3681,11 +3766,15 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 	// Video renders asynchronously, so the URL only exists once the render is
 	// done. Polling is opt-in because it can take minutes.
 	if (req.Wait || req.Download) && len(outcome.MediaIDs) > 0 {
+		reportPhase(ctx, "rendering", "waiting for video render to become downloadable")
 		urls, files := e.collectVideo(ctx, client, projectID, outcome.MediaIDs, req.Prompt, rowID, req.Download)
 		outcome.URLs = urls
 		outcome.Files = files
 		if len(urls) > 0 {
 			outcome.Status = "ready"
+		}
+		if req.Download && len(files) > 0 {
+			reportPhase(ctx, "download_complete", "video files downloaded")
 		}
 	}
 
@@ -4461,6 +4550,12 @@ func (e *Engine) collectVideo(ctx context.Context, client *batchexecute.Client, 
 	lastErr := make(map[string]string, len(mediaIDs))
 
 	for len(pending) > 0 && time.Now().Before(deadline) {
+		releasePoll, pollErr := acquireMediaLimit(ctx, e.mediaPollGate)
+		if pollErr != nil {
+			return urls, files
+		}
+		type readyMedia struct{ id, url string }
+		var ready []readyMedia
 		for mediaID := range pending {
 			url, err := client.ResolveVideoURL(ctx, projectID, mediaID)
 			if err != nil {
@@ -4481,17 +4576,22 @@ func (e *Engine) collectVideo(ctx context.Context, client *batchexecute.Client, 
 			}
 			delete(pending, mediaID)
 			urls = append(urls, url)
-
-			if download {
-				file, dlErr := e.downloadGenerated(ctx, batchexecute.GeneratedMedia{
-					MediaID: mediaID, URL: url, Kind: "video",
-				}, "video", prompt, rowID)
-				if dlErr != nil {
-					log.Printf("engine: could not save video %s: %v", shortID(mediaID), dlErr)
-					continue
-				}
-				files = append(files, file)
+			ready = append(ready, readyMedia{id: mediaID, url: url})
+		}
+		releasePoll()
+		for _, media := range ready {
+			if !download {
+				continue
 			}
+			reportPhase(ctx, "downloading", "video render is ready; downloading media")
+			file, dlErr := e.downloadGenerated(ctx, batchexecute.GeneratedMedia{
+				MediaID: media.id, URL: media.url, Kind: "video",
+			}, "video", prompt, rowID)
+			if dlErr != nil {
+				log.Printf("engine: could not save video %s: %v", shortID(media.id), dlErr)
+				continue
+			}
+			files = append(files, file)
 		}
 
 		if len(pending) == 0 {
@@ -4518,6 +4618,55 @@ func (e *Engine) collectVideo(ctx context.Context, client *batchexecute.Client, 
 		}
 	}
 	return urls, files
+}
+
+// ResumeAcceptedMedia resolves assets from an earlier accepted generation and
+// optionally downloads them. It never submits generation work.
+func (e *Engine) ResumeAcceptedMedia(ctx context.Context, projectID string, mediaIDs []string, kind, prompt string, download bool) (map[string]any, error) {
+	if projectID == "" || len(mediaIDs) == 0 {
+		return nil, fmt.Errorf("engine: project id and accepted media ids are required to resume")
+	}
+	jar := e.Jar()
+	if jar == nil {
+		return nil, fmt.Errorf("engine: no active cookie jar for media recovery")
+	}
+	client := e.newBatchexecuteClient(jar, e.hc)
+	result := map[string]any{"project_id": projectID, "media_ids": mediaIDs, "status": "submitted"}
+	if !download {
+		return result, nil
+	}
+	result["status"] = "partial"
+	var urls []string
+	var files []MediaFile
+	if kind == "video" {
+		reportPhase(ctx, "rendering", "resuming video render polling")
+		urls, files = e.collectVideo(ctx, client, projectID, mediaIDs, prompt, 0, true)
+	} else if kind == "image" {
+		reportPhase(ctx, "downloading", "resolving and downloading accepted images")
+		for _, id := range mediaIDs {
+			url, err := client.ResolveImageURL(ctx, projectID, id)
+			if err != nil {
+				continue
+			}
+			urls = append(urls, url)
+			file, err := e.downloadGenerated(ctx, batchexecute.GeneratedMedia{MediaID: id, URL: url, Kind: "image"}, "image", prompt, 0)
+			if err == nil {
+				files = append(files, file)
+			}
+		}
+	} else {
+		return nil, fmt.Errorf("engine: cannot resume media kind %q", kind)
+	}
+	result["urls"] = urls
+	result["files"] = files
+	if len(files) > 0 {
+		result["status"] = "ready"
+		reportPhase(ctx, "download_complete", "recovered media files downloaded")
+	}
+	if len(files) == 0 {
+		return nil, &ResumeMediaError{Message: fmt.Sprintf("engine: accepted %s media could not be resolved or downloaded", kind)}
+	}
+	return result, nil
 }
 
 /* ------------------------------------------------------------------ *
@@ -4627,6 +4776,7 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 			return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
 		}
 
+		reportPhase(ctx, "submitting", "sending image generation request")
 		media, err = client.GenerateMedia(ctx, batchexecute.GenerateRequest{
 			ProjectID:    projectID,
 			Model:        model,
@@ -4649,6 +4799,12 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 			break
 		}
 
+		if rejected != nil && batchexecute.IsUnusualActivity(rejected.Reason) && e.opts.SchedulerOwnsFailover {
+			client.SetSubmissionGap(e.pacing.gap())
+			err := &AccountThrottleError{Cause: rejected}
+			e.finishJob(jobID, "failed", nil, start, err, accountID)
+			return nil, err
+		}
 		if rejected != nil && batchexecute.IsUnusualActivity(rejected.Reason) && attempt < maxAttempts {
 			// Push the widened spacing onto the client this run is already using.
 			//
@@ -4703,6 +4859,16 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 		}
 		break
 	}
+	if len(media) > 0 {
+		ids := make([]string, 0, len(media))
+		for _, item := range media {
+			if item.MediaID != "" {
+				ids = append(ids, item.MediaID)
+			}
+		}
+		reportUpstreamIDs(ctx, ids)
+		reportPhase(ctx, "media_available", "upstream returned generated image media")
+	}
 
 	outcome := &BatchOutcome{
 		JobID:     jobID,
@@ -4738,6 +4904,7 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 	}
 
 	if req.Download {
+		reportPhase(ctx, "downloading", "downloading generated images")
 		for _, item := range media {
 			if item.URL == "" {
 				continue
@@ -4748,6 +4915,9 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 				continue
 			}
 			outcome.Files = append(outcome.Files, file)
+		}
+		if len(outcome.Files) > 0 {
+			reportPhase(ctx, "download_complete", "image files downloaded")
 		}
 	}
 
@@ -4778,6 +4948,11 @@ func batchImageModel(name string) string {
 // The signed URL needs no credentials — it was verified to return 200 with no
 // headers at all — so this does not attach cookies.
 func (e *Engine) downloadGenerated(ctx context.Context, item batchexecute.GeneratedMedia, kind, prompt string, generationRow int64) (MediaFile, error) {
+	releaseDownload, err := acquireMediaLimit(ctx, e.mediaDownloadGate)
+	if err != nil {
+		return MediaFile{}, err
+	}
+	defer releaseDownload()
 	resp, err := e.hc.Do(ctx, &httpx.Request{
 		Method:      "GET",
 		URL:         item.URL,
@@ -4803,7 +4978,7 @@ func (e *Engine) downloadGenerated(ctx context.Context, item batchexecute.Genera
 	ext := extensionForContentType(resp.Header.Get("Content-Type"), kind)
 	path := filepath.Join(config.OutputDir(), shortID(item.MediaID)+ext)
 
-	if err := os.WriteFile(path, resp.Body, 0o644); err != nil {
+	if err := atomicfile.Write(path, resp.Body, 0o644); err != nil {
 		return MediaFile{}, err
 	}
 
@@ -4862,7 +5037,7 @@ func (e *Engine) downloadAll(ctx context.Context, mediaIDs []string, kind, resol
 				continue
 			}
 			path := e.outputPath(kind, mediaID, resolution)
-			if err := os.WriteFile(path, data, 0o644); err != nil {
+			if err := atomicfile.Write(path, data, 0o644); err != nil {
 				if firstErr == nil {
 					firstErr = err
 				}

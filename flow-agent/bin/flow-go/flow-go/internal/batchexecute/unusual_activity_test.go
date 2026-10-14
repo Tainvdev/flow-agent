@@ -194,23 +194,45 @@ func TestAnInitialAssessmentRefusalIsNotEscalated(t *testing.T) {
 // reason on the third line, which left an ordinary empty response and a stated
 // refusal indistinguishable except by how fast they returned: about a second
 // against the twenty-odd a real render takes.
-func TestANonRateReasonIsStillRetriedAndReported(t *testing.T) {
+func TestANonPolicyReasonIsStillRetriedAndReported(t *testing.T) {
 	_, submit := recorder(answer())
 	opts := CallOptions{RefreshCaptcha: func(context.Context) (string, error) { return "t", nil }}
 
 	var err error
 	got := captureLog(t, func() {
 		_, err = retryIfEmpty(context.Background(), opts,
-			refusal("PUBLIC_ERROR_MODEL_ACCESS_DENIED"), carriesNothing, submit)
+			refusal("PUBLIC_ERROR_TEMPORARY_ERROR"), carriesNothing, submit)
 	})
 	if err != nil {
 		t.Fatalf("the retry should have succeeded: %v", err)
 	}
-	if !strings.Contains(got, "PUBLIC_ERROR_MODEL_ACCESS_DENIED") {
+	if !strings.Contains(got, "PUBLIC_ERROR_TEMPORARY_ERROR") {
 		t.Errorf("the log does not name the first response's reason:\n%s", got)
 	}
 	if !strings.Contains(got, "retrying once") {
 		t.Errorf("the log does not report the retry that was made:\n%s", got)
+	}
+}
+
+func TestModelPolicyRefusalIsNeverRetried(t *testing.T) {
+	tokens, submit := recorder(answer())
+	refreshes := 0
+	opts := CallOptions{RefreshCaptcha: func(context.Context) (string, error) {
+		refreshes++
+		return "fresh-token", nil
+	}}
+
+	frames, err := retryIfEmpty(context.Background(), opts,
+		refusal(ReasonModelAccessDenied), carriesNothing, submit)
+	var rejected *RejectedError
+	if !errors.As(err, &rejected) || rejected.Reason != ReasonModelAccessDenied {
+		t.Fatalf("error=%v, want terminal model-access refusal", err)
+	}
+	if len(frames) == 0 || UpstreamError(frames) != ReasonModelAccessDenied {
+		t.Fatalf("refusal response was lost: %v", frames)
+	}
+	if refreshes != 0 || len(*tokens) != 0 {
+		t.Fatalf("model refusal triggered refresh=%d, resubmissions=%d; want neither", refreshes, len(*tokens))
 	}
 }
 

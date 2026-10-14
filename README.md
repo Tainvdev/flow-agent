@@ -65,11 +65,31 @@ pip install -e '.[test]'
 > Load it from the `flow-extension/` folder via `chrome://extensions → Load unpacked`.
 
 ```bash
-# Start the WebSocket bridge (keep this running in a terminal)
-./bin/flow bridge
+# Start the persistent generation service (keep this running)
+# Windows:
+$env:FLOW_INTERNAL_TOKEN = "replace-with-a-long-random-token"
+$env:FLOW_SERVICE_URL = "http://127.0.0.1:9223"
+$env:FLOW_OUTPUT_DIR = Join-Path (Get-Location).Path "output"
+./bin/flow-windows.exe service --token $env:FLOW_INTERNAL_TOKEN --workers 8
 ```
 
-Then open **[https://labs.google/fx/tools/flow](https://labs.google/fx/tools/flow)** in Chrome while signed in to your Google account. The extension will automatically save your session to `cookies/`.
+Then open **[https://labs.google/fx/tools/flow](https://labs.google/fx/tools/flow)** in Chrome while signed in to your Google account. The extension will automatically save your session to `cookies/`. In the FastAPI or MCP terminal, set `FLOW_ENGINE_MODE=service` plus the same `FLOW_INTERNAL_TOKEN` and `FLOW_SERVICE_URL`; the Python process refuses an ambiguous service configuration rather than quietly spawning per-request subprocesses.
+
+Service mode requires a live extension cookie sync before each submission. If the extension is offline, the request fails instead of using an older saved jar. Set `FLOW_COOKIE_FRESHNESS=cached` explicitly only when offline cached-cookie operation is acceptable. Keep the same absolute `FLOW_OUTPUT_DIR` in both terminals so the FastAPI media route can serve generated files.
+
+The Go service accepts at most 1000 outstanding jobs by default; set `FLOW_MAX_OUTSTANDING_JOBS` to change that queue limit. Terminal jobs older than 30 days are pruned at service startup; set `FLOW_JOB_RETENTION_DAYS` to change the retention period. `FLOW_SERVICE_DRAIN_SECONDS` (default 30, range 1–3600) bounds how long active jobs may finish during shutdown; queued and resumable work remains durable for restart.
+
+If the checked-in binary predates the `service` command, rebuild it from `bin/flow-go/flow-go` with `go build -o ../../flow-windows.exe .` before starting the service.
+
+In a second terminal, set the same values before starting FastAPI or MCP:
+
+```powershell
+$env:FLOW_INTERNAL_TOKEN = "the-same-random-token"
+$env:FLOW_ENGINE_MODE = "service"
+$env:FLOW_SERVICE_URL = "http://127.0.0.1:9223"
+$env:FLOW_OUTPUT_DIR = Join-Path (Get-Location).Path "output"
+python main.py server --port 8001
+```
 
 ### 3 — Verify Setup
 
@@ -147,6 +167,8 @@ python main.py projects           # list your Flow projects
 python main.py server --port 8001
 ```
 
+Set `FLOW_ENGINE_MODE=service`, `FLOW_SERVICE_URL` and `FLOW_INTERNAL_TOKEN` before starting FastAPI/MCP to route image/video requests, uploads, balance refreshes and project reads through the persistent Go service. Select `FLOW_ENGINE_MODE=subprocess` explicitly only for migration or rollback. Startup fails if the engine mode is omitted, so a deployment cannot silently fall back to launching one Go subprocess per request. Go CLI `image`, `generate` and `upload-video` commands use the same durable scheduler whenever `FLOW_SERVICE_URL` is set.
+
 Interactive docs open at **`http://127.0.0.1:8001/docs`**
 
 ### All Endpoints
@@ -159,6 +181,9 @@ Interactive docs open at **`http://127.0.0.1:8001/docs`**
 | `GET` | `/api/v1/stats` | Generation history |
 | `GET` | `/api/v1/projects` | List Flow projects |
 | `GET` | `/api/v1/media/{file}` | Download result |
+| `POST` | `/api/v1/jobs` | Accept an asynchronous service job (202) |
+| `GET` | `/api/v1/jobs/{job_id}` | Read durable job state/result |
+| `POST` | `/api/v1/jobs/{job_id}/cancel` | Request job cancellation |
 | `GET` | `/health` | Server liveness |
 | `POST` | `/v1/images/generations` | OpenAI DALL-E compat |
 | `POST` | `/v1/chat/completions` | OpenAI Chat compat + SSE |
@@ -268,7 +293,8 @@ flow-agent/
 │
 ├── bin/
 │   ├── flow              → auto-selects the right binary
-│   ├── flow-macos        → macOS universal binary (arm64 + x86_64)
+│   ├── flow-macos        → macOS Intel x86_64 binary
+│   ├── flow-macos-arm64  → macOS Apple Silicon arm64 binary
 │   ├── flow-linux        → Linux binary
 │   └── flow-windows.exe  → Windows binary
 │
@@ -338,6 +364,7 @@ python3 -m pytest -q --basetemp=/tmp/fa_test
 | 🤖 [MCP Guide](docs/MCP_GUIDE.md) | Claude, Cursor, Zed, AGY setup |
 | 🏗️ [Architecture](docs/ARCHITECTURE.md) | How the engine, bridge, and server fit together |
 | 🔌 [Extension Bridge](docs/EXTENSION_BRIDGE.md) | Chrome extension + WebSocket protocol |
+| 🛠️ [Service Operations](docs/SERVICE_OPERATIONS.md) | Backup, staged cutover, health checks, monitoring and rollback |
 
 ---
 

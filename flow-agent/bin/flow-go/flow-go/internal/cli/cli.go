@@ -47,6 +47,8 @@ func Run(args []string) int {
 	log.Printf("cli: run %s", strings.Join(args, " "))
 
 	switch args[0] {
+	case "service":
+		return runService(args[1:])
 	case "bridge", "serve", "server":
 		return runBridge(args[1:])
 	case "generate", "video":
@@ -99,6 +101,7 @@ USAGE
   flow-go <command> [flags]
 
 COMMANDS
+  service               Run the long-lived generation service and bridge
   bridge                Listen for the Flow Bridge extension and persist what it
                         sends into cookies/account_<key>.json. This is the whole
                         of that process: no HTTP API, no generation.
@@ -165,6 +168,7 @@ GENERATE FLAGS
   --no-download         Skip writing the result to output/
   --all                 Run the same generation on every account in cookies/ at
                         once, one goroutine each, and print a summary table
+  --json                With --all, print a machine-readable aggregate for scripts
 
   --resolution and --seed exist on the legacy aisandbox transport and not on
   the batchexecute one. Passing one is reported on stderr and the run continues
@@ -193,6 +197,7 @@ IMAGE FLAGS
   --no-download         Skip writing the result to output/
   --all                 Run the same generation on every account in cookies/ at
                         once, one goroutine each, and print a summary table
+  --json                With --all, print a machine-readable aggregate for scripts
 
   SHORTHAND
   The options above may also be given as tokens after the prompt, in any order:
@@ -276,7 +281,8 @@ type commonFlags struct {
 	// It is a flag rather than an env var because its whole purpose is to run
 	// one command as one named account, and a setting that persists would make
 	// the next command silently use the previous account.
-	cookies string
+	cookies        string
+	idempotencyKey string
 	// refreshCredits reads every registered account's balance as the boot
 	// finishes. Set only by the daemon, where the figures feed the pool's
 	// affordability gate; a one-shot generation neither routes through the pool
@@ -303,6 +309,8 @@ func (c *commonFlags) bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.email, "email", "", "account email, used as the OAuth login hint")
 	fs.StringVar(&c.cookies, "cookies", "",
 		"cookie file to run as, e.g. cookies/account_<key>.json (default: the usual search)")
+	fs.StringVar(&c.idempotencyKey, "idempotency-key", "",
+		"reuse this service job key after an unresolved acknowledgement")
 }
 
 // envDefault returns the environment variable's value, or fallback when it is
@@ -435,6 +443,34 @@ func runBridge(args []string) int {
 	return 0
 }
 
+func runService(args []string) int {
+	fs := flag.NewFlagSet("service", flag.ExitOnError)
+	var common commonFlags
+	common.bind(fs)
+	listen := fs.String("listen", "127.0.0.1:9223", "internal HTTP API address")
+	token := fs.String("token", envDefault("FLOW_INTERNAL_TOKEN", ""), "internal API bearer token")
+	workers := fs.Int("workers", 8, "maximum concurrent jobs across all accounts")
+	_ = fs.Parse(args)
+	if *workers < 1 || *workers > 256 {
+		return fail(fmt.Errorf("--workers must be between 1 and 256"))
+	}
+	if strings.TrimSpace(*token) == "" {
+		return fail(fmt.Errorf("set FLOW_INTERNAL_TOKEN or pass --token to start the service"))
+	}
+	a, err := common.build()
+	if err != nil {
+		return fail(err)
+	}
+	defer a.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := a.RunService(ctx, *listen, *token, *workers); err != nil && err != context.Canceled {
+		return fail(err)
+	}
+	return 0
+}
+
 /* ------------------------------------------------------------------ *
  * generate
  * ------------------------------------------------------------------ */
@@ -462,6 +498,7 @@ func runGenerate(args []string) int {
 	// reported and dropped.
 	aspect := fs.String("aspect", "", "landscape | 16:9 | portrait | 9:16")
 	all := fs.Bool("all", false, "run the same generation on every account in cookies/ at once")
+	jsonOutput := fs.Bool("json", false, "print the aggregate result as JSON (for scripts)")
 	resolution := fs.String("resolution", "", "ignored — not implemented on the batchexecute transport")
 	seed := fs.Int64("seed", 0, "ignored — not implemented on the batchexecute transport")
 	// --reference is a real flag now. It used to be declared purely so that
@@ -503,6 +540,37 @@ func runGenerate(args []string) int {
 		}
 	}
 	warnIgnoredFlags(ignoredGenerateFlags(*resolution, *seed))
+	if configuredServiceURL() != "" {
+		if len(references) > 0 && *all {
+			return fail(fmt.Errorf("--all cannot be combined with --reference: reference-to-video is not enabled for account fan-out"))
+		}
+		if len(references) > 0 && (*startImage != "" || *endImage != "") {
+			return fail(fmt.Errorf("--reference cannot be combined with --start-image or --end-image"))
+		}
+		if len(references) > 0 && *quality != "720p" {
+			warnIgnoredFlags([]string{"--quality (reference-to-video has no quality variant)"})
+		}
+		if len(references) > 0 && strings.TrimSpace(*aspect) != "" {
+			warnIgnoredFlags([]string{"--aspect (reference-to-video has no aspect slot)"})
+		}
+		payload := map[string]any{
+			"prompt": *prompt, "duration": strconv.Itoa(*duration), "quality": *quality,
+			"count": *count, "aspect": *aspect, "start_image": *startImage,
+			"end_image": *endImage, "no_download": *noDownload, "all_accounts": *all,
+			"project_id": common.projectID,
+		}
+		if len(references) > 0 {
+			payload["references"] = []string(references)
+		}
+		if common.cookies != "" {
+			accountID, accountErr := serviceAccountID(common.cookies)
+			if accountErr != nil {
+				return fail(accountErr)
+			}
+			payload["account_id"] = accountID
+		}
+		return runServiceJob("video", payload, common.idempotencyKey)
+	}
 
 	if *all {
 		// Refused rather than ignored. Reference-to-video is a different RPC with
@@ -518,7 +586,7 @@ func runGenerate(args []string) int {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 
-		return runAllAccounts(ctx, common, "generate", func(ctx context.Context, a *app.App) ([]string, error) {
+		return runAllAccounts(ctx, common, "generate", *jsonOutput, func(ctx context.Context, a *app.App) (accountGenerationResult, error) {
 			outcome, err := a.Engine.GenerateVideoViaBatch(ctx, engine.BatchVideoRequest{
 				Prompt:     *prompt,
 				Duration:   *duration,
@@ -531,9 +599,9 @@ func runGenerate(args []string) int {
 				Download:   !*noDownload,
 			})
 			if err != nil {
-				return nil, err
+				return accountGenerationResult{}, err
 			}
-			return filePaths(outcome.Files), nil
+			return accountGenerationResult{Files: filePaths(outcome.Files), Value: outcome}, nil
 		})
 	}
 
@@ -829,6 +897,23 @@ func runUploadVideo(args []string) int {
 		return fail(fmt.Errorf("upload-video takes one file, and got %d", len(positional)))
 	}
 	path := positional[0]
+	if configuredServiceURL() != "" {
+		absolutePath, err := filepath.Abs(path)
+		if err != nil {
+			return fail(err)
+		}
+		payload := map[string]any{
+			"file_path": absolutePath, "force": *forceUpload, "project_id": common.projectID,
+		}
+		if common.cookies != "" {
+			accountID, accountErr := serviceAccountID(common.cookies)
+			if accountErr != nil {
+				return fail(accountErr)
+			}
+			payload["account_id"] = accountID
+		}
+		return runServiceJob("upload-video", payload, common.idempotencyKey)
+	}
 
 	a, err := common.build()
 	if err != nil {
@@ -1288,6 +1373,7 @@ func runImage(args []string) int {
 	// default aspect rather than a mode flag.
 	aspect := fs.String("aspect", "", "landscape | 16:9 | portrait | 9:16 | square | 1:1 | 4:3 | 3:4")
 	all := fs.Bool("all", false, "run the same generation on every account in cookies/ at once")
+	jsonOutput := fs.Bool("json", false, "print the aggregate result as JSON (for scripts)")
 	seed := fs.Int64("seed", 0, "ignored — not implemented on the batchexecute transport")
 	// Flags and the positional prompt may be interleaved, so
 	// `flow-go image "a red boat" --model narwhal` applies both.
@@ -1322,22 +1408,46 @@ func runImage(args []string) int {
 		}
 	}
 	warnIgnoredFlags(ignoredGenerateFlags("", *seed))
+	if configuredServiceURL() != "" {
+		payload := map[string]any{
+			"prompt": *prompt, "count": *count, "model": *model,
+			"aspect": *aspect, "no_download": *noDownload, "all_accounts": *all,
+			"project_id": common.projectID,
+		}
+		if common.cookies != "" {
+			accountID, accountErr := serviceAccountID(common.cookies)
+			if accountErr != nil {
+				return fail(accountErr)
+			}
+			payload["account_id"] = accountID
+		}
+		return runServiceJob("image", payload, common.idempotencyKey)
+	}
 
 	if *all {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 
-		return runAllAccounts(ctx, common, "image", func(ctx context.Context, a *app.App) ([]string, error) {
-			outcome, err := a.Engine.GenerateImageViaBatch(ctx, engine.BatchImageRequest{
-				Prompt:   *prompt,
-				Model:    *model,
-				Aspect:   *aspect,
-				Download: !*noDownload,
-			})
-			if err != nil {
-				return nil, err
+		return runAllAccounts(ctx, common, "image", *jsonOutput, func(ctx context.Context, a *app.App) (accountGenerationResult, error) {
+			outcomes := make([]*engine.BatchOutcome, 0, *count)
+			files := make([]string, 0, *count)
+			for i := 0; i < *count; i++ {
+				outcome, err := a.Engine.GenerateImageViaBatch(ctx, engine.BatchImageRequest{
+					Prompt: *prompt, Model: *model, Aspect: *aspect, Download: !*noDownload,
+				})
+				if err != nil {
+					if len(outcomes) == 0 {
+						return accountGenerationResult{}, err
+					}
+					return accountGenerationResult{Files: files, Value: outcomes}, err
+				}
+				outcomes = append(outcomes, outcome)
+				files = append(files, filePaths(outcome.Files)...)
 			}
-			return filePaths(outcome.Files), nil
+			if *count == 1 {
+				return accountGenerationResult{Files: files, Value: outcomes[0]}, nil
+			}
+			return accountGenerationResult{Files: files, Value: outcomes}, nil
 		})
 	}
 
@@ -1559,6 +1669,7 @@ func runBatchAll(args []string) int {
 	model := fs.String("model", envDefault("IMAGE_MODEL", "narwhal"),
 		"image model: narwhal|lite|pro (from $IMAGE_MODEL, else narwhal)")
 	download := fs.Bool("download", true, "write the results to output/")
+	jsonOutput := fs.Bool("json", false, "print the aggregate result as JSON (for scripts)")
 	_ = fs.Parse(args)
 
 	if strings.TrimSpace(*prompt) == "" {
@@ -1569,16 +1680,16 @@ func runBatchAll(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	return runAllAccounts(ctx, common, "batch-all", func(ctx context.Context, a *app.App) ([]string, error) {
+	return runAllAccounts(ctx, common, "batch-all", *jsonOutput, func(ctx context.Context, a *app.App) (accountGenerationResult, error) {
 		outcome, err := a.Engine.GenerateImageViaBatch(ctx, engine.BatchImageRequest{
 			Prompt:   *prompt,
 			Model:    *model,
 			Download: *download,
 		})
 		if err != nil {
-			return nil, err
+			return accountGenerationResult{}, err
 		}
-		return filePaths(outcome.Files), nil
+		return accountGenerationResult{Files: filePaths(outcome.Files), Value: outcome}, nil
 	})
 }
 
@@ -1593,12 +1704,14 @@ func runBatchAll(args []string) int {
 // failure and no output, and folding it into "ok" would hide exactly the accounts
 // that are not working.
 type accountRun struct {
-	AccountID string
-	Label     string
-	Duration  time.Duration
-	Status    string
-	Files     []string
-	Err       string
+	AccountID string        `json:"account_id"`
+	Label     string        `json:"label,omitempty"`
+	Duration  time.Duration `json:"-"`
+	ElapsedS  float64       `json:"elapsed_seconds,omitempty"`
+	Status    string        `json:"status"`
+	Files     []string      `json:"files,omitempty"`
+	Result    any           `json:"result,omitempty"`
+	Err       string        `json:"error,omitempty"`
 }
 
 const (
@@ -1608,7 +1721,12 @@ const (
 )
 
 // accountGenerate performs the job for one account and returns what it wrote.
-type accountGenerate func(ctx context.Context, a *app.App) ([]string, error)
+type accountGenerationResult struct {
+	Files []string
+	Value any
+}
+
+type accountGenerate func(ctx context.Context, a *app.App) (accountGenerationResult, error)
 
 // runAccounts runs the job for every path, one goroutine each, and returns the
 // results in the order the paths were given.
@@ -1678,6 +1796,82 @@ func filePaths(files []engine.MediaFile) []string {
 	return out
 }
 
+type accountOutputFile struct {
+	AccountID string `json:"account_id"`
+	engine.MediaFile
+}
+
+// aggregateAccountRuns keeps the per-account result while also exposing flat
+// media fields consumed by the existing Python/OpenAI wrappers.
+func aggregateAccountRuns(runs []accountRun) map[string]any {
+	status := "succeeded"
+	ok, failed := 0, 0
+	files := make([]accountOutputFile, 0)
+	media := make([]any, 0)
+	mediaIDs := make([]string, 0)
+	urls := make([]string, 0)
+	seenFiles := make(map[string]bool)
+	appendFile := func(accountID string, file engine.MediaFile) {
+		key := accountID + "\x00" + file.Path
+		if seenFiles[key] {
+			return
+		}
+		seenFiles[key] = true
+		files = append(files, accountOutputFile{AccountID: accountID, MediaFile: file})
+	}
+	appendValue := func(accountID string, value any) {}
+	appendValue = func(accountID string, value any) {
+		switch result := value.(type) {
+		case *engine.BatchOutcome:
+			if result == nil {
+				return
+			}
+			for _, file := range result.Files {
+				appendFile(accountID, file)
+			}
+			for _, item := range result.Media {
+				media = append(media, item)
+			}
+		case []*engine.BatchOutcome:
+			for _, item := range result {
+				appendValue(accountID, item)
+			}
+		case *engine.BatchVideoOutcome:
+			if result == nil {
+				return
+			}
+			for _, file := range result.Files {
+				appendFile(accountID, file)
+			}
+			mediaIDs = append(mediaIDs, result.MediaIDs...)
+			urls = append(urls, result.URLs...)
+		}
+	}
+	for _, run := range runs {
+		if run.Status == runOK {
+			ok++
+		} else {
+			failed++
+		}
+		appendValue(run.AccountID, run.Result)
+		for _, path := range run.Files {
+			if !seenFiles[run.AccountID+"\x00"+path] {
+				appendFile(run.AccountID, engine.MediaFile{Path: path})
+			}
+		}
+	}
+	if failed > 0 {
+		status = "failed"
+		if ok > 0 {
+			status = "partial"
+		}
+	}
+	return map[string]any{
+		"status": status, "accounts": runs, "files": files,
+		"media": media, "media_ids": mediaIDs, "urls": urls,
+	}
+}
+
 // runForAccount builds an app for one account file and performs the job.
 //
 // The whole run is one function because every step needs the same app: the
@@ -1705,6 +1899,7 @@ func runForAccount(ctx context.Context, common commonFlags, path string, generat
 		// did the generation take", which for this row is not a number at all.
 		if run.Status != runSkipped {
 			run.Duration = time.Since(start)
+			run.ElapsedS = run.Duration.Seconds()
 		}
 	}()
 
@@ -1749,18 +1944,18 @@ func runForAccount(ctx context.Context, common commonFlags, path string, generat
 		return run
 	}
 
-	files, err := generate(ctx, a)
+	result, err := generate(ctx, a)
 	if err != nil {
-		run.Err = err.Error()
+		run.Err, run.Files, run.Result = err.Error(), result.Files, result.Value
 		return run
 	}
-	run.Status, run.Files = runOK, files
+	run.Status, run.Files, run.Result = runOK, result.Files, result.Value
 	return run
 }
 
 // runAllAccounts discovers the account files and runs the job on every one at
 // once.
-func runAllAccounts(ctx context.Context, common commonFlags, what string, generate accountGenerate) int {
+func runAllAccounts(ctx context.Context, common commonFlags, what string, asJSON bool, generate accountGenerate) int {
 	paths, err := engine.DiscoverAccountJars(config.CookieDir())
 	if err != nil {
 		return fail(fmt.Errorf("--all: list account cookie files: %w", err))
@@ -1771,22 +1966,30 @@ func runAllAccounts(ctx context.Context, common commonFlags, what string, genera
 		return 1
 	}
 
-	fmt.Printf("\n  %s on %d account(s), concurrently\n", what, len(paths))
-	fmt.Println("  " + strings.Repeat("-", 52))
+	if !asJSON {
+		fmt.Printf("\n  %s on %d account(s), concurrently\n", what, len(paths))
+		fmt.Println("  " + strings.Repeat("-", 52))
+	}
 
 	// Said once, before any of them start. The engine's own log lines go to the
 	// global logger, which has no per-account identity to attach — so they
 	// interleave, and a reader who has not been told will read them as belonging
 	// to whichever account's block they happen to land in.
-	fmt.Println("  The engine's log lines interleave across accounts below; the table at")
-	fmt.Println("  the end is the per-account record.")
-	fmt.Println()
+	if !asJSON {
+		fmt.Println("  The engine's log lines interleave across accounts below; the table at")
+		fmt.Println("  the end is the per-account record.")
+		fmt.Println()
+	}
 
 	runs := runAccounts(paths, func(path string) accountRun {
 		return runForAccount(ctx, common, path, generate)
 	})
 
-	fmt.Print(renderAccountRuns(runs))
+	if asJSON {
+		printJSON(aggregateAccountRuns(runs))
+	} else {
+		fmt.Print(renderAccountRuns(runs))
+	}
 
 	var ok, skipped, failed int
 	for _, run := range runs {
@@ -1799,8 +2002,13 @@ func runAllAccounts(ctx context.Context, common commonFlags, what string, genera
 			failed++
 		}
 	}
-	fmt.Printf("\n  %d succeeded, %d skipped, %d failed\n\n", ok, skipped, failed)
+	if !asJSON {
+		fmt.Printf("\n  %d succeeded, %d skipped, %d failed\n\n", ok, skipped, failed)
+	}
 	if failed > 0 {
+		if asJSON {
+			return 0 // The JSON status carries failures without hiding partial results.
+		}
 		return 1
 	}
 	return 0

@@ -73,6 +73,8 @@ type UploadOptions struct {
 	// asset removed — and a hit is never re-checked, because checking would cost
 	// the round trip the cache exists to save.
 	Force bool
+	// ProjectID selects a project owned by the current account runtime.
+	ProjectID string
 }
 
 // VideoUploadResult is what a completed video upload produces.
@@ -104,6 +106,9 @@ func (e *Engine) UploadVideo(ctx context.Context, filePath string, opts UploadOp
 		return nil, fmt.Errorf("engine: not ready — call Bootstrap first")
 	}
 	projectID := e.ProjectID()
+	if strings.TrimSpace(opts.ProjectID) != "" {
+		projectID = strings.TrimSpace(opts.ProjectID)
+	}
 	if projectID == "" {
 		return nil, fmt.Errorf("engine: no project id resolved")
 	}
@@ -217,6 +222,7 @@ func (e *Engine) UploadVideo(ctx context.Context, filePath string, opts UploadOp
 			FilePath:  filePath,
 			FileHash:  hash,
 			MediaID:   mediaID,
+			AccountID: e.AccountID(),
 			ProjectID: projectID,
 			Bytes:     info.Size(),
 		}); recErr != nil {
@@ -242,7 +248,7 @@ func (e *Engine) findCachedUpload(hash, projectID string) (*store.UploadRecord, 
 	if e.store == nil {
 		return nil, nil
 	}
-	return e.store.FindUpload(hash, projectID)
+	return e.store.FindUpload(e.AccountID(), hash, projectID)
 }
 
 // hashFile returns the SHA-256 of a file's contents, read in a stream.
@@ -313,8 +319,11 @@ func openUploadSession(ctx context.Context, step uploadStep) (string, error) {
 		return "", fmt.Errorf("engine: could not open the upload session: %w", err)
 	}
 	if !resp.OK() {
-		return "", fmt.Errorf("engine: the upload session was refused: HTTP %d %s",
-			resp.Status, truncate(resp.Text(), 300))
+		body := truncate(resp.Text(), 300)
+		if resp.Status == 429 {
+			return "", &UploadThrottleError{Status: resp.Status, Body: body}
+		}
+		return "", fmt.Errorf("engine: the upload session was refused: HTTP %d %s", resp.Status, body)
 	}
 
 	if url := sessionURLFrom(resp.Header); url != "" {
@@ -359,14 +368,25 @@ func postVideo(ctx context.Context, step uploadStep, sessionURL, filePath string
 		DisableQUIC: true,
 	})
 	if err != nil {
-		return "", fmt.Errorf("engine: the upload failed%s: %w", uploadTimeoutHint(err), err)
+		return "", &UploadOutcomeUnknown{Cause: fmt.Errorf("the upload failed%s: %w", uploadTimeoutHint(err), err)}
 	}
 	if !resp.OK() {
-		return "", fmt.Errorf("engine: the upload was refused: HTTP %d %s",
-			resp.Status, truncate(resp.Text(), 300))
+		body := truncate(resp.Text(), 300)
+		if resp.Status == 429 {
+			return "", &UploadThrottleError{Status: resp.Status, Body: body}
+		}
+		err := fmt.Errorf("the upload was refused: HTTP %d %s", resp.Status, body)
+		if resp.Status >= 500 {
+			return "", &UploadOutcomeUnknown{Cause: err}
+		}
+		return "", fmt.Errorf("engine: %w", err)
 	}
 
-	return mediaIDFrom(resp.Body)
+	mediaID, err := mediaIDFrom(resp.Body)
+	if err != nil {
+		return "", &UploadOutcomeUnknown{Cause: err}
+	}
+	return mediaID, nil
 }
 
 // sessionURLFrom finds the resumable session URL in a step-one reply.

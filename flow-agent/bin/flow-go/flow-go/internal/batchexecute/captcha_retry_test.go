@@ -2,6 +2,7 @@ package batchexecute
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,77 @@ import (
 	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
 	"github.com/kodelyx/flow-go/flow-go/internal/httpx"
 )
+
+func TestGenerationServerErrorHasAmbiguousSubmissionMarker(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "upstream failed after receiving request", http.StatusBadGateway)
+	}))
+	defer server.Close()
+	pointAt(t, server)
+
+	_, err := testClient(t).call(context.Background(), RPCIDGenerate, CallOptions{}, payloadWithToken)
+	if err == nil {
+		t.Fatal("expected HTTP 502")
+	}
+	var unknown interface{ SubmissionUnknown() bool }
+	if !errors.As(err, &unknown) || !unknown.SubmissionUnknown() {
+		t.Fatalf("error %T (%v) does not mark ambiguous generation", err, err)
+	}
+}
+
+func TestReadServerErrorIsNotAnAmbiguousSubmission(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "upstream failed", http.StatusBadGateway)
+	}))
+	defer server.Close()
+	pointAt(t, server)
+
+	_, err := testClient(t).call(context.Background(), RPCIDProjectList, CallOptions{}, payloadWithToken)
+	if err == nil {
+		t.Fatal("expected HTTP 502")
+	}
+	var unknown interface{ SubmissionUnknown() bool }
+	if errors.As(err, &unknown) {
+		t.Fatalf("read RPC error %T (%v) was marked as ambiguous generation", err, err)
+	}
+}
+
+func TestGenerationDefiniteClientErrorIsNotAnAmbiguousSubmission(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "invalid generation request", http.StatusBadRequest)
+	}))
+	defer server.Close()
+	pointAt(t, server)
+
+	_, err := testClient(t).call(context.Background(), RPCIDGenerate, CallOptions{}, payloadWithToken)
+	if err == nil {
+		t.Fatal("expected HTTP 400")
+	}
+	var unknown interface{ SubmissionUnknown() bool }
+	if errors.As(err, &unknown) {
+		t.Fatalf("definite HTTP 400 error %T (%v) was marked ambiguous", err, err)
+	}
+}
+
+func TestGenerationTransportFailureHasAmbiguousSubmissionMarker(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}))
+	defer server.Close()
+	pointAt(t, server)
+
+	_, err := testClient(t).call(context.Background(), RPCIDGenerate, CallOptions{}, payloadWithToken)
+	if err == nil {
+		t.Fatal("expected connection failure")
+	}
+	var unknown interface{ SubmissionUnknown() bool }
+	if !errors.As(err, &unknown) || !unknown.SubmissionUnknown() {
+		t.Fatalf("error %T (%v) does not mark ambiguous generation", err, err)
+	}
+}
 
 // The priming handshake resends a request. So does a session refresh after a
 // 401. Both used to resend the payload they were given — and the payload has the

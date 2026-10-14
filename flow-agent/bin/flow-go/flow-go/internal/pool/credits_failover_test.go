@@ -85,6 +85,44 @@ func TestUnknownCreditsAreStillHandedOut(t *testing.T) {
 	}
 }
 
+func TestAcquireAccountNeverSubstitutesAnotherAccount(t *testing.T) {
+	p := New()
+	p.Register(newTestWorker("requested"))
+	p.Register(newTestWorker("other"))
+
+	got, err := p.AcquireAccount(context.Background(), "requested", 0)
+	if err != nil {
+		t.Fatalf("AcquireAccount failed: %v", err)
+	}
+	if got.ID != "requested" {
+		t.Fatalf("AcquireAccount returned %q, want requested", got.ID)
+	}
+	p.Release(got, 0, nil)
+
+	_, err = p.AcquireAccount(context.Background(), "missing", 0)
+	var noWorker *NoWorkerError
+	if !errors.As(err, &noWorker) {
+		t.Fatalf("missing account error = %T (%v), want *NoWorkerError", err, err)
+	}
+}
+
+func TestAcquireAccountRejectsKnownInsufficientBalance(t *testing.T) {
+	p := New()
+	w := newTestWorker("requested")
+	w.SetCredits(3, "G1_TIER1")
+	p.Register(w)
+	p.Register(newTestWorker("other"))
+
+	_, err := p.AcquireAccount(context.Background(), "requested", 10)
+	var noWorker *NoWorkerError
+	if !errors.As(err, &noWorker) || !noWorker.InsufficientCredits() {
+		t.Fatalf("error = %T (%v), want typed insufficient-credits error", err, err)
+	}
+	if inFlight := inFlightOf(w); inFlight != 0 {
+		t.Fatalf("unaffordable account was reserved: in-flight = %d", inFlight)
+	}
+}
+
 // TestOutOfCreditsMarksTheWorkerDrained covers the discarded-zero half: the
 // balance has to actually be written down, or the worker keeps its stale
 // positive figure and stays affordable forever.

@@ -9,24 +9,38 @@ UI works without knowing anything about Flow.
 from __future__ import annotations
 
 import base64
+from contextlib import asynccontextmanager
 import json
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .engine import EngineError, FlowEngine
+
+engine = FlowEngine()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    try:
+        yield
+    finally:
+        close = getattr(engine, "aclose", None)
+        if close is not None:
+            await close()
+
 
 app = FastAPI(
     title="flow-agent",
     version="1.0.0",
     description="Image and video generation on Google Flow.",
+    lifespan=lifespan,
 )
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,8 +48,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-engine = FlowEngine()
 
 
 # OpenAI's image sizes, and the aspect each one means.
@@ -82,6 +94,7 @@ class ImageGenerationRequest(BaseModel):
     # Flow-specific, ignored by OpenAI clients.
     all_accounts: bool = False
     cookies: Optional[str] = None
+    account_id: Optional[str] = None
 
 
 class FlowImageRequest(BaseModel):
@@ -91,6 +104,7 @@ class FlowImageRequest(BaseModel):
     model: str = "narwhal"
     all_accounts: bool = False
     cookies: Optional[str] = None
+    account_id: Optional[str] = None
 
 
 class FlowVideoRequest(BaseModel):
@@ -102,6 +116,12 @@ class FlowVideoRequest(BaseModel):
     start_image: Optional[str] = None
     all_accounts: bool = False
     cookies: Optional[str] = None
+    account_id: Optional[str] = None
+
+
+class AsyncJobRequest(BaseModel):
+    kind: Literal["image", "video", "upload-video"]
+    payload: dict[str, Any]
 
 
 class ChatMessage(BaseModel):
@@ -121,6 +141,7 @@ class ChatCompletionRequest(BaseModel):
     size: str = "1024x1024"
     all_accounts: bool = False
     cookies: Optional[str] = None
+    account_id: Optional[str] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -150,6 +171,37 @@ def _no_image_detail(result: dict) -> str:
         "the engine produced no image "
         f"(status={result.get('status')!r}, job={result.get('job_id')!r}, "
         f"account={result.get('account_id')!r})"
+    )
+
+
+def _engine_http_status(exc: EngineError) -> int:
+    """Preserve local service admission/deadline errors at the API boundary."""
+    if exc.returncode in (400, 404, 409, 422, 429, 503):
+        return exc.returncode
+    if exc.returncode == -1 and (exc.job_id or "still running" in str(exc)):
+        return 504
+    if (
+        exc.returncode == -1
+        and exc.command
+        and exc.command[0].startswith(("http://", "https://"))
+        and "outcome is unknown" not in str(exc).lower()
+    ):
+        # Read-only calls can safely report that the local Go service is
+        # unavailable. A failed generation POST stays a gateway error when its
+        # durable acceptance cannot be resolved by idempotency key.
+        return 503
+    return 502
+
+
+def _engine_http_exception(exc: EngineError) -> HTTPException:
+    """Keep accepted durable job IDs available when a compatibility wait expires."""
+    headers = {}
+    if exc.job_id:
+        headers["X-Flow-Job-ID"] = exc.job_id
+    if exc.idempotency_key:
+        headers["Idempotency-Key"] = exc.idempotency_key
+    return HTTPException(
+        status_code=_engine_http_status(exc), detail=str(exc), headers=headers or None
     )
 
 
@@ -261,7 +313,10 @@ def _sse(body: dict) -> StreamingResponse:
 
 
 @app.post("/v1/images/generations")
-async def openai_images(payload: ImageGenerationRequest, request: Request):
+async def openai_images(
+    payload: ImageGenerationRequest, request: Request,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+):
     """Generate an image from an OpenAI images payload."""
     aspect = SIZE_TO_ASPECT.get(payload.size.strip().lower())
     if aspect is None:
@@ -274,6 +329,7 @@ async def openai_images(payload: ImageGenerationRequest, request: Request):
         )
 
     try:
+        retry_key = {"idempotency_key": idempotency_key} if idempotency_key else {}
         result = await engine.generate_image(
             prompt=payload.prompt,
             aspect=aspect,
@@ -281,9 +337,11 @@ async def openai_images(payload: ImageGenerationRequest, request: Request):
             model=payload.model,
             all_accounts=payload.all_accounts,
             cookies=payload.cookies,
+            account_id=payload.account_id,
+            **retry_key,
         )
     except EngineError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise _engine_http_exception(exc) from exc
 
     payload_out = _image_payload(request, result, payload.response_format)
     # A run that produced nothing is not a success. Returning 200 with an empty
@@ -296,7 +354,10 @@ async def openai_images(payload: ImageGenerationRequest, request: Request):
 
 
 @app.post("/v1/chat/completions")
-async def openai_chat(payload: ChatCompletionRequest, request: Request):
+async def openai_chat(
+    payload: ChatCompletionRequest, request: Request,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+):
     """Generate from the last user turn and answer with a Markdown link."""
     prompt = _prompt_from_messages(payload.messages)
     if not prompt:
@@ -305,14 +366,17 @@ async def openai_chat(payload: ChatCompletionRequest, request: Request):
     aspect = SIZE_TO_ASPECT.get(payload.size.strip().lower(), "1:1")
 
     try:
+        retry_key = {"idempotency_key": idempotency_key} if idempotency_key else {}
         result = await engine.generate_image(
             prompt=prompt,
             aspect=aspect,
             all_accounts=payload.all_accounts,
             cookies=payload.cookies,
+            account_id=payload.account_id,
+            **retry_key,
         )
     except EngineError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise _engine_http_exception(exc) from exc
 
     files = result.get("files") or []
     if not files:
@@ -332,12 +396,92 @@ async def openai_chat(payload: ChatCompletionRequest, request: Request):
 # --------------------------------------------------------------------------- #
 
 
+@app.post("/api/v1/jobs")
+async def create_async_job(
+    payload: AsyncJobRequest,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+):
+    """Accept asynchronous work and return immediately with a durable status URL."""
+    if payload.kind in ("image", "video") and not str(payload.payload.get("prompt", "")).strip():
+        raise HTTPException(status_code=422, detail="payload.prompt is required")
+    if payload.kind in ("image", "video"):
+        count = payload.payload.get("count", 1)
+        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 4:
+            raise HTTPException(status_code=422, detail="payload.count must be an integer from 1 to 4")
+    if payload.kind == "upload-video" and not str(payload.payload.get("file_path", "")).strip():
+        raise HTTPException(status_code=422, detail="payload.file_path is required")
+    try:
+        accepted = await engine.enqueue_service_job(payload.kind, payload.payload, idempotency_key)
+    except EngineError as exc:
+        raise _engine_http_exception(exc) from exc
+    job_id = accepted.get("job_id")
+    if not job_id:
+        raise HTTPException(status_code=502, detail="service returned no job_id")
+    status_url = f"/api/v1/jobs/{job_id}"
+    events_url = f"/api/v1/jobs/{job_id}/events"
+    return JSONResponse(
+        status_code=202,
+        headers={"Location": status_url},
+        content={
+            "job_id": job_id,
+            "status": accepted.get("status", "queued"),
+            "status_url": status_url,
+            "events_url": events_url,
+        },
+    )
+
+
+@app.get("/api/v1/jobs/{job_id}")
+async def get_async_job(job_id: str):
+    try:
+        return await engine.get_service_job(job_id)
+    except EngineError as exc:
+        raise _engine_http_exception(exc) from exc
+
+
+@app.get("/api/v1/jobs/{job_id}/events")
+async def stream_async_job_events(
+    job_id: str,
+    last_event_id: Optional[str] = Header(default=None, alias="Last-Event-ID"),
+):
+    try:
+        upstream = await engine.open_service_job_events(job_id, last_event_id)
+    except EngineError as exc:
+        raise _engine_http_exception(exc) from exc
+
+    async def stream():
+        try:
+            async for chunk in upstream.aiter_bytes():
+                yield chunk
+        finally:
+            await upstream.aclose()
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/v1/jobs/{job_id}/cancel", status_code=202)
+async def cancel_async_job(job_id: str):
+    try:
+        await engine.cancel_service_job(job_id)
+    except EngineError as exc:
+        raise _engine_http_exception(exc) from exc
+    return {"job_id": job_id, "status": "cancellation_requested"}
+
+
 @app.post("/v1/generate/image")
 @app.post("/v1/image")
 @app.post("/api/v1/image")
-async def flow_image(payload: FlowImageRequest):
+async def flow_image(
+    payload: FlowImageRequest,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+):
     """Generate an image, speaking the engine's own vocabulary."""
     try:
+        retry_key = {"idempotency_key": idempotency_key} if idempotency_key else {}
         return await engine.generate_image(
             prompt=payload.prompt,
             aspect=payload.aspect,
@@ -345,17 +489,23 @@ async def flow_image(payload: FlowImageRequest):
             model=payload.model,
             all_accounts=payload.all_accounts,
             cookies=payload.cookies,
+            account_id=payload.account_id,
+            **retry_key,
         )
     except EngineError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise _engine_http_exception(exc) from exc
 
 
 @app.post("/v1/generate/video")
 @app.post("/v1/video")
 @app.post("/api/v1/video")
-async def flow_video(payload: FlowVideoRequest):
+async def flow_video(
+    payload: FlowVideoRequest,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+):
     """Generate a video, speaking the engine's own vocabulary."""
     try:
+        retry_key = {"idempotency_key": idempotency_key} if idempotency_key else {}
         return await engine.generate_video(
             prompt=payload.prompt,
             aspect=payload.aspect,
@@ -365,9 +515,11 @@ async def flow_video(payload: FlowVideoRequest):
             start_image=payload.start_image,
             all_accounts=payload.all_accounts,
             cookies=payload.cookies,
+            account_id=payload.account_id,
+            **retry_key,
         )
     except EngineError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise _engine_http_exception(exc) from exc
 
 
 @app.get("/v1/balance")
@@ -377,7 +529,7 @@ async def flow_balance(refresh: bool = False):
     try:
         return await engine.get_balance(refresh=refresh)
     except EngineError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise _engine_http_exception(exc) from exc
 
 
 @app.get("/v1/stats")
@@ -387,16 +539,16 @@ async def flow_stats():
     try:
         return await engine.get_stats()
     except EngineError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise _engine_http_exception(exc) from exc
 
 
 @app.get("/v1/projects")
 @app.get("/api/v1/projects")
-async def flow_projects(cookies: Optional[str] = None):
+async def flow_projects(cookies: Optional[str] = None, account_id: Optional[str] = None):
     try:
-        return {"projects": await engine.get_projects(cookies=cookies)}
+        return {"projects": await engine.get_projects(cookies=cookies, account_id=account_id)}
     except EngineError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise _engine_http_exception(exc) from exc
 
 
 @app.get("/v1/media/{filename:path}")
@@ -415,4 +567,21 @@ async def flow_media(filename: str):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "engine": engine.available(), "binary": str(engine.binary)}
+    service_health = getattr(engine, "service_health", None)
+    details = await service_health() if service_health is not None else {}
+    if service_health is not None:
+        engine_available = details.get("status") == "ok"
+    else:
+        available = getattr(engine, "service_available", None)
+        engine_available = await available() if available is not None else bool(engine.available())
+    service_url = getattr(engine, "service_url", "")
+    body = {
+        "status": "ok",
+        "engine": engine_available,
+        "mode": "service" if service_url else "subprocess",
+        "binary": str(engine.binary),
+    }
+    for key in ("ready_accounts", "connected_accounts", "strict_cookie_freshness"):
+        if key in details:
+            body[key] = details[key]
+    return body
