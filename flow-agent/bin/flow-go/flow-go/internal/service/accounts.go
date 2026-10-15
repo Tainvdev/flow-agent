@@ -479,7 +479,9 @@ func (m *AccountManager) ReadyAccounts() int {
 	return ready
 }
 
-// RequiresLiveCookieSync indicates that an offline extension cannot be routed work.
+// RequiresLiveCookieSync reports whether strict freshness requires an online
+// extension connection. Jobs use the persisted account bundle and do not pull a
+// cookie snapshot immediately before submission.
 func (m *AccountManager) RequiresLiveCookieSync() bool { return m.strictFresh }
 
 // ConnectedAccounts reports runtimes with a currently attached extension peer.
@@ -574,7 +576,7 @@ func (m *AccountManager) acquire(ctx context.Context, id string) (*accountRuntim
 			}
 		}
 		if m.strictFresh && !m.bridge.AccountConnected(id) {
-			return nil, fmt.Errorf("service: account %s extension is offline; live cookie sync is required", id)
+			return nil, fmt.Errorf("service: account %s extension is offline; strict cookie freshness requires a connected extension", id)
 		}
 		select {
 		case runtime.gate <- struct{}{}:
@@ -607,7 +609,7 @@ func (m *AccountManager) acquire(ctx context.Context, id string) (*accountRuntim
 			m.mu.Unlock()
 			select {
 			case <-m.initialized:
-				return nil, fmt.Errorf("service: no account has a connected extension for live cookie sync")
+				return nil, fmt.Errorf("service: no account has a connected extension under strict cookie freshness")
 			default:
 				select {
 				case <-ctx.Done():
@@ -901,15 +903,6 @@ func (m *AccountManager) ResumeWithProgress(ctx context.Context, job store.Job, 
 	if err != nil {
 		return nil, err
 	}
-	accountID := runtime.id
-	m.release(runtime)
-	if err := m.syncLatest(ctx, accountID); err != nil {
-		return nil, err
-	}
-	runtime, err = m.acquire(ctx, accountID)
-	if err != nil {
-		return nil, err
-	}
 	defer m.release(runtime)
 	if progress != nil {
 		ctx = engine.WithExecutionProgress(ctx, progress)
@@ -981,18 +974,9 @@ func (m *AccountManager) runOne(ctx context.Context, jobID, kind string, payload
 	if err != nil {
 		return nil, err
 	}
-	// The extension sends rotation events, and a full sync here closes the gap
-	// between the last event and this submission. Offline snapshots are used only
-	// when the operator explicitly selected cached freshness mode.
-	selectedID := runtime.id
-	m.release(runtime)
-	if err := m.syncLatest(ctx, selectedID); err != nil {
-		return nil, err
-	}
-	runtime, err = m.acquire(ctx, selectedID)
-	if err != nil {
-		return nil, err
-	}
+	// The account runtime is built from its persisted bundle. Cookie rotation
+	// events update that bundle asynchronously; generation does not pull cookies
+	// from the extension immediately before submitting a job.
 	defer m.release(runtime)
 	if err := m.validateReferenceOwnership(ctx, runtime.engine, payload); err != nil {
 		return nil, err
@@ -1367,43 +1351,6 @@ func appendJSONItems(target map[string]any, key string, value any) {
 	items, _ := target[key].([]any)
 	more, _ := value.([]any)
 	target[key] = append(items, more...)
-}
-
-func (m *AccountManager) syncLatest(ctx context.Context, id string) error {
-	syncCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	jar, connected, err := m.bridge.SyncAccount(syncCtx, id)
-	cancel()
-	if err != nil {
-		return fmt.Errorf("service: refresh account %s cookies: %w", id, err)
-	}
-	if !connected {
-		if m.strictFresh {
-			return fmt.Errorf("service: account %s extension is offline; live cookie sync is required", id)
-		}
-		return nil
-	}
-	path := m.bridge.AccountCookieFile(id)
-	bundle, err := cookiejar.LoadBundleFile(path)
-	if err != nil {
-		return fmt.Errorf("service: load refreshed account %s bundle: %w", id, err)
-	}
-	if !bundle.Complete() {
-		return fmt.Errorf("service: refreshed account %s bundle is incomplete", id)
-	}
-	encoded, _ := json.Marshal(bundle)
-	digest := fmt.Sprintf("%x", sha256.Sum256(encoded))
-	for {
-		runtime := m.account(id)
-		if runtime != nil && runtime.snapshot == digest && runtime.engine.Jar() != nil &&
-			runtime.engine.Jar().Hash() == jar.Hash() {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
 }
 
 func accountIDFromCookiePath(path string) (string, error) {

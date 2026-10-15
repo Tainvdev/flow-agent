@@ -45,7 +45,7 @@ sequenceDiagram
     Note over Bridge,Storage: Fresh snapshot is durable before the runtime can use it
 ```
 
-The extension sends cookie rotation events as a signal to resync, not as a cookie delta. The bridge fetches the complete scoped cookie set, writes the account bundle atomically, then publishes the update to the account registry. A failed sync or failed bundle write does not publish the new session. Cookie freshness defaults to strict: service mode requires a live sync before submission. `FLOW_COOKIE_FRESHNESS=cached` explicitly allows use of a persisted snapshot while the extension is offline.
+The extension sends cookie rotation events as a signal to resync, not as a cookie delta. The bridge fetches the complete scoped cookie set, writes the account bundle atomically, then publishes the update to the account registry. A failed sync or failed bundle write does not publish the new session. Service jobs use the persisted account bundle and do not pull cookies immediately before submission. Cookie freshness defaults to strict: service mode requires the owning extension to remain connected so rotation events can update the bundle. `FLOW_COOKIE_FRESHNESS=cached` allows a persisted snapshot to be used while the extension is offline.
 
 ---
 

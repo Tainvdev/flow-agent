@@ -487,8 +487,8 @@ Confirms the Python server is running and its configured engine backend is reach
 | `status` | Always `"ok"` if server is up |
 | `engine` | `true` if the Go service answers health checks in service mode, or the binary exists in subprocess mode |
 | `ready_accounts` | Warm account runtimes available in service mode |
-| `connected_accounts` | Accounts with a live extension peer; strict cookie sync needs these |
-| `strict_cookie_freshness` | Whether service jobs require live extension sync before submit |
+| `connected_accounts` | Accounts with a live extension peer; strict cookie freshness requires these connections |
+| `strict_cookie_freshness` | Whether service jobs require the owning extension to stay connected; jobs use the persisted account bundle without a pre-submit cookie pull |
 | `mode` | `service` or `subprocess` |
 | `binary` | Absolute path selected for subprocess mode; informational in service mode |
 

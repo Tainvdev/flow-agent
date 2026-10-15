@@ -21,7 +21,10 @@ the same database exits instead of becoming another queue owner.
 For strict cookie freshness, each account must have a live extension connection
 from the browser profile that owns that account's cookies. A persisted bundle
 whose profile is offline stays unavailable to the scheduler even if its cached
-cookies can bootstrap an engine. When several profiles are used, install/pair
+cookies can bootstrap an engine. The service does not pull cookies immediately
+before each job: it submits with the account bundle on disk. The extension's
+cookie-rotation event updates that bundle, and a connected extension is still
+required by strict freshness mode. When several profiles are used, install/pair
 the extension in each profile and confirm `/health` reports the expected
 `connected_accounts` and `ready_accounts` before relying on parallel account
 capacity.

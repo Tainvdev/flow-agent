@@ -295,7 +295,9 @@ func (e *Engine) Fingerprint() *flowapi.BrowserFingerprint {
 	return e.fingerprint
 }
 
-// Jar returns the cookies the engine acts as.
+// Jar returns the cookies the engine acts as. When CookieFile is configured,
+// it reads that persisted snapshot on every access so requests use the file as
+// their source of truth instead of a jar captured in memory during Bootstrap.
 //
 // Deliberately not `bridge.Jar()`, which answers with whichever extension synced
 // most recently. The bridge holds a single jar and `SyncCookies` overwrites it
@@ -304,10 +306,19 @@ func (e *Engine) Fingerprint() *flowapi.BrowserFingerprint {
 // primary account then goes out under a different profile's session. That is the
 // cross-contamination this accessor exists to prevent.
 //
-// The bridge is still the fallback, for a caller that runs before Bootstrap has
-// captured one. It is not the primary source, and it is not consulted once
-// Bootstrap has run.
+// Without a configured CookieFile, the bridge is still the fallback for a
+// caller that runs before Bootstrap has captured one. Once Bootstrap has run,
+// the engine's own in-memory jar is used instead.
 func (e *Engine) Jar() *cookiejar.Jar {
+	if path := strings.TrimSpace(e.opts.CookieFile); path != "" {
+		jar, err := cookiejar.LoadFile(path)
+		if err != nil {
+			log.Printf("engine: could not load cookies from %s: %v", path, err)
+			return nil
+		}
+		return jar
+	}
+
 	e.mu.RLock()
 	jar := e.primaryJar
 	e.mu.RUnlock()
@@ -449,6 +460,13 @@ func (e *Engine) refreshSessionOnce(ctx context.Context) (*cookiejar.Jar, error)
 	}
 	if err := e.Bootstrap(ctx); err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(e.opts.CookieFile) != "" {
+		persisted, err := cookiejar.LoadFile(e.opts.CookieFile)
+		if err != nil {
+			return nil, fmt.Errorf("engine: reload refreshed cookies from %s: %w", e.opts.CookieFile, err)
+		}
+		return persisted, nil
 	}
 	return jar, nil
 }
@@ -668,7 +686,7 @@ func (e *Engine) AccountsCredits(ctx context.Context, max int) ([]AccountCredits
 	if !e.Ready() {
 		return nil, fmt.Errorf("engine: not ready — call Bootstrap first")
 	}
-	jar := e.bridge.Jar()
+	jar := e.Jar()
 	if jar == nil {
 		return nil, fmt.Errorf("engine: no cookies loaded")
 	}
@@ -800,7 +818,7 @@ func (e *Engine) AccessToken(ctx context.Context) (string, error) {
 // different number, and the token used for it can belong to a different signed-in
 // account entirely, so it is not a source to trust.
 func (e *Engine) Credits(ctx context.Context) (int, error) {
-	jar := e.bridge.Jar()
+	jar := e.Jar()
 	if jar == nil {
 		return 0, fmt.Errorf("engine: no cookies loaded")
 	}
@@ -927,7 +945,7 @@ func (e *Engine) RawCreditsRPC(ctx context.Context, authUser int) ([]json.RawMes
 	if !e.Ready() {
 		return nil, fmt.Errorf("engine: not ready — call Bootstrap first")
 	}
-	jar := e.bridge.Jar()
+	jar := e.Jar()
 	if jar == nil {
 		return nil, fmt.Errorf("engine: no cookies loaded")
 	}
@@ -1025,7 +1043,7 @@ func (e *Engine) SessionSnapshot(ctx context.Context) (*SessionSnapshot, error) 
 // Ordered by the server, most recently modified first, which makes the first
 // entry the project the account was last working in.
 func (e *Engine) ListProjects(ctx context.Context) ([]batchexecute.Project, error) {
-	jar := e.bridge.Jar()
+	jar := e.Jar()
 	if jar == nil {
 		return nil, fmt.Errorf("engine: no cookies loaded")
 	}
@@ -1046,7 +1064,7 @@ func (e *Engine) ListProjects(ctx context.Context) ([]batchexecute.Project, erro
 // for generation but never appears in the listing, so before this the only way
 // to make a *findable* project was to click New project in the browser.
 func (e *Engine) CreateProject(ctx context.Context, label string) (batchexecute.Project, error) {
-	jar := e.bridge.Jar()
+	jar := e.Jar()
 	if jar == nil {
 		return batchexecute.Project{}, fmt.Errorf("engine: no cookies loaded")
 	}
@@ -4219,7 +4237,7 @@ func (e *Engine) GenerateVideoFromReferencesViaBatch(ctx context.Context, req Ba
 // from outside the process, which is the only way to establish whether that
 // surface still works before building on it.
 func (e *Engine) LabsAccessToken(ctx context.Context) (string, error) {
-	jar := e.bridge.Jar()
+	jar := e.Jar()
 	if jar == nil {
 		return "", fmt.Errorf("engine: no cookies loaded")
 	}

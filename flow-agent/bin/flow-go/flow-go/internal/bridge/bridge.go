@@ -589,19 +589,6 @@ func (b *Bridge) persistCookieSnapshot(client *cdp.Client, jar *cookiejar.Jar, b
 	return nil
 }
 
-// SyncAccount refreshes one account from its browser profile if that profile is
-// still connected. connected=false means callers may use the persisted bundle.
-func (b *Bridge) SyncAccount(ctx context.Context, accountID string) (*cookiejar.Jar, bool, error) {
-	b.mu.RLock()
-	client := b.accountClients[accountID]
-	b.mu.RUnlock()
-	if client == nil || !client.Connected() {
-		return nil, false, nil
-	}
-	jar, err := b.SyncCookies(ctx, client)
-	return jar, true, err
-}
-
 // AccountConnected reports whether the extension client currently bound to an
 // account is live. It does not trigger a browser command or cookie refresh.
 func (b *Bridge) AccountConnected(accountID string) bool {
