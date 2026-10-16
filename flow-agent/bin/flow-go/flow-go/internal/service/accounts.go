@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -63,7 +62,6 @@ type accountRuntime struct {
 	path              string
 	engine            *engine.Engine
 	gate              chan struct{}
-	refreshingBalance atomic.Bool
 	lastUsed          time.Time
 	snapshot          string
 	schedulerWorker   *pool.Worker
@@ -995,11 +993,11 @@ func (m *AccountManager) runOne(ctx context.Context, jobID, kind string, payload
 		if err := progress.BindAccount(runtime.id, runtime.engine.ProjectID(), runtime.snapshot); err != nil {
 			return nil, err
 		}
-		// Image/video engines do their own preflight (credits, project, captcha)
-		// before reporting "submitting" immediately before the generation RPC.
-		// Keep their durable phase at preparing until that boundary so a process
-		// restart can safely reclaim a lease lost during preflight. Upload-video
-		// has no equivalent phase boundary yet, so it stays conservative.
+		// Image balance refresh and image/video engine preflights happen before
+		// reporting "submitting" immediately before the generation RPC. Keep the
+		// durable phase at preparing until that boundary so a process restart can
+		// safely reclaim a lease lost during preflight. Upload-video has no
+		// equivalent phase boundary yet, so it stays conservative.
 		if kind == "upload-video" {
 			if err := progress.SetPhase("executing", ""); err != nil {
 				return nil, err
@@ -1017,11 +1015,7 @@ func (m *AccountManager) runOne(ctx context.Context, jobID, kind string, payload
 		}
 		return runtime.engine.UploadVideo(ctx, payload.FilePath, engine.UploadOptions{Force: payload.ForceUpload, ProjectID: payload.ProjectID})
 	case "image":
-		result, err = generateImages(ctx, runtime, jobID, payload)
-		if err == nil {
-			m.refreshImageBalanceAsync(runtime)
-		}
-		return result, err
+		return m.generateImages(ctx, runtime, jobID, payload)
 	case "video":
 		if len(payload.References) > 0 {
 			duration := 8
@@ -1091,31 +1085,21 @@ func (m *AccountManager) validateReferenceOwnership(ctx context.Context, e *engi
 	return nil
 }
 
-// refreshImageBalanceAsync updates the scheduler's admission snapshot after an
-// image submit without adding a credits RPC to the generation response path.
-// At most one refresh runs per account runtime; a cookie rotation that replaces
-// the runtime prevents the old result from being published.
-func (m *AccountManager) refreshImageBalanceAsync(runtime *accountRuntime) {
+// refreshImageBalance reads the authoritative balance immediately before an
+// image submission and publishes it to the scheduler and account store. A
+// failed balance read is best-effort: it must not prevent image generation.
+func (m *AccountManager) refreshImageBalance(ctx context.Context, runtime *accountRuntime) {
 	if runtime == nil || runtime.engine == nil {
 		return
 	}
-	if !runtime.refreshingBalance.CompareAndSwap(false, true) {
+	creditCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	credits, err := runtime.engine.Credits(creditCtx)
+	if err != nil {
+		log.Printf("service: refresh image balance for account %s: %v", runtime.id, err)
 		return
 	}
-	started := m.startBackground(func() {
-		defer runtime.refreshingBalance.Store(false)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		credits, err := runtime.engine.Credits(ctx)
-		if err != nil {
-			log.Printf("service: refresh image balance for account %s: %v", runtime.id, err)
-			return
-		}
-		m.publishObservedBalance(runtime, credits)
-	})
-	if !started {
-		runtime.refreshingBalance.Store(false)
-	}
+	m.publishObservedBalance(runtime, credits)
 }
 
 func (m *AccountManager) startBackground(task func()) bool {
@@ -1286,7 +1270,7 @@ func generationCreditCost(kind string, payload generationPayload) int {
 // generateImages expands the public image count into sequential submissions on
 // the same pinned runtime. The account gate remains held for the whole request,
 // so another request cannot interleave mutable session work on that account.
-func generateImages(ctx context.Context, runtime *accountRuntime, parentJobID string, payload generationPayload) (any, error) {
+func (m *AccountManager) generateImages(ctx context.Context, runtime *accountRuntime, parentJobID string, payload generationPayload) (any, error) {
 	count := payload.Count
 	if count < 1 {
 		count = 1
@@ -1295,6 +1279,7 @@ func generateImages(ctx context.Context, runtime *accountRuntime, parentJobID st
 		return nil, fmt.Errorf("service: image count must be between 1 and 4")
 	}
 	if count == 1 {
+		m.refreshImageBalance(ctx, runtime)
 		return runtime.engine.GenerateImageViaBatch(ctx, engine.BatchImageRequest{
 			Prompt: payload.Prompt, Model: payload.Model, ProjectID: payload.ProjectID, Aspect: payload.Aspect, Download: !payload.NoDownload,
 		})
@@ -1306,6 +1291,7 @@ func generateImages(ctx context.Context, runtime *accountRuntime, parentJobID st
 	var failures []string
 	succeeded := 0
 	for i := 0; i < count; i++ {
+		m.refreshImageBalance(ctx, runtime)
 		outcome, err := runtime.engine.GenerateImageViaBatch(ctx, engine.BatchImageRequest{
 			Prompt: payload.Prompt, Model: payload.Model, ProjectID: payload.ProjectID, Aspect: payload.Aspect, Download: !payload.NoDownload,
 		})

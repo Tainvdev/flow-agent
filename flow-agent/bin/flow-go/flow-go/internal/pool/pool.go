@@ -54,7 +54,7 @@ const (
 	// Shorter than CircuitCooldown on purpose: a throttle clears on its own, and
 	// keeping the account out of rotation for longer than the throttle lasts
 	// only wastes capacity.
-	ThrottleCooldown = 45 * time.Second
+	ThrottleCooldown = 5 * time.Second
 	// CreditsCooldown is how long an account that ran out of credits stays out of
 	// rotation.
 	//
