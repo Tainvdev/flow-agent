@@ -244,7 +244,7 @@ func (r *expansionTestRunner) Run(_ context.Context, job store.Job) (any, error)
 func (r *expansionTestRunner) ExpandForQueue(_ context.Context, job store.Job) ([]store.Job, bool, error) {
 	var payload generationPayload
 	_ = json.Unmarshal([]byte(job.Payload), &payload)
-	if job.Kind != "image" || (!payload.AllAccounts && payload.Count <= 1) {
+	if job.Kind != "image" || !payload.AllAccounts {
 		return nil, false, nil
 	}
 	return []store.Job{{ID: "expanded-1", Kind: "image", Payload: `{"account_id":"acct-1","count":1}`}, {ID: "expanded-2", Kind: "image", Payload: `{"account_id":"acct-1","count":1}`}}, true, nil
@@ -436,7 +436,7 @@ func TestJobsAPIRequiresToken(t *testing.T) {
 	}
 }
 
-func TestJobsAPIAtomicallyAcceptsExpandedParentAndChildren(t *testing.T) {
+func TestJobsAPIAcceptsImageCountAsOneQueuedJob(t *testing.T) {
 	jobs, _ := newTestJobs(t)
 	jobs.runner = &expansionTestRunner{}
 	req := httptest.NewRequest(http.MethodPost, "/internal/v1/jobs", strings.NewReader(`{"kind":"image","payload":{"prompt":"x","count":2}}`))
@@ -454,10 +454,14 @@ func TestJobsAPIAtomicallyAcceptsExpandedParentAndChildren(t *testing.T) {
 	if err := json.Unmarshal(res.Body.Bytes(), &accepted); err != nil {
 		t.Fatal(err)
 	}
-	parent, err := jobs.store.JobByID(context.Background(), accepted.ID)
+	job, err := jobs.store.JobByID(context.Background(), accepted.ID)
 	children, childrenErr := jobs.store.ChildJobs(context.Background(), accepted.ID)
-	if err != nil || childrenErr != nil || accepted.Status != "waiting_children" || parent.Status != "waiting_children" || len(children) != 2 {
-		t.Fatalf("accepted parent=%+v response=%+v children=%+v errors=(%v,%v)", parent, accepted, children, err, childrenErr)
+	if err != nil || childrenErr != nil || accepted.Status != "queued" || job.Status != "queued" || len(children) != 0 {
+		t.Fatalf("accepted job=%+v response=%+v children=%+v errors=(%v,%v)", job, accepted, children, err, childrenErr)
+	}
+	var payload generationPayload
+	if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil || payload.Count != 2 {
+		t.Fatalf("queued payload=%s count=%d err=%v, want count preserved as 2", job.Payload, payload.Count, err)
 	}
 }
 

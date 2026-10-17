@@ -1219,6 +1219,10 @@ func firstStringAt(value any, path ...int) string {
 type GenerateRequest struct {
 	// ProjectID is the project to generate into.
 	ProjectID string
+	// ReferenceMediaIDs are project media IDs attached at request[2].
+	ReferenceMediaIDs []string
+	// Count is the number of image variations submitted in this RPC.
+	Count int
 	// Model is the image enum ("NARWHAL", "HARBOR_SEAL", "GEM_PIX_2") or the
 	// video key ("abra_t2v_8s").
 	Model string
@@ -1282,6 +1286,9 @@ func (c *Client) Generate(ctx context.Context, req GenerateRequest, opts CallOpt
 	}
 	if strings.TrimSpace(req.Prompt) == "" {
 		return nil, fmt.Errorf("batchexecute: a prompt is required")
+	}
+	if req.Count < 0 || req.Count > 4 {
+		return nil, fmt.Errorf("batchexecute: image count must be between 1 and 4")
 	}
 	if req.CaptchaToken == "" {
 		return nil, fmt.Errorf("batchexecute: a reCAPTCHA token is required")
@@ -1713,29 +1720,46 @@ func buildGenerateArgument(req GenerateRequest, seed int64) []any {
 		nil, nil, nil, nil,
 		[]any{req.CaptchaToken, 1},
 	}
+	referenceInputs := make([]any, 0, len(req.ReferenceMediaIDs))
+	for _, mediaID := range req.ReferenceMediaIDs {
+		// The app encodes each reference as [media_id, null, null, null, 1].
+		referenceInputs = append(referenceInputs, []any{mediaID, nil, nil, nil, 1})
+	}
 
-	request := []any{
-		nil, nil, nil,
-		seed,
-		// The aspect ratio, at index 4. Unset leaves this at the value a live
-		// submission is known to accept, so a caller who never mentions aspect
-		// sends exactly the bytes they sent before this slot was understood.
-		imageAspectSlot(req.AspectRatio),
-		req.Model,
-		nil,
-		contextBlock,
-		// Three levels, not four: the prompt string must land at [8][0][0][0].
-		// With an extra level a list sits there instead, and the server accepts
-		// the request with a 200 while generating nothing.
-		[]any{[]any{[]any{req.Prompt}}},
-		nil, nil, nil,
-		uuid.NewString(),
-		uuid.NewString(),
+	count := req.Count
+	if count < 1 {
+		count = 1
+	}
+	requests := make([]any, 0, count)
+	for i := 0; i < count; i++ {
+		requestSeed := seed + int64(i)
+		request := []any{
+			nil, nil, nil,
+			requestSeed,
+			// The aspect ratio, at index 4. Unset leaves this at the value a live
+			// submission is known to accept, so a caller who never mentions aspect
+			// sends exactly the bytes they sent before this slot was understood.
+			imageAspectSlot(req.AspectRatio),
+			req.Model,
+			nil,
+			contextBlock,
+			// Three levels, not four: the prompt string must land at [8][0][0][0].
+			// With an extra level a list sits there, and the server accepts a 200
+			// while generating nothing.
+			[]any{[]any{[]any{req.Prompt}}},
+			nil, nil, nil,
+			uuid.NewString(),
+			uuid.NewString(),
+		}
+		if len(req.ReferenceMediaIDs) > 0 {
+			request[2] = referenceInputs
+		}
+		requests = append(requests, request)
 	}
 
 	return []any{
 		nil,
-		[]any{request},
+		requests,
 		1,
 		contextBlock,
 		[]any{uuid.NewString()},

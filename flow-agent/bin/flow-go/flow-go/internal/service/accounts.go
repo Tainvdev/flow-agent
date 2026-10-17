@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,32 +59,33 @@ type AccountManager struct {
 var errAccountSnapshotSuperseded = errors.New("service: account snapshot superseded by a newer cookie update")
 
 type accountRuntime struct {
-	id                string
-	path              string
-	engine            *engine.Engine
-	gate              chan struct{}
-	lastUsed          time.Time
-	snapshot          string
-	schedulerWorker   *pool.Worker
+	id              string
+	path            string
+	engine          *engine.Engine
+	gate            chan struct{}
+	lastUsed        time.Time
+	snapshot        string
+	schedulerWorker *pool.Worker
 }
 
 type generationPayload struct {
-	Prompt      string   `json:"prompt"`
-	Aspect      string   `json:"aspect"`
-	Model       string   `json:"model"`
-	Duration    string   `json:"duration"`
-	Quality     string   `json:"quality"`
-	Count       int      `json:"count"`
-	FilePath    string   `json:"file_path"`
-	ForceUpload bool     `json:"force"`
-	NoDownload  bool     `json:"no_download"`
-	StartImage  string   `json:"start_image"`
-	EndImage    string   `json:"end_image"`
-	References  []string `json:"references,omitempty"`
-	AccountID   string   `json:"account_id"`
-	AllAccounts bool     `json:"all_accounts"`
-	Cookies     string   `json:"cookies"`
-	ProjectID   string   `json:"project_id"`
+	Prompt        string                      `json:"prompt"`
+	Aspect        string                      `json:"aspect"`
+	Model         string                      `json:"model"`
+	Duration      string                      `json:"duration"`
+	Quality       string                      `json:"quality"`
+	Count         int                         `json:"count"`
+	FilePath      string                      `json:"file_path"`
+	ForceUpload   bool                        `json:"force"`
+	NoDownload    bool                        `json:"no_download"`
+	StartImage    string                      `json:"start_image"`
+	EndImage      string                      `json:"end_image"`
+	References    []string                    `json:"references,omitempty"`
+	ReferenceData []engine.ReferenceImageData `json:"reference_data,omitempty"`
+	AccountID     string                      `json:"account_id"`
+	AllAccounts   bool                        `json:"all_accounts"`
+	Cookies       string                      `json:"cookies"`
+	ProjectID     string                      `json:"project_id"`
 }
 
 func NewAccountManager(st *store.Store, br *bridge.Bridge, workers int) (*AccountManager, error) {
@@ -662,7 +664,15 @@ func (m *AccountManager) ValidateJobPayload(ctx context.Context, job store.Job) 
 			return fmt.Errorf("service: image count must be between 1 and 4")
 		}
 		if len(payload.References) > 0 {
-			return fmt.Errorf("service: image jobs do not accept video reference images")
+			return fmt.Errorf("service: image jobs accept reference_data, not video reference IDs")
+		}
+		for i, ref := range payload.ReferenceData {
+			if strings.TrimSpace(ref.MimeType) == "" {
+				return fmt.Errorf("service: reference_data[%d].mime_type is required", i)
+			}
+			if data, err := base64.StdEncoding.DecodeString(ref.Base64); err != nil || len(data) == 0 {
+				return fmt.Errorf("service: reference_data[%d].base64 must contain valid, non-empty base64 image data", i)
+			}
 		}
 		if aspect := strings.TrimSpace(payload.Aspect); aspect != "" {
 			if _, ok := config.ImageAspectValue(aspect); !ok {
@@ -676,8 +686,16 @@ func (m *AccountManager) ValidateJobPayload(ctx context.Context, job store.Job) 
 		if payload.Count < 0 || payload.Count > config.MaxCount {
 			return fmt.Errorf("service: video count must be between 1 and %d", config.MaxCount)
 		}
-		if len(payload.References) > 0 && (payload.StartImage != "" || payload.EndImage != "") {
+		if hasReferenceImages(payload) && (payload.StartImage != "" || payload.EndImage != "") {
 			return fmt.Errorf("service: reference images cannot be combined with start_image or end_image")
+		}
+		for i, ref := range payload.ReferenceData {
+			if strings.TrimSpace(ref.MimeType) == "" {
+				return fmt.Errorf("service: reference_data[%d].mime_type is required", i)
+			}
+			if data, err := base64.StdEncoding.DecodeString(ref.Base64); err != nil || len(data) == 0 {
+				return fmt.Errorf("service: reference_data[%d].base64 must contain valid, non-empty base64 image data", i)
+			}
 		}
 		duration := 8
 		if raw := strings.TrimSpace(payload.Duration); raw != "" {
@@ -687,24 +705,24 @@ func (m *AccountManager) ValidateJobPayload(ctx context.Context, job store.Job) 
 			}
 			duration = value
 		}
-		if len(payload.References) > 0 {
+		if hasReferenceImages(payload) {
 			if _, ok := config.ReferenceVideoModelFor(duration); !ok {
 				return fmt.Errorf("service: unsupported reference video duration %ds", duration)
 			}
 		} else if !slices.Contains(config.Durations, duration) {
 			return fmt.Errorf("service: unsupported video duration %ds", duration)
 		}
-		if len(payload.References) == 0 {
+		if !hasReferenceImages(payload) {
 			if aspect := strings.TrimSpace(payload.Aspect); aspect != "" {
 				if _, ok := config.VideoAspectValue(aspect); !ok {
 					return fmt.Errorf("service: invalid video aspect %q", aspect)
 				}
 			}
 		}
-		if payload.AllAccounts && (len(payload.References) > 0 || payload.StartImage != "" || payload.EndImage != "") {
+		if payload.AllAccounts && (hasReferenceImages(payload) || payload.StartImage != "" || payload.EndImage != "") {
 			return fmt.Errorf("service: reference media cannot be fanned out across accounts; pin account_id")
 		}
-		if payload.AccountID == "" && (len(payload.References) > 0 || payload.StartImage != "" || payload.EndImage != "") {
+		if payload.AccountID == "" && (hasReferenceImages(payload) || payload.StartImage != "" || payload.EndImage != "") {
 			if err := m.bindReferenceAccount(ctx, &payload); err != nil {
 				return err
 			}
@@ -728,6 +746,10 @@ func (m *AccountManager) ValidateJobPayload(ctx context.Context, job store.Job) 
 		return fmt.Errorf("service: unsupported job kind %q", job.Kind)
 	}
 	return nil
+}
+
+func hasReferenceImages(payload generationPayload) bool {
+	return len(payload.References) > 0 || len(payload.ReferenceData) > 0
 }
 
 func (m *AccountManager) RunWithProgress(ctx context.Context, job store.Job, progress AttemptReporter) (any, error) {
@@ -786,24 +808,16 @@ func (m *AccountManager) bindReferenceAccount(ctx context.Context, payload *gene
 	return nil
 }
 
-// ExpandForQueue snapshots eligible accounts for all_accounts and pins image
-// count children to one account before queue workers execute them.
+// ExpandForQueue snapshots eligible accounts for all_accounts before queue
+// workers execute them. Image count stays on each account's single job payload.
 func (m *AccountManager) ExpandForQueue(_ context.Context, job store.Job) ([]store.Job, bool, error) {
 	var payload generationPayload
 	if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
 		return nil, false, fmt.Errorf("service: decode %s payload for expansion: %w", job.Kind, err)
 	}
-	count := payload.Count
-	if count < 1 {
-		count = 1
-	}
 	all := payload.AllAccounts
-	imageFanout := job.Kind == "image" && count > 1
-	if !all && !imageFanout {
+	if !all {
 		return nil, false, nil
-	}
-	if imageFanout && count > 4 {
-		return nil, true, fmt.Errorf("service: image count must be between 1 and 4")
 	}
 
 	ids := m.accountIDs()
@@ -813,30 +827,6 @@ func (m *AccountManager) ExpandForQueue(_ context.Context, job store.Job) ([]sto
 			return nil, true, err
 		}
 		payload.AccountID = id
-	}
-	if !all {
-		if payload.AccountID != "" {
-			ids = []string{payload.AccountID}
-		} else if len(ids) > 0 {
-			// The count is pinned as a single batch. Choose the least occupied
-			// connected runtime once, then let the durable queue serialize its children.
-			best := ""
-			bestLoad := int(^uint(0) >> 1)
-			for _, id := range ids {
-				candidate := m.account(id)
-				if candidate == nil || (m.strictFresh && !m.bridge.AccountConnected(id)) {
-					continue
-				}
-				load := len(candidate.gate)
-				if load < bestLoad {
-					best, bestLoad = id, load
-				}
-			}
-			ids = nil
-			if best != "" {
-				ids = []string{best}
-			}
-		}
 	}
 	if m.strictFresh {
 		filtered := ids[:0]
@@ -858,24 +848,15 @@ func (m *AccountManager) ExpandForQueue(_ context.Context, job store.Job) ([]sto
 
 	children := make([]store.Job, 0)
 	for _, id := range ids {
-		n := 1
-		if imageFanout {
-			n = count
+		childPayload := payload
+		childPayload.AccountID = id
+		childPayload.Cookies = ""
+		childPayload.AllAccounts = false
+		encoded, err := json.Marshal(childPayload)
+		if err != nil {
+			return nil, true, err
 		}
-		for i := 0; i < n; i++ {
-			childPayload := payload
-			childPayload.AccountID = id
-			childPayload.Cookies = ""
-			childPayload.AllAccounts = false
-			if imageFanout {
-				childPayload.Count = 1
-			}
-			encoded, err := json.Marshal(childPayload)
-			if err != nil {
-				return nil, true, err
-			}
-			children = append(children, store.Job{ID: uuid.NewString(), Kind: job.Kind, Payload: string(encoded)})
-		}
+		children = append(children, store.Job{ID: uuid.NewString(), Kind: job.Kind, Payload: string(encoded)})
 	}
 	return children, true, nil
 }
@@ -1015,9 +996,9 @@ func (m *AccountManager) runOne(ctx context.Context, jobID, kind string, payload
 		}
 		return runtime.engine.UploadVideo(ctx, payload.FilePath, engine.UploadOptions{Force: payload.ForceUpload, ProjectID: payload.ProjectID})
 	case "image":
-		return m.generateImages(ctx, runtime, jobID, payload)
+		return m.generateImage(ctx, runtime, payload)
 	case "video":
-		if len(payload.References) > 0 {
+		if hasReferenceImages(payload) {
 			duration := 8
 			if raw := strings.TrimSpace(payload.Duration); raw != "" {
 				value, parseErr := strconv.Atoi(strings.TrimSuffix(raw, "s"))
@@ -1027,7 +1008,7 @@ func (m *AccountManager) runOne(ctx context.Context, jobID, kind string, payload
 				duration = value
 			}
 			return runtime.engine.GenerateVideoFromReferencesViaBatch(ctx, engine.BatchReferenceRequest{
-				Prompt: payload.Prompt, References: payload.References, ProjectID: payload.ProjectID,
+				Prompt: payload.Prompt, References: payload.References, ReferenceData: payload.ReferenceData, ProjectID: payload.ProjectID,
 				Duration: duration, Wait: !payload.NoDownload, Download: !payload.NoDownload,
 			})
 		}
@@ -1245,7 +1226,7 @@ func generationCreditCost(kind string, payload generationPayload) int {
 	if kind != "video" {
 		return 0
 	}
-	if len(payload.References) > 0 {
+	if hasReferenceImages(payload) {
 		return config.CreditsPerReferenceVideo
 	}
 	duration := 8
@@ -1267,10 +1248,9 @@ func generationCreditCost(kind string, payload generationPayload) int {
 	return cost
 }
 
-// generateImages expands the public image count into sequential submissions on
-// the same pinned runtime. The account gate remains held for the whole request,
-// so another request cannot interleave mutable session work on that account.
-func (m *AccountManager) generateImages(ctx context.Context, runtime *accountRuntime, parentJobID string, payload generationPayload) (any, error) {
+// generateImage keeps the client request as one service job and submits its
+// requested variations in one Flow RPC.
+func (m *AccountManager) generateImage(ctx context.Context, runtime *accountRuntime, payload generationPayload) (any, error) {
 	count := payload.Count
 	if count < 1 {
 		count = 1
@@ -1278,65 +1258,11 @@ func (m *AccountManager) generateImages(ctx context.Context, runtime *accountRun
 	if count > 4 {
 		return nil, fmt.Errorf("service: image count must be between 1 and 4")
 	}
-	if count == 1 {
-		m.refreshImageBalance(ctx, runtime)
-		return runtime.engine.GenerateImageViaBatch(ctx, engine.BatchImageRequest{
-			Prompt: payload.Prompt, Model: payload.Model, ProjectID: payload.ProjectID, Aspect: payload.Aspect, Download: !payload.NoDownload,
-		})
-	}
-	combined := map[string]any{
-		"job_id": parentJobID, "account_id": runtime.id, "media": []any{}, "files": []any{},
-		"child_job_ids": []string{}, "status": "succeeded", "elapsed_seconds": float64(0),
-	}
-	var failures []string
-	succeeded := 0
-	for i := 0; i < count; i++ {
-		m.refreshImageBalance(ctx, runtime)
-		outcome, err := runtime.engine.GenerateImageViaBatch(ctx, engine.BatchImageRequest{
-			Prompt: payload.Prompt, Model: payload.Model, ProjectID: payload.ProjectID, Aspect: payload.Aspect, Download: !payload.NoDownload,
-		})
-		if err != nil {
-			failures = append(failures, err.Error())
-			if ctx.Err() != nil {
-				break
-			}
-			continue
-		}
-		encoded, _ := json.Marshal(outcome)
-		var item map[string]any
-		if err := json.Unmarshal(encoded, &item); err != nil {
-			failures = append(failures, err.Error())
-			continue
-		}
-		appendJSONItems(combined, "media", item["media"])
-		appendJSONItems(combined, "files", item["files"])
-		appendJSONItems(combined, "child_job_ids", []any{item["job_id"]})
-		if elapsed, ok := item["elapsed_seconds"].(float64); ok {
-			combined["elapsed_seconds"] = combined["elapsed_seconds"].(float64) + elapsed
-		}
-		if item["status"] == "succeeded" || item["status"] == "ready" {
-			succeeded++
-		} else {
-			failures = append(failures, fmt.Sprintf("image attempt %d returned status %v", i+1, item["status"]))
-		}
-	}
-	if succeeded == 0 {
-		if len(failures) == 0 {
-			return nil, fmt.Errorf("service: image generation produced no result")
-		}
-		return nil, fmt.Errorf("service: all %d image submissions failed: %s", count, strings.Join(failures, "; "))
-	}
-	if len(failures) > 0 || succeeded < count {
-		combined["status"] = "partial"
-		combined["errors"] = failures
-	}
-	return combined, nil
-}
-
-func appendJSONItems(target map[string]any, key string, value any) {
-	items, _ := target[key].([]any)
-	more, _ := value.([]any)
-	target[key] = append(items, more...)
+	m.refreshImageBalance(ctx, runtime)
+	return runtime.engine.GenerateImageViaBatch(ctx, engine.BatchImageRequest{
+		Prompt: payload.Prompt, Model: payload.Model, ProjectID: payload.ProjectID, Aspect: payload.Aspect,
+		Count: count, ReferenceData: payload.ReferenceData, Download: !payload.NoDownload,
+	})
 }
 
 func accountIDFromCookiePath(path string) (string, error) {

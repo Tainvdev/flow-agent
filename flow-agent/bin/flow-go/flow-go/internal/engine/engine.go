@@ -14,6 +14,7 @@ package engine
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -4043,7 +4044,10 @@ type BatchReferenceRequest struct {
 	// References are the reference assets, as media ids or content ids. Media ids
 	// are resolved to content ids before submitting.
 	References []string
-	Prompt     string
+	// ReferenceData supplies reference images directly as base64-encoded bytes.
+	// Each item is uploaded into the project before the generation is submitted.
+	ReferenceData []ReferenceImageData
+	Prompt        string
 	// Model defaults to the reference model for Duration.
 	Model     string
 	Duration  int
@@ -4051,6 +4055,14 @@ type BatchReferenceRequest struct {
 	// Wait polls until the render is downloadable. Download implies Wait.
 	Wait     bool
 	Download bool
+}
+
+// ReferenceImageData is an image supplied inline instead of by local path or
+// existing project asset ID.
+type ReferenceImageData struct {
+	Base64   string `json:"base64"`
+	MimeType string `json:"mime_type"`
+	FileName string `json:"file_name,omitempty"`
 }
 
 // GenerateVideoFromReferencesViaBatch submits a reference-image generation.
@@ -4067,7 +4079,7 @@ func (e *Engine) GenerateVideoFromReferencesViaBatch(ctx context.Context, req Ba
 	if strings.TrimSpace(req.Prompt) == "" {
 		return nil, fmt.Errorf("engine: a prompt is required")
 	}
-	if len(req.References) == 0 {
+	if len(req.References) == 0 && len(req.ReferenceData) == 0 {
 		return nil, fmt.Errorf("engine: at least one reference image is required")
 	}
 
@@ -4157,6 +4169,31 @@ func (e *Engine) GenerateVideoFromReferencesViaBatch(ctx context.Context, req Ba
 			return nil, err
 		}
 		refs = append(refs, resolved)
+	}
+	for i, ref := range req.ReferenceData {
+		data, err := base64.StdEncoding.DecodeString(ref.Base64)
+		if err != nil || len(data) == 0 {
+			if err == nil {
+				err = fmt.Errorf("empty image data")
+			}
+			e.finishJob(jobID, "failed", nil, start, err, accountID)
+			return nil, fmt.Errorf("engine: invalid base64 for reference image %d: %w", i+1, err)
+		}
+		if strings.TrimSpace(ref.MimeType) == "" {
+			err := fmt.Errorf("engine: mime_type is required for reference image %d", i+1)
+			e.finishJob(jobID, "failed", nil, start, err, accountID)
+			return nil, err
+		}
+		fileName := strings.TrimSpace(ref.FileName)
+		if fileName == "" {
+			fileName = fmt.Sprintf("reference-%d", i+1)
+		}
+		_, contentID, err := e.UploadImageViaBatch(ctx, data, ref.MimeType, fileName)
+		if err != nil {
+			e.finishJob(jobID, "failed", nil, start, err, accountID)
+			return nil, fmt.Errorf("engine: upload inline reference image %d: %w", i+1, err)
+		}
+		refs = append(refs, contentID)
 	}
 
 	frames, err := client.GenerateVideoFromReferences(ctx, batchexecute.ReferenceVideoRequest{
@@ -4251,6 +4288,10 @@ func (e *Engine) LabsAccessToken(ctx context.Context) (string, error) {
 // answers 200 and returns an id, but that id is invisible to everything on this
 // transport, so it cannot be used to condition a generation.
 func (e *Engine) UploadImageViaBatch(ctx context.Context, data []byte, mimeType, fileName string) (mediaID, contentID string, err error) {
+	return e.uploadImageViaBatch(ctx, "", data, mimeType, fileName)
+}
+
+func (e *Engine) uploadImageViaBatch(ctx context.Context, projectID string, data []byte, mimeType, fileName string) (mediaID, contentID string, err error) {
 	if !e.Ready() {
 		return "", "", fmt.Errorf("engine: not ready — call Bootstrap first")
 	}
@@ -4258,7 +4299,9 @@ func (e *Engine) UploadImageViaBatch(ctx context.Context, data []byte, mimeType,
 		return "", "", fmt.Errorf("engine: refusing to upload an empty file")
 	}
 
-	projectID := e.ProjectID()
+	if projectID == "" {
+		projectID = e.ProjectID()
+	}
 	if projectID == "" {
 		return "", "", fmt.Errorf("engine: no project id resolved")
 	}
@@ -4703,6 +4746,12 @@ type BatchImageRequest struct {
 	// "portrait"/"9:16", "square"/"1:1", "4:3" or "3:4". Empty sends the value
 	// every working submission already carries, so an unset flag changes nothing.
 	Aspect string
+	// Count is the number of image variations to submit in one Flow RPC.
+	Count int
+	// ReferenceData are base64-encoded images uploaded before submission.
+	ReferenceData []ReferenceImageData
+	// ReferenceMediaIDs are already-uploaded project images to attach to the request.
+	ReferenceMediaIDs []string
 	// Download writes the result to output/.
 	Download bool
 }
@@ -4732,6 +4781,13 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 	if strings.TrimSpace(req.Prompt) == "" {
 		return nil, fmt.Errorf("engine: a prompt is required")
 	}
+	count := req.Count
+	if count < 1 {
+		count = 1
+	}
+	if count > 4 {
+		return nil, fmt.Errorf("engine: image count must be between 1 and 4")
+	}
 
 	model := batchImageModel(req.Model)
 	projectID := req.ProjectID
@@ -4755,6 +4811,7 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 		Prompt:    req.Prompt,
 		Model:     model,
 		Aspect:    req.Aspect,
+		Count:     count,
 		Status:    "submitted",
 	})
 	if err != nil {
@@ -4793,14 +4850,25 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 			e.finishJob(jobID, "failed", nil, start, err, accountID)
 			return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
 		}
+		referenceMediaIDs := append([]string(nil), req.ReferenceMediaIDs...)
+		if len(req.ReferenceData) > 0 {
+			uploaded, uploadErr := e.uploadImageReferencesViaBatch(ctx, req.ReferenceData, projectID)
+			if uploadErr != nil {
+				e.finishJob(jobID, "failed", nil, start, uploadErr, accountID)
+				return nil, uploadErr
+			}
+			referenceMediaIDs = append(referenceMediaIDs, uploaded...)
+		}
 
 		reportPhase(ctx, "submitting", "sending image generation request")
 		media, err = client.GenerateMedia(ctx, batchexecute.GenerateRequest{
-			ProjectID:    projectID,
-			Model:        model,
-			Prompt:       req.Prompt,
-			AspectRatio:  req.Aspect,
-			CaptchaToken: captcha,
+			ProjectID:         projectID,
+			ReferenceMediaIDs: referenceMediaIDs,
+			Model:             model,
+			Prompt:            req.Prompt,
+			Count:             count,
+			AspectRatio:       req.Aspect,
+			CaptchaToken:      captcha,
 		}, e.captchaOptions(recaptcha.ActionImage, batchexecute.CallOptions{
 			SourcePath: "/project/" + projectID,
 			BuildLabel: config.BuildLabel(),
@@ -4896,6 +4964,9 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 		Media:     media,
 		Status:    "succeeded",
 	}
+	if len(media) > 0 && len(media) < count {
+		outcome.Status = "partial"
+	}
 	var emptyErr error
 	if len(media) == 0 {
 		// Accepted but nothing came back. The app's own call returns the asset
@@ -4945,6 +5016,38 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 
 	log.Printf("engine: generated %d image(s) in %.1fs", len(media), outcome.ElapsedS)
 	return outcome, emptyErr
+}
+
+// UploadImageReferencesViaBatch uploads base64 image references and returns
+// their project media IDs for use in a subsequent image generation request.
+func (e *Engine) UploadImageReferencesViaBatch(ctx context.Context, refs []ReferenceImageData) ([]string, error) {
+	return e.uploadImageReferencesViaBatch(ctx, refs, "")
+}
+
+func (e *Engine) uploadImageReferencesViaBatch(ctx context.Context, refs []ReferenceImageData, projectID string) ([]string, error) {
+	mediaIDs := make([]string, 0, len(refs))
+	for i, ref := range refs {
+		data, err := base64.StdEncoding.DecodeString(ref.Base64)
+		if err != nil || len(data) == 0 {
+			if err == nil {
+				err = fmt.Errorf("empty image data")
+			}
+			return nil, fmt.Errorf("engine: invalid base64 for reference image %d: %w", i+1, err)
+		}
+		if strings.TrimSpace(ref.MimeType) == "" {
+			return nil, fmt.Errorf("engine: mime_type is required for reference image %d", i+1)
+		}
+		fileName := strings.TrimSpace(ref.FileName)
+		if fileName == "" {
+			fileName = fmt.Sprintf("reference-%d", i+1)
+		}
+		mediaID, _, err := e.uploadImageViaBatch(ctx, projectID, data, ref.MimeType, fileName)
+		if err != nil {
+			return nil, fmt.Errorf("engine: upload image reference %d: %w", i+1, err)
+		}
+		mediaIDs = append(mediaIDs, mediaID)
+	}
+	return mediaIDs, nil
 }
 
 // batchImageModel resolves a friendly model name to the enum the RPC expects.

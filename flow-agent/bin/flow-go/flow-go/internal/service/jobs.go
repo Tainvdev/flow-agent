@@ -743,9 +743,16 @@ func (j *Jobs) execute(parent context.Context, owner string, job *store.Job) {
 		if err != nil {
 			runErr = fmt.Errorf("service: encode job result: %w", err)
 		} else {
+			status := "succeeded"
+			var resultState struct {
+				Status string `json:"status"`
+			}
+			if json.Unmarshal(data, &resultState) == nil && resultState.Status == "partial" {
+				status = "partial"
+			}
 			if err := progress.Complete(result); err != nil {
 				runErr = fmt.Errorf("service: persist completed attempt: %w", err)
-			} else if err := j.store.FinishJob(context.Background(), job.ID, owner, "succeeded", string(data), ""); err != nil {
+			} else if err := j.store.FinishJob(context.Background(), job.ID, owner, status, string(data), ""); err != nil {
 				log.Printf("service: finish job %s: %v", job.ID, err)
 				return
 			} else {
@@ -880,10 +887,14 @@ func aggregateChildren(parent store.Job, children []store.Job) (any, string, str
 		if child.Result != "" {
 			_ = json.Unmarshal([]byte(child.Result), &value)
 		}
-		if child.Status == "succeeded" {
+		if child.Status == "succeeded" || child.Status == "partial" {
 			succeeded++
 			item["result"] = value
-			if valueMap, ok := value.(map[string]any); ok && valueMap["status"] == "partial" {
+			if child.Status == "partial" {
+				hasPartialChild = true
+				item["error"] = "partial child result"
+				errorsList = append(errorsList, payload.AccountID+": partial child result")
+			} else if valueMap, ok := value.(map[string]any); ok && valueMap["status"] == "partial" {
 				hasPartialChild = true
 				item["error"] = "partial child result"
 				errorsList = append(errorsList, payload.AccountID+": partial child result")
@@ -939,10 +950,14 @@ func aggregateAccounts(parent store.Job, children []store.Job) (any, string, str
 			if child.Result != "" {
 				_ = json.Unmarshal([]byte(child.Result), &result)
 			}
-			if child.Status == "succeeded" {
+			if child.Status == "succeeded" || child.Status == "partial" {
 				succeeded++
 				item["result"] = result
-				if value, ok := result.(map[string]any); ok && value["status"] == "partial" {
+				if child.Status == "partial" {
+					partial = true
+					item["error"] = "partial child result"
+					messages = append(messages, payload.AccountID+": partial child result")
+				} else if value, ok := result.(map[string]any); ok && value["status"] == "partial" {
 					partial = true
 					item["error"] = "partial child result"
 					messages = append(messages, payload.AccountID+": partial child result")
@@ -987,8 +1002,9 @@ func aggregateAccounts(parent store.Job, children []store.Job) (any, string, str
 		if child.Result != "" {
 			_ = json.Unmarshal([]byte(child.Result), &value)
 		}
-		if child.Status == "succeeded" {
+		if child.Status == "succeeded" || child.Status == "partial" {
 			group.succeeded++
+			childPartial := child.Status == "partial"
 			if value != nil {
 				if items, ok := value["media"].([]any); ok {
 					group.media = append(group.media, items...)
@@ -999,10 +1015,7 @@ func aggregateAccounts(parent store.Job, children []store.Job) (any, string, str
 				if elapsed, ok := value["elapsed_seconds"].(float64); ok {
 					group.elapsed += elapsed
 				}
-				if value["status"] == "partial" {
-					group.partial = true
-					group.failures = append(group.failures, "partial child result")
-				}
+				childPartial = childPartial || value["status"] == "partial"
 				if id, ok := value["job_id"]; ok {
 					group.childIDs = append(group.childIDs, id)
 				} else {
@@ -1010,6 +1023,10 @@ func aggregateAccounts(parent store.Job, children []store.Job) (any, string, str
 				}
 			} else {
 				group.childIDs = append(group.childIDs, child.ID)
+			}
+			if childPartial {
+				group.partial = true
+				group.failures = append(group.failures, "partial child result")
 			}
 		} else {
 			message := child.Error

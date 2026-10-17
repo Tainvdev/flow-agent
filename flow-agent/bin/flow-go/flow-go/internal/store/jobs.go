@@ -973,7 +973,7 @@ func (s *Store) FinishJob(ctx context.Context, id, owner, status, result, messag
 // FinishJobWithErrorCode persists a terminal error's HTTP-compatible status
 // mapping alongside the durable job so callers do not have to parse messages.
 func (s *Store) FinishJobWithErrorCode(ctx context.Context, id, owner, status, result, message string, errorCode int) error {
-	if status != "succeeded" && status != "failed" && status != "submission_unknown" && status != "cancelled" {
+	if status != "succeeded" && status != "partial" && status != "failed" && status != "submission_unknown" && status != "cancelled" {
 		return fmt.Errorf("store: invalid terminal job status %q", status)
 	}
 	if errorCode != 0 && (errorCode < 400 || errorCode > 599) {
