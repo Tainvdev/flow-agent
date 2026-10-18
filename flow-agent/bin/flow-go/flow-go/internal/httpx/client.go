@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	stdhttp "net/http"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -191,6 +192,7 @@ type Client struct {
 	// protocolRacing means the TLS library is racing HTTP/3 against HTTP/2
 	// internally, so this package must not second-guess the protocol.
 	protocolRacing bool
+	traceFile      string
 }
 
 // Option configures the client.
@@ -202,6 +204,13 @@ type clientOptions struct {
 	proxyURL       string
 	profileName    string
 	protocolRacing bool
+	traceFile      string
+}
+
+// WithTraceFile enables complete HTTP request/response tracing to JSONL and
+// body sidecar files. Trace contents include credentials sent in headers.
+func WithTraceFile(path string) Option {
+	return func(o *clientOptions) { o.traceFile = strings.TrimSpace(path) }
 }
 
 // WithTimeout sets the per-request timeout.
@@ -244,7 +253,7 @@ func WithProxy(proxyURL string) Option {
 
 // New builds a client pinned to a Chrome TLS profile.
 func New(opts ...Option) (*Client, error) {
-	o := clientOptions{timeout: 90 * time.Second, enableQUIC: true}
+	o := clientOptions{timeout: 90 * time.Second, enableQUIC: true, traceFile: strings.TrimSpace(os.Getenv("FLOW_HTTP_TRACE_FILE"))}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -281,6 +290,7 @@ func New(opts ...Option) (*Client, error) {
 		useQUIC:        o.enableQUIC,
 		timeout:        o.timeout,
 		protocolRacing: o.protocolRacing,
+		traceFile:      o.traceFile,
 	}
 
 	// The stdlib QUIC transport is only built when protocol racing is off. With
@@ -328,9 +338,19 @@ func (c *Client) doHTTP2(ctx context.Context, req *Request) (*Response, error) {
 	if req.BodyReader != nil {
 		body = req.BodyReader
 	}
+	trace, err := newHTTPTrace(c.traceFile, req)
+	if err != nil {
+		return nil, err
+	}
+	if trace != nil {
+		body = trace.wrapRequestBody(body)
+	}
 
 	hreq, err := http.NewRequestWithContext(ctx, req.Method, req.URL, body)
 	if err != nil {
+		if trace != nil {
+			_ = trace.finish(nil, nil, err)
+		}
 		return nil, err
 	}
 	if req.BodyReader != nil && req.BodyLength > 0 {
@@ -343,16 +363,28 @@ func (c *Client) doHTTP2(ctx context.Context, req *Request) (*Response, error) {
 	if req.Cookies != "" {
 		hreq.Header.Set("Cookie", req.Cookies)
 	}
+	if trace != nil {
+		trace.setRequest(hreq)
+	}
 
 	resp, err := c.hc.Do(hreq)
 	if err != nil {
+		if trace != nil {
+			_ = trace.finish(nil, nil, err)
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
+		if trace != nil {
+			_ = trace.finish(resp, nil, err)
+		}
 		return nil, err
+	}
+	if trace != nil {
+		_ = trace.finish(resp, bodyBytes, nil)
 	}
 	return &Response{Status: resp.StatusCode, Header: stdhttp.Header(resp.Header), Body: bodyBytes}, nil
 }
@@ -362,9 +394,19 @@ func (c *Client) doQUIC(ctx context.Context, req *Request) (*Response, error) {
 	if req.BodyReader != nil {
 		body = req.BodyReader
 	}
+	trace, err := newHTTPTrace(c.traceFile, req)
+	if err != nil {
+		return nil, err
+	}
+	if trace != nil {
+		body = trace.wrapRequestBody(body)
+	}
 
 	hreq, err := stdhttp.NewRequestWithContext(ctx, req.Method, req.URL, body)
 	if err != nil {
+		if trace != nil {
+			_ = trace.finishStd(nil, nil, err)
+		}
 		return nil, err
 	}
 	if req.BodyReader != nil && req.BodyLength > 0 {
@@ -379,16 +421,28 @@ func (c *Client) doQUIC(ctx context.Context, req *Request) (*Response, error) {
 	if req.Cookies != "" {
 		hreq.Header.Set("Cookie", req.Cookies)
 	}
+	if trace != nil {
+		trace.setStdRequest(hreq)
+	}
 
 	resp, err := c.quic.Do(hreq)
 	if err != nil {
+		if trace != nil {
+			_ = trace.finishStd(nil, nil, err)
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
+		if trace != nil {
+			_ = trace.finishStd(nil, nil, err)
+		}
 		return nil, err
+	}
+	if trace != nil {
+		_ = trace.finishStd(resp, bodyBytes, nil)
 	}
 	return &Response{Status: resp.StatusCode, Header: resp.Header, Body: bodyBytes}, nil
 }

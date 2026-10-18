@@ -69,23 +69,24 @@ type accountRuntime struct {
 }
 
 type generationPayload struct {
-	Prompt        string                      `json:"prompt"`
-	Aspect        string                      `json:"aspect"`
-	Model         string                      `json:"model"`
-	Duration      string                      `json:"duration"`
-	Quality       string                      `json:"quality"`
-	Count         int                         `json:"count"`
-	FilePath      string                      `json:"file_path"`
-	ForceUpload   bool                        `json:"force"`
-	NoDownload    bool                        `json:"no_download"`
-	StartImage    string                      `json:"start_image"`
-	EndImage      string                      `json:"end_image"`
-	References    []string                    `json:"references,omitempty"`
-	ReferenceData []engine.ReferenceImageData `json:"reference_data,omitempty"`
-	AccountID     string                      `json:"account_id"`
-	AllAccounts   bool                        `json:"all_accounts"`
-	Cookies       string                      `json:"cookies"`
-	ProjectID     string                      `json:"project_id"`
+	Prompt            string                      `json:"prompt"`
+	Aspect            string                      `json:"aspect"`
+	Model             string                      `json:"model"`
+	Duration          string                      `json:"duration"`
+	Quality           string                      `json:"quality"`
+	Count             int                         `json:"count"`
+	FilePath          string                      `json:"file_path"`
+	ForceUpload       bool                        `json:"force"`
+	NoDownload        bool                        `json:"no_download"`
+	StartImage        string                      `json:"start_image"`
+	EndImage          string                      `json:"end_image"`
+	References        []string                    `json:"references,omitempty"`
+	ReferenceData     []engine.ReferenceImageData `json:"reference_data,omitempty"`
+	ReferenceMediaIDs []string                    `json:"reference_media_ids,omitempty"`
+	AccountID         string                      `json:"account_id"`
+	AllAccounts       bool                        `json:"all_accounts"`
+	Cookies           string                      `json:"cookies"`
+	ProjectID         string                      `json:"project_id"`
 }
 
 func NewAccountManager(st *store.Store, br *bridge.Bridge, workers int) (*AccountManager, error) {
@@ -664,7 +665,20 @@ func (m *AccountManager) ValidateJobPayload(ctx context.Context, job store.Job) 
 			return fmt.Errorf("service: image count must be between 1 and 4")
 		}
 		if len(payload.References) > 0 {
-			return fmt.Errorf("service: image jobs accept reference_data, not video reference IDs")
+			return fmt.Errorf("service: image jobs use reference_media_ids or reference_data; references is for video jobs")
+		}
+		for i, mediaID := range payload.ReferenceMediaIDs {
+			if strings.TrimSpace(mediaID) == "" {
+				return fmt.Errorf("service: reference_media_ids[%d] must not be empty", i)
+			}
+		}
+		if payload.AllAccounts && len(payload.ReferenceMediaIDs) > 0 {
+			return fmt.Errorf("service: reference media IDs cannot be fanned out across accounts; pin account_id")
+		}
+		if payload.AccountID == "" && len(payload.ReferenceMediaIDs) > 0 {
+			if err := m.bindReferenceAccount(ctx, &payload); err != nil {
+				return err
+			}
 		}
 		for i, ref := range payload.ReferenceData {
 			if strings.TrimSpace(ref.MimeType) == "" {
@@ -680,6 +694,9 @@ func (m *AccountManager) ValidateJobPayload(ctx context.Context, job store.Job) 
 			}
 		}
 	case "video":
+		if len(payload.ReferenceMediaIDs) > 0 {
+			return fmt.Errorf("service: video jobs use references, not reference_media_ids")
+		}
 		if strings.TrimSpace(payload.Prompt) == "" {
 			return fmt.Errorf("service: video prompt is required")
 		}
@@ -782,6 +799,7 @@ func (m *AccountManager) bindReferenceAccount(ctx context.Context, payload *gene
 		return nil
 	}
 	refs := append([]string(nil), payload.References...)
+	refs = append(refs, payload.ReferenceMediaIDs...)
 	refs = append(refs, payload.StartImage, payload.EndImage)
 	ownerAccount := ""
 	for _, ref := range refs {
@@ -916,7 +934,7 @@ func (m *AccountManager) runOne(ctx context.Context, jobID, kind string, payload
 	engineStarted := false
 	var runtime *accountRuntime
 	defer func() {
-		if outcome, ok := result.(*engine.BatchVideoOutcome); ok && outcome.CreditsKnown {
+		if outcome, ok := result.(*engine.BatchVideoOutcome); ok && outcome != nil && outcome.CreditsKnown {
 			scheduled.SetCredits(outcome.Credits, "")
 		}
 		// Errors from queue cancellation, cookie refresh, or local setup do not
@@ -1009,7 +1027,7 @@ func (m *AccountManager) runOne(ctx context.Context, jobID, kind string, payload
 			}
 			return runtime.engine.GenerateVideoFromReferencesViaBatch(ctx, engine.BatchReferenceRequest{
 				Prompt: payload.Prompt, References: payload.References, ReferenceData: payload.ReferenceData, ProjectID: payload.ProjectID,
-				Duration: duration, Wait: !payload.NoDownload, Download: !payload.NoDownload,
+				Duration: duration, Quality: payload.Quality, Wait: !payload.NoDownload, Download: !payload.NoDownload,
 			})
 		}
 		duration := 8
@@ -1039,6 +1057,7 @@ func (m *AccountManager) runOne(ctx context.Context, jobID, kind string, payload
 // externally created assets whose ownership is not present in this database.
 func (m *AccountManager) validateReferenceOwnership(ctx context.Context, e *engine.Engine, payload generationPayload) error {
 	refs := append([]string(nil), payload.References...)
+	refs = append(refs, payload.ReferenceMediaIDs...)
 	refs = append(refs, payload.StartImage, payload.EndImage)
 	for _, id := range refs {
 		id = strings.TrimSpace(id)
@@ -1259,9 +1278,14 @@ func (m *AccountManager) generateImage(ctx context.Context, runtime *accountRunt
 		return nil, fmt.Errorf("service: image count must be between 1 and 4")
 	}
 	m.refreshImageBalance(ctx, runtime)
+	referenceMediaIDs := make([]string, 0, len(payload.ReferenceMediaIDs))
+	for _, mediaID := range payload.ReferenceMediaIDs {
+		referenceMediaIDs = append(referenceMediaIDs, strings.TrimSpace(mediaID))
+	}
 	return runtime.engine.GenerateImageViaBatch(ctx, engine.BatchImageRequest{
 		Prompt: payload.Prompt, Model: payload.Model, ProjectID: payload.ProjectID, Aspect: payload.Aspect,
-		Count: count, ReferenceData: payload.ReferenceData, Download: !payload.NoDownload,
+		Count: count, ReferenceData: payload.ReferenceData, ReferenceMediaIDs: referenceMediaIDs,
+		Download: !payload.NoDownload,
 	})
 }
 

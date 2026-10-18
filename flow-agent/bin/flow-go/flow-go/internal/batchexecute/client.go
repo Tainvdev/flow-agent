@@ -2598,8 +2598,7 @@ func buildReferenceArgument(req ReferenceVideoRequest) []any {
 			[]any{nil, nil, []any{[]any{[]any{req.Prompt}}}},
 			refs,
 			req.Model,
-			// The capture carried 2 here, as the edit payload does.
-			videoModeText,
+			videoModeImage,
 			nil,
 			[]any{nil, nil, nil, nil, uuid.NewString(), uuid.NewString()},
 			nil, nil, nil, nil,

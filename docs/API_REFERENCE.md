@@ -548,6 +548,25 @@ The compatibility generation endpoints above continue waiting for their final re
 - Fan-out parents may initially report `waiting_children`; each account/count child is independently queued, and the parent becomes `succeeded`, `partial`, or `failed` after all children are terminal.
 - Image `count` children share one account selected when the parent is accepted, and their generated media/files are combined into the parent result.
 - Service mode validates generation payloads locally before accepting a durable job. Missing prompts/upload paths and invalid image count, aspect, or video duration return HTTP 422 without consuming queue capacity.
+- Image jobs accept `reference_media_ids` for images already uploaded to the selected Flow project, or `reference_data` to upload image bytes as part of the job. Reference media IDs are project/account scoped: pin `account_id` for IDs not present in this service's media history, and do not use `all_accounts` with them.
+- Video jobs using `references` or `reference_data` accept `quality: "360p"` or `"720p"`; `360p` selects the matching `_360p` reference-video model variant.
+
+Example image job using an existing Flow media ID:
+
+```json
+{
+  "kind": "image",
+  "payload": {
+    "prompt": "Create an image based on the reference",
+    "model": "HARBOR_SEAL",
+    "aspect": "landscape",
+    "count": 1,
+    "account_id": "account-key",
+    "project_id": "flow-project-id",
+    "reference_media_ids": ["flow-media-id"]
+  }
+}
+```
 
 Send an `Idempotency-Key` header when retrying an uncertain client request. The compatibility generation routes forward that header too. These routes require `FLOW_ENGINE_MODE=service`, `FLOW_SERVICE_URL` and `FLOW_INTERNAL_TOKEN` on the FastAPI process. Set the same absolute `FLOW_OUTPUT_DIR` in the Go service and FastAPI process so generated files are served from the shared output directory.
 

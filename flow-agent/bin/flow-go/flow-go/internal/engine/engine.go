@@ -4051,6 +4051,7 @@ type BatchReferenceRequest struct {
 	// Model defaults to the reference model for Duration.
 	Model     string
 	Duration  int
+	Quality   string
 	ProjectID string
 	// Wait polls until the render is downloadable. Download implies Wait.
 	Wait     bool
@@ -4094,6 +4095,12 @@ func (e *Engine) GenerateVideoFromReferencesViaBatch(ctx context.Context, req Ba
 			return nil, fmt.Errorf("engine: unsupported duration %ds; use one of %v", duration, config.Durations)
 		}
 		model = key
+	}
+	// Like other video models, the reference-video quality is encoded in the
+	// model key. The RPC has no separate quality field. Preserve an explicit
+	// model when the caller did not request a quality override.
+	if strings.TrimSpace(req.Quality) != "" {
+		model = config.VideoModelQuality(strings.TrimSuffix(model, "_360p"), req.Quality)
 	}
 	projectID := req.ProjectID
 	if projectID == "" {
@@ -4842,14 +4849,6 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 	var rejected *batchexecute.RejectedError
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		// A fresh token per attempt. The page mints one per generation, and the value
-		// is embedded in the request, so reusing one across submissions is not
-		// something the app ever does.
-		captcha, err := e.CaptchaToken(ctx, recaptcha.ActionImage)
-		if err != nil {
-			e.finishJob(jobID, "failed", nil, start, err, accountID)
-			return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
-		}
 		referenceMediaIDs := append([]string(nil), req.ReferenceMediaIDs...)
 		if len(req.ReferenceData) > 0 {
 			uploaded, uploadErr := e.uploadImageReferencesViaBatch(ctx, req.ReferenceData, projectID)
@@ -4858,6 +4857,43 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 				return nil, uploadErr
 			}
 			referenceMediaIDs = append(referenceMediaIDs, uploaded...)
+
+			expected := make(map[string]struct{}, len(uploaded))
+			for _, contentID := range uploaded {
+				expected[contentID] = struct{}{}
+			}
+			log.Printf("engine: checking project listing for %d uploaded image reference(s)", len(expected))
+			found, waitErr := awaitAsset(ctx, func() (bool, error) {
+				assets, listErr := client.ProjectAssets(ctx, projectID)
+				if listErr != nil {
+					return false, listErr
+				}
+				present := make(map[string]struct{}, len(expected))
+				for _, asset := range assets {
+					if _, ok := expected[asset.ContentID]; ok {
+						present[asset.ContentID] = struct{}{}
+					}
+				}
+				return len(present) == len(expected), nil
+			})
+			if waitErr != nil {
+				e.finishJob(jobID, "failed", nil, start, waitErr, accountID)
+				return nil, fmt.Errorf("engine: checking uploaded image references in project: %w", waitErr)
+			}
+			if !found {
+				err := fmt.Errorf("engine: uploaded image references did not appear in project %s within %s", projectID, assetResolveWindow)
+				e.finishJob(jobID, "failed", nil, start, err, accountID)
+				return nil, err
+			}
+			log.Printf("engine: all %d uploaded image reference(s) are visible in the project", len(expected))
+		}
+
+		// Mint the generation token after upload/listing confirmation so a delayed
+		// project listing does not age it before the generation request is sent.
+		captcha, err := e.CaptchaToken(ctx, recaptcha.ActionImage)
+		if err != nil {
+			e.finishJob(jobID, "failed", nil, start, err, accountID)
+			return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
 		}
 
 		reportPhase(ctx, "submitting", "sending image generation request")
@@ -5019,13 +5055,13 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 }
 
 // UploadImageReferencesViaBatch uploads base64 image references and returns
-// their project media IDs for use in a subsequent image generation request.
+// their project content IDs for use in a subsequent image generation request.
 func (e *Engine) UploadImageReferencesViaBatch(ctx context.Context, refs []ReferenceImageData) ([]string, error) {
 	return e.uploadImageReferencesViaBatch(ctx, refs, "")
 }
 
 func (e *Engine) uploadImageReferencesViaBatch(ctx context.Context, refs []ReferenceImageData, projectID string) ([]string, error) {
-	mediaIDs := make([]string, 0, len(refs))
+	contentIDs := make([]string, 0, len(refs))
 	for i, ref := range refs {
 		data, err := base64.StdEncoding.DecodeString(ref.Base64)
 		if err != nil || len(data) == 0 {
@@ -5041,13 +5077,16 @@ func (e *Engine) uploadImageReferencesViaBatch(ctx context.Context, refs []Refer
 		if fileName == "" {
 			fileName = fmt.Sprintf("reference-%d", i+1)
 		}
-		mediaID, _, err := e.uploadImageViaBatch(ctx, projectID, data, ref.MimeType, fileName)
+		_, contentID, err := e.uploadImageViaBatch(ctx, projectID, data, ref.MimeType, fileName)
 		if err != nil {
 			return nil, fmt.Errorf("engine: upload image reference %d: %w", i+1, err)
 		}
-		mediaIDs = append(mediaIDs, mediaID)
+		if strings.TrimSpace(contentID) == "" {
+			return nil, fmt.Errorf("engine: upload image reference %d returned no content id", i+1)
+		}
+		contentIDs = append(contentIDs, contentID)
 	}
-	return mediaIDs, nil
+	return contentIDs, nil
 }
 
 // batchImageModel resolves a friendly model name to the enum the RPC expects.
