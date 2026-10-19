@@ -201,7 +201,7 @@ func imageAspectSlotAt(t *testing.T, req GenerateRequest, seed int64) any {
 // never mentions it — the same promise the video path keeps by leaving its slot
 // null, kept here by leaving this one at its default.
 func TestImageAspectSlotKeepsTheDefaultWhenUnset(t *testing.T) {
-	got := imageAspectSlotAt(t, GenerateRequest{Model: "NARWHAL", Prompt: "p"}, 1)
+	got := imageAspectSlotAt(t, GenerateRequest{Model: "BELUGA", Prompt: "p"}, 1)
 	if got != imageAspectDefault {
 		t.Errorf("an unset aspect wrote %#v, want the default %d", got, imageAspectDefault)
 	}
@@ -224,7 +224,7 @@ func TestImageAspectSlotCarriesTheWireInteger(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.aspect, func(t *testing.T) {
 			got := imageAspectSlotAt(t, GenerateRequest{
-				Model: "NARWHAL", Prompt: "p", AspectRatio: tc.aspect,
+				Model: "BELUGA", Prompt: "p", AspectRatio: tc.aspect,
 			}, 1)
 			value, ok := got.(int)
 			if !ok {
@@ -243,7 +243,7 @@ func TestImageAspectSlotCarriesTheWireInteger(t *testing.T) {
 // it, silently and with a plausible-looking render as the only feedback.
 func TestTheImageSeedIsNotTheAspectSlot(t *testing.T) {
 	arg := buildGenerateArgument(GenerateRequest{
-		Model: "NARWHAL", Prompt: "p", AspectRatio: "square",
+		Model: "BELUGA", Prompt: "p", AspectRatio: "square",
 	}, 99)
 	request := arg[1].([]any)[0].([]any)
 
@@ -263,7 +263,7 @@ func TestLandscapeLandsOnDifferentIntegersOnTheTwoPaths(t *testing.T) {
 		Model: "abra_t2v_8s", Prompt: "p", AspectRatio: "landscape",
 	})
 	image := imageAspectSlotAt(t, GenerateRequest{
-		Model: "NARWHAL", Prompt: "p", AspectRatio: "landscape",
+		Model: "BELUGA", Prompt: "p", AspectRatio: "landscape",
 	}, 1)
 
 	if video != 2 {
@@ -283,7 +283,7 @@ func TestLandscapeLandsOnDifferentIntegersOnTheTwoPaths(t *testing.T) {
 // total. Generate refuses the name long before this is reached.
 func TestImageAspectSlotFallsBackToTheDefaultOnAnUnknownName(t *testing.T) {
 	got := imageAspectSlotAt(t, GenerateRequest{
-		Model: "NARWHAL", Prompt: "p", AspectRatio: "widescreen",
+		Model: "BELUGA", Prompt: "p", AspectRatio: "widescreen",
 	}, 1)
 	if got != imageAspectDefault {
 		t.Errorf("an unknown aspect wrote %#v, want the default %d", got, imageAspectDefault)
@@ -295,7 +295,7 @@ func TestGenerateRefusesAnUnknownImageAspect(t *testing.T) {
 
 	_, err := client.Generate(context.Background(), GenerateRequest{
 		ProjectID:    "p",
-		Model:        "NARWHAL",
+		Model:        "BELUGA",
 		Prompt:       "p",
 		AspectRatio:  "widescreen",
 		CaptchaToken: "t",

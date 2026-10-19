@@ -222,7 +222,7 @@ func TestEndpointConstants(t *testing.T) {
 func TestGenerateArgumentPromptNesting(t *testing.T) {
 	req := GenerateRequest{
 		ProjectID:    "proj-123",
-		Model:        "NARWHAL",
+		Model:        "BELUGA",
 		Prompt:       "a small wooden rowing boat",
 		CaptchaToken: "0cAFcWeAtoken",
 	}
@@ -318,11 +318,11 @@ func TestGenerateValidatesInput(t *testing.T) {
 		name string
 		req  GenerateRequest
 	}{
-		{"no project", GenerateRequest{Model: "NARWHAL", Prompt: "p", CaptchaToken: "t"}},
+		{"no project", GenerateRequest{Model: "BELUGA", Prompt: "p", CaptchaToken: "t"}},
 		{"no model", GenerateRequest{ProjectID: "p", Prompt: "p", CaptchaToken: "t"}},
-		{"no prompt", GenerateRequest{ProjectID: "p", Model: "NARWHAL", CaptchaToken: "t"}},
-		{"blank prompt", GenerateRequest{ProjectID: "p", Model: "NARWHAL", Prompt: "   ", CaptchaToken: "t"}},
-		{"no captcha", GenerateRequest{ProjectID: "p", Model: "NARWHAL", Prompt: "p"}},
+		{"no prompt", GenerateRequest{ProjectID: "p", Model: "BELUGA", CaptchaToken: "t"}},
+		{"blank prompt", GenerateRequest{ProjectID: "p", Model: "BELUGA", Prompt: "   ", CaptchaToken: "t"}},
+		{"no captcha", GenerateRequest{ProjectID: "p", Model: "BELUGA", Prompt: "p"}},
 	}
 
 	for _, tc := range cases {
@@ -450,7 +450,7 @@ func TestVideoAndImagePromptsDiffer(t *testing.T) {
 	prompt := "same text"
 
 	imgArg := buildGenerateArgument(GenerateRequest{
-		ProjectID: "p", Model: "NARWHAL", Prompt: prompt, CaptchaToken: "t"}, 1)
+		ProjectID: "p", Model: "BELUGA", Prompt: prompt, CaptchaToken: "t"}, 1)
 	imgPrompt := imgArg[1].([]any)[0].([]any)[8].([]any)[0].([]any)[0].([]any)[0].(string)
 
 	vidArg := buildVideoArgument(GenerateVideoRequest{

@@ -4744,8 +4744,8 @@ func (e *Engine) ResumeAcceptedMedia(ctx context.Context, projectID string, medi
 // BatchImageRequest is a caller-facing image request for the batchexecute path.
 type BatchImageRequest struct {
 	Prompt string
-	// Model is the image enum: NARWHAL (Nano Banana), HARBOR_SEAL (Nano Banana 2
-	// Lite), or GEM_PIX_2 (Nano Banana Pro).
+	// Model is the image enum: BELUGA (Nano Banana 2.1), HARBOR_SEAL (Nano
+	// Banana 2 Lite), or GEM_PIX_2 (Nano Banana Pro).
 	Model string
 	// ProjectID overrides the resolved project.
 	ProjectID string
@@ -5092,8 +5092,8 @@ func (e *Engine) uploadImageReferencesViaBatch(ctx context.Context, refs []Refer
 // batchImageModel resolves a friendly model name to the enum the RPC expects.
 func batchImageModel(name string) string {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "", "narwhal", "nano_banana", "standard", "nano_banana_2":
-		return "NARWHAL"
+	case "", "beluga", "nano_banano_2.1", "nano_banana_2.1", "narwhal", "nano_banana", "standard", "nano_banana_2":
+		return "BELUGA"
 	case "harbor_seal", "lite", "nano_banana_2_lite":
 		return "HARBOR_SEAL"
 	case "gem_pix_2", "pro", "nano_banana_pro":

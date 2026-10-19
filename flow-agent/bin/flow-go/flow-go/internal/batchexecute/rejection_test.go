@@ -6,7 +6,7 @@ import (
 )
 
 // liveRefusal is a response body captured from the live endpoint on 2026-09-23,
-// answering a NARWHAL image submission that the engine reported as "the
+// answering a BELUGA image submission that the engine reported as "the
 // transport returned no image (it answered with no frames at all)".
 //
 // It is the whole reason Frame.Error exists. The data slot really is null, so a

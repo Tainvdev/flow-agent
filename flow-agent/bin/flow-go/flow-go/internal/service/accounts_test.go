@@ -927,7 +927,7 @@ func TestUnauthorizedSessionFailureMarksOnlyItsAccountNeedsLogin(t *testing.T) {
 	}
 	unauthorizedClient := eng.NewBatchexecuteClient(jar, httpClient)
 	_, refreshErr := unauthorizedClient.Generate(context.Background(), batchexecute.GenerateRequest{
-		ProjectID: "project-a", Model: "NARWHAL", Prompt: "first request", CaptchaToken: "captcha-a",
+		ProjectID: "project-a", Model: "BELUGA", Prompt: "first request", CaptchaToken: "captcha-a",
 	}, batchexecute.CallOptions{})
 	if refreshErr == nil || eng.SessionFailure() == "" {
 		t.Fatalf("401 recovery=(err=%v, session failure=%q), want failed refresh latched", refreshErr, eng.SessionFailure())
@@ -997,7 +997,7 @@ func TestUnauthorizedBurstAfterRefreshFailureDoesNotCreateRetryStorm(t *testing.
 	}
 	unauthorizedClient := eng.NewBatchexecuteClient(jar, httpClient)
 	_, refreshErr := unauthorizedClient.Generate(context.Background(), batchexecute.GenerateRequest{
-		ProjectID: "project-a", Model: "NARWHAL", Prompt: "trigger stale session", CaptchaToken: "captcha-a",
+		ProjectID: "project-a", Model: "BELUGA", Prompt: "trigger stale session", CaptchaToken: "captcha-a",
 	}, batchexecute.CallOptions{})
 	if refreshErr == nil || eng.SessionFailure() == "" {
 		t.Fatalf("initial 401 recovery=(err=%v, session failure=%q), want extension refresh failure", refreshErr, eng.SessionFailure())

@@ -129,7 +129,7 @@ python main.py image "PROMPT"
 python main.py image "PROMPT" \
   --aspect 16:9          # 1:1 | 16:9 | 9:16 | 4:3 | 3:4 | square | landscape | portrait
   --count 2              # 1–4 variations
-  --model narwhal        # narwhal | harbor_seal | gem_pix_2
+  --model nano_banano_2.1 # nano_banano_2.1 | harbor_seal | gem_pix_2
 
 # Run on all accounts at once (pools credits)
 python main.py image "PROMPT" --all
@@ -324,7 +324,7 @@ flow-agent/
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `IMAGE_MODEL` | `narwhal` | Default image model (`narwhal` / `harbor_seal` / `gem_pix_2`) |
+| `IMAGE_MODEL` | `nano_banano_2.1` | Default image model (`nano_banano_2.1` / `harbor_seal` / `gem_pix_2`) |
 | `FLOW_COOKIES_DIR` | `cookies/` | Directory with account JSON files |
 | `FLOW_OUTPUT_DIR` | `output/` | Where generated files are saved |
 | `FLOW_DB_PATH` | `data/flow.db` | SQLite history database path |

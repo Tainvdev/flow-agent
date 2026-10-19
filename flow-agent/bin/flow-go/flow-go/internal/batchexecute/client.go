@@ -96,7 +96,7 @@ const (
 
 	// RPCIDModelCatalog returns every generation model the account can use:
 	// abra_i2v_{4,6,10}s, abra_edit, abra_edit_360p, and the image models
-	// NARWHAL, HARBOR_SEAL, GEM_PIX_2, with their display labels.
+	// BELUGA, HARBOR_SEAL, GEM_PIX_2, with their display labels.
 	RPCIDModelCatalog = "HTrJv"
 
 	// RPCIDAvailableModels returns the subset currently offered for a tool.
@@ -120,7 +120,7 @@ const (
 	//	  [<same context block again>],
 	//	  ["<batch-uuid>"]]
 	//
-	// The model is an image enum ("NARWHAL") or a video key ("abra_t2v_8s").
+	// The model is an image enum ("BELUGA") or a video key ("abra_t2v_8s").
 	RPCIDGenerate = "ogiZ0b"
 
 	// RPCIDGenerationStatus reports generation telemetry and progress. It carries
@@ -1223,7 +1223,7 @@ type GenerateRequest struct {
 	ReferenceMediaIDs []string
 	// Count is the number of image variations submitted in this RPC.
 	Count int
-	// Model is the image enum ("NARWHAL", "HARBOR_SEAL", "GEM_PIX_2") or the
+	// Model is the image enum ("BELUGA", "HARBOR_SEAL", "GEM_PIX_2") or the
 	// video key ("abra_t2v_8s").
 	Model string
 	// Prompt is the text prompt.

@@ -15,7 +15,7 @@ import (
 func TestRefusedSubmissionNamesTheServerReason(t *testing.T) {
 	err := &EmptyResultError{
 		Kind:     "image",
-		Model:    "NARWHAL",
+		Model:    "BELUGA",
 		JobID:    "8f14e45fceea167a5a36dedd4bea2543",
 		Account:  "acct-h5a40db955d8d",
 		Frames:   1,
@@ -27,7 +27,7 @@ func TestRefusedSubmissionNamesTheServerReason(t *testing.T) {
 
 	for _, want := range []string{
 		reasonUnusualActivity, // what the server actually said
-		"NARWHAL",             // which model, so the job can be found
+		"BELUGA",             // which model, so the job can be found
 		"8f14e45f",
 		"acct-h5a40db955d8d",
 		"refused", // that it was a refusal rather than a silence

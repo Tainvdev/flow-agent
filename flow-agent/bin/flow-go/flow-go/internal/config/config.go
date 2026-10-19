@@ -293,13 +293,16 @@ const EditModel = "abra_edit"
 
 // ImageModels maps friendly names to the Flow image model enum.
 var ImageModels = map[string]string{
-	"harbor_seal":   "HARBOR_SEAL",
-	"lite":          "HARBOR_SEAL",
-	"narwhal":       "NARWHAL",
-	"nano_banana_2": "NARWHAL",
-	"standard":      "NARWHAL",
-	"gem_pix_2":     "GEM_PIX_2",
-	"pro":           "GEM_PIX_2",
+	"harbor_seal":     "HARBOR_SEAL",
+	"lite":            "HARBOR_SEAL",
+	"beluga":          "BELUGA",
+	"nano_banano_2.1": "BELUGA",
+	"nano_banana_2.1": "BELUGA",
+	"narwhal":         "BELUGA", // Legacy alias.
+	"nano_banana_2":   "BELUGA",
+	"standard":        "BELUGA",
+	"gem_pix_2":       "GEM_PIX_2",
+	"pro":             "GEM_PIX_2",
 }
 
 // DefaultImageModel resolves IMAGE_MODEL, accepting either a friendly key or an
@@ -307,7 +310,7 @@ var ImageModels = map[string]string{
 func DefaultImageModel() string {
 	raw := os.Getenv("IMAGE_MODEL")
 	if raw == "" {
-		return "NARWHAL"
+		return "BELUGA"
 	}
 	if resolved, ok := ImageModels[strings.ToLower(raw)]; ok {
 		return resolved
@@ -317,7 +320,7 @@ func DefaultImageModel() string {
 			return raw
 		}
 	}
-	return "NARWHAL"
+	return "BELUGA"
 }
 
 /* ------------------------------------------------------------------ *

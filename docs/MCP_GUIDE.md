@@ -98,7 +98,7 @@ Generates an image from a prompt on Google Flow.
 | `prompt` | `string` | **Yes** | — | Description of the scene or subject to draw. |
 | `aspect` | `string` | No | `"1:1"` | Aspect ratio: `"1:1"`, `"16:9"`, `"9:16"`, `"4:3"`, `"3:4"`, `"square"`, `"landscape"`, `"portrait"`. |
 | `count` | `integer` | No | `1` | Number of variations (1 to 4). |
-| `model` | `string` | No | `"narwhal"` | Engine model: `"narwhal"`, `"harbor_seal"`. |
+| `model` | `string` | No | `"nano_banano_2.1"` | Engine model: `"nano_banano_2.1"`, `"harbor_seal"`, `"gem_pix_2"`. |
 | `all_accounts`| `boolean`| No | `false` | Distribute the prompt across all signed-in accounts at once. |
 
 #### Example Tool Call:

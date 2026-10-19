@@ -93,7 +93,7 @@ python main.py image PROMPT [OPTIONS]
 | `prompt` | string | — | — | Scene description **(required)** |
 | `--aspect` | string | `1:1` | `1:1` `16:9` `9:16` `4:3` `3:4` `square` `landscape` `portrait` | Image aspect ratio |
 | `--count` | integer | `1` | `1` `2` `3` `4` | Number of image variations |
-| `--model` | string | `narwhal` | — | Model key (see models table below) |
+| `--model` | string | `nano_banano_2.1` | — | Model key (see models table below) |
 | `--all` | flag | off | — | Run on every account in `cookies/` concurrently |
 | `--cookies` | string | `null` | — | Target a specific account file, e.g. `cookies/account_abc.json` |
 
@@ -101,7 +101,7 @@ python main.py image PROMPT [OPTIONS]
 
 | Model Key | Description |
 | :--- | :--- |
-| `narwhal` | Default Flow image model — best quality |
+| `nano_banano_2.1` | Default Flow image model (BELUGA) |
 | `harbor_seal` | Alternative image model |
 | `gem_pix_2` | Gemini Pixel model variant |
 
@@ -370,7 +370,7 @@ Starts the WebSocket bridge on `ws://127.0.0.1:9222` that the Chrome Flow extens
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `IMAGE_MODEL` | `narwhal` | Default image model key. Overrides the `--model` default without passing the flag. |
+| `IMAGE_MODEL` | `nano_banano_2.1` | Default image model key. Overrides the `--model` default without passing the flag. |
 | `FLOW_COOKIES_DIR` | `cookies/` | Directory to scan for account JSON bundles. |
 | `FLOW_OUTPUT_DIR` | `output/` | Directory where generated images and videos are saved. |
 | `FLOW_DB_PATH` | `data/flow.db` | SQLite database path for generation history. |

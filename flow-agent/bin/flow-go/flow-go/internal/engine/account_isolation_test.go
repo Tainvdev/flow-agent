@@ -133,7 +133,7 @@ func TestConcurrentAccountEnginesKeepCookiesProjectAndAuthuserTogether(t *testin
 			<-start
 			batchexecuteClient := tc.engine.newBatchexecuteClient(tc.engine.Jar(), tc.http)
 			_, callErr := batchexecuteClient.Generate(context.Background(), batchexecute.GenerateRequest{
-				ProjectID: tc.project, Model: "NARWHAL", Prompt: tc.prompt, CaptchaToken: tc.captcha,
+				ProjectID: tc.project, Model: "BELUGA", Prompt: tc.prompt, CaptchaToken: tc.captcha,
 			}, batchexecute.CallOptions{})
 			results <- callErr
 		}(tc)

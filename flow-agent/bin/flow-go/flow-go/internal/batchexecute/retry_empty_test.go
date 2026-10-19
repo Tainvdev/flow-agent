@@ -66,7 +66,7 @@ func generationServer(t *testing.T, rpcID string, payloads ...string) (*httptest
 func imageRequest(token string) GenerateRequest {
 	return GenerateRequest{
 		ProjectID:    "proj-1",
-		Model:        "NARWHAL",
+		Model:        "BELUGA",
 		Prompt:       "a red apple on a wooden table",
 		CaptchaToken: token,
 	}

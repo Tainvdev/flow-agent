@@ -68,7 +68,7 @@ Generates one or more images from a text prompt using Google Flow's image models
   "prompt": "a majestic cybernetic lion in neon rain, 8k cinematic",
   "aspect": "16:9",
   "count": 1,
-  "model": "narwhal",
+  "model": "nano_banano_2.1",
   "all_accounts": false,
   "cookies": null
 }
@@ -79,7 +79,7 @@ Generates one or more images from a text prompt using Google Flow's image models
 | `prompt` | string | ✅ | — | Scene description |
 | `aspect` | string | ❌ | `"1:1"` | Aspect ratio — see values below |
 | `count` | integer | ❌ | `1` | Number of variations — `1` to `4` |
-| `model` | string | ❌ | `"narwhal"` | Model key — `"narwhal"`, `"harbor_seal"`, `"gem_pix_2"` |
+| `model` | string | ❌ | `"nano_banano_2.1"` | Model key — `"nano_banano_2.1"`, `"harbor_seal"`, `"gem_pix_2"` |
 | `all_accounts` | boolean | ❌ | `false` | Snapshot eligible accounts at acceptance, create one durable child job per account, then return per-account results and partial failures |
 | `account_id` | string | Optional | `null` | Run on one registered account; preferred selector in service mode. |
 | `cookies` | string | ❌ | `null` | Path to a specific account bundle, e.g. `"cookies/account_abc.json"` |
@@ -101,7 +101,7 @@ Generates one or more images from a text prompt using Google Flow's image models
   "job_id": "ba884266-3fe5-4106-89a1-2ed79c8a8e5b",
   "account_id": "acct-e50d5ecec52e",
   "project_id": "07543949-1b85-4161-85a7-09387d3a95fc",
-  "model": "NARWHAL",
+  "model": "BELUGA",
   "status": "succeeded",
   "elapsed_seconds": 26.3,
   "files": [
@@ -234,7 +234,7 @@ Returns the full generation history and cumulative metrics stored in `data/flow.
       "job_id": "ba884266-3fe5-4106-89a1-2ed79c8a8e5b",
       "account_id": "acct-e50d5ecec52e",
       "kind": "image",
-      "model": "NARWHAL",
+      "model": "BELUGA",
       "aspect": "16:9",
       "status": "succeeded",
       "credits_spent": null,

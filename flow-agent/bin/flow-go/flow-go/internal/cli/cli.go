@@ -188,8 +188,8 @@ GENERATE FLAGS
 IMAGE FLAGS
   --prompt              Prompt text (required, or give it as a positional
                         argument)
-  --model               harbor_seal | narwhal | gem_pix_2
-                        (default: $IMAGE_MODEL, else narwhal)
+  --model               harbor_seal | nano_banano_2.1 | gem_pix_2
+                        (default: $IMAGE_MODEL, else nano_banano_2.1)
   --count               Accepted, but only 1 is honoured: the RPC returns one
                         asset per call
   --aspect              landscape | 16:9 | portrait | 9:16 | square | 1:1 |
@@ -260,7 +260,7 @@ EXAMPLES
   flow-go upload-video clip.mp4
   flow-go edit clip.mp4 "make it a cybernetic neon city"
   flow-go edit --source <content-id> "make the boat drift slowly to the left"
-  flow-go batch-all --prompt "a paper boat" --model narwhal
+  flow-go batch-all --prompt "a paper boat" --model nano_banano_2.1
   flow-go stats
 `
 }
@@ -1363,7 +1363,7 @@ func runImage(args []string) int {
 	prompt := fs.String("prompt", "", "prompt text")
 	count := fs.Int("count", 1, "number of variations")
 	model := fs.String("model", envDefault("IMAGE_MODEL", ""),
-		"harbor_seal, narwhal, or gem_pix_2 (from $IMAGE_MODEL, else narwhal)")
+		"harbor_seal, nano_banano_2.1, or gem_pix_2 (from $IMAGE_MODEL, else nano_banano_2.1)")
 	noDownload := fs.Bool("no-download", false, "skip writing the result to disk")
 	// --seed is not implemented on the batchexecute transport; declared, and
 	// named when passed, but the run continues without it.
@@ -1376,7 +1376,7 @@ func runImage(args []string) int {
 	jsonOutput := fs.Bool("json", false, "print the aggregate result as JSON (for scripts)")
 	seed := fs.Int64("seed", 0, "ignored — not implemented on the batchexecute transport")
 	// Flags and the positional prompt may be interleaved, so
-	// `flow-go image "a red boat" --model narwhal` applies both.
+	// `flow-go image "a red boat" --model nano_banano_2.1` applies both.
 	positional := parseInterspersed(fs, args)
 
 	// Trailing shorthand — `flow-go image "an origami owl" 1:1 x2` — is peeled
@@ -1666,8 +1666,8 @@ func runBatchAll(args []string) int {
 	var common commonFlags
 	common.bind(fs)
 	prompt := fs.String("prompt", "", "prompt to generate (required)")
-	model := fs.String("model", envDefault("IMAGE_MODEL", "narwhal"),
-		"image model: narwhal|lite|pro (from $IMAGE_MODEL, else narwhal)")
+	model := fs.String("model", envDefault("IMAGE_MODEL", "nano_banano_2.1"),
+		"image model: nano_banano_2.1|lite|pro (from $IMAGE_MODEL, else nano_banano_2.1)")
 	download := fs.Bool("download", true, "write the results to output/")
 	jsonOutput := fs.Bool("json", false, "print the aggregate result as JSON (for scripts)")
 	_ = fs.Parse(args)
