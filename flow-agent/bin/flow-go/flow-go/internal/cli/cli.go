@@ -2510,7 +2510,7 @@ func runBatchExecute(args []string) int {
 		fmt.Println("  Example:")
 		fmt.Println("    flow-go batchexecute --rpc HTrJv --payload '[]' \\")
 		fmt.Println("      --source-path /project/<project-id> \\")
-		fmt.Println("      --bl boq_labs-ai-sandbox-frontend_20260917.00_p0")
+		fmt.Println("      --bl boq_labs-ai-sandbox-frontend_20261019.11_p0")
 		fmt.Println()
 		return 0
 	}

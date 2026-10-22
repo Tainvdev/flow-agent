@@ -208,7 +208,7 @@ const (
 	//	"abra_r2v_4s", 2, null,
 	//	[null, null, null, null, <uuid>, <uuid>],
 	//	null, null, null, null,
-	//	[["d351dd3c-0a12-1522-0000-000000000000"]]  <- fixed, see referenceTail
+	//	Optional composer fields follow the UUID pair and vary by model.
 	//
 	// Note the layout is *not* the i2v one: there the prompt sits at index 2 with
 	// the images in trailing slots, here it sits at index 0 ahead of them, which is
@@ -366,9 +366,10 @@ type Fingerprint struct {
 
 // Client issues batchexecute calls with cookie authentication.
 type Client struct {
-	jar  *cookiejar.Jar
-	hc   *httpx.Client
-	reqs int64
+	jar        *cookiejar.Jar
+	hc         *httpx.Client
+	browserRPC BrowserRPCTransport
+	reqs       int64
 
 	mu sync.Mutex
 	// at is the anti-CSRF token the server hands out on a rejected first call.
@@ -413,6 +414,22 @@ type Client struct {
 	// of all measuring the same gap and firing together.
 	subMu   sync.Mutex
 	subNext time.Time
+}
+
+// BrowserCaptchaTokenPlaceholder marks the captcha field that the Flow page
+// replaces after minting a token inline with an image submission.
+const BrowserCaptchaTokenPlaceholder = "__FLOW_IMAGE_CAPTCHA_TOKEN__"
+
+// BrowserRPCTransport submits a batchexecute form through the signed-in Flow
+// page and returns the HTTP status and response text. captchaAction, when set,
+// asks the page to mint and insert a token immediately before submitting it.
+type BrowserRPCTransport func(ctx context.Context, requestURL, body, captchaAction, captchaPlaceholder string) (int, string, error)
+
+// SetBrowserRPCTransport routes the allowlisted browser RPCs through a page.
+func (c *Client) SetBrowserRPCTransport(transport BrowserRPCTransport) {
+	c.mu.Lock()
+	c.browserRPC = transport
+	c.mu.Unlock()
 }
 
 // SubmissionUnknownError marks an upstream write whose transport outcome cannot
@@ -750,7 +767,7 @@ type CallOptions struct {
 	// SourcePath is the app route the call is made from, e.g. "/project/<id>".
 	SourcePath string
 	// BuildLabel is the `bl` parameter, e.g.
-	// "boq_labs-ai-sandbox-frontend_20260917.00_p0".
+	// "boq_labs-ai-sandbox-frontend_20261019.11_p0".
 	BuildLabel string
 	// SessionID is the `f.sid` parameter from the page.
 	SessionID string
@@ -758,6 +775,10 @@ type CallOptions struct {
 	// a submission's shape to its RPC is what several models hinge on, so it has
 	// to be overridable to test one against another.
 	RPCID string
+	// BrowserCaptchaAction asks the browser transport to mint this action's
+	// captcha in the Flow page and insert it into the request immediately before
+	// fetch. Used for image generation in broker mode to preserve the UI ordering.
+	BrowserCaptchaAction string
 	// RefreshCaptcha re-mints the captcha token a payload carries.
 	//
 	// **A reCAPTCHA token is single-use**, so a retry that resends the previous
@@ -840,9 +861,15 @@ func (c *Client) call(ctx context.Context, rpcID string, opts CallOptions,
 	}
 	defer release()
 
-	auth, err := c.Authorization()
-	if err != nil {
-		return nil, err
+	c.mu.Lock()
+	useBrowserRPC := c.browserRPC != nil && browserRPCs[rpcID]
+	c.mu.Unlock()
+	auth := ""
+	if !useBrowserRPC {
+		auth, err = c.Authorization()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// The envelope is [[[rpcid, "<args>", null, "generic"]]]. The arguments are a
@@ -891,7 +918,7 @@ func (c *Client) call(ctx context.Context, rpcID string, opts CallOptions,
 	query := url.Values{}
 	query.Set("rpcids", rpcID)
 	query.Set("source-path", sourcePath)
-	query.Set("hl", "en")
+	query.Set("hl", "vi")
 	query.Set("rt", "c")
 	query.Set("_reqid", strconv.FormatInt(reqID, 10))
 	if opts.BuildLabel != "" {
@@ -901,7 +928,7 @@ func (c *Client) call(ctx context.Context, rpcID string, opts CallOptions,
 		query.Set("f.sid", sid)
 	}
 
-	resp, err := c.post(ctx, rpcID, envelopeFor, query.Encode(), auth)
+	resp, err := c.post(ctx, rpcID, envelopeFor, query.Encode(), auth, opts.BrowserCaptchaAction)
 	if err != nil {
 		return nil, err
 	}
@@ -931,6 +958,17 @@ var submissionRPCs = map[string]bool{
 	RPCIDGenerateVideoImageStart: true, // eb1hJf — start frame only
 	RPCIDGenerateVideoReferences: true, // MZZa6b — reference images
 	RPCIDVideoEdit:               true, // jIps6 — video edit
+}
+
+// browserRPCs are the RPCs that must use the signed-in Flow page transport.
+// Generation writes need the page's session context.
+var browserRPCs = map[string]bool{
+	RPCIDGenerate:                true,
+	RPCIDGenerateVideo:           true,
+	RPCIDGenerateVideoImage:      true,
+	RPCIDGenerateVideoImageStart: true,
+	RPCIDGenerateVideoReferences: true,
+	RPCIDVideoEdit:               true,
 }
 
 // SetSubmissionLimits caps how many submission calls may be in flight and the
@@ -1074,7 +1112,7 @@ func (c *Client) SetUnauthorizedHandler(fn UnauthorizedHandler) {
 // refresh is attempted at most once per call.
 func (c *Client) post(ctx context.Context, rpcID string,
 	envelope func(ctx context.Context, retry bool) (string, error),
-	rawQuery, auth string) (*httpx.Response, error) {
+	rawQuery, auth, captchaAction string) (*httpx.Response, error) {
 	fullURL := c.endpointURL(rawQuery)
 	headers := c.requestHeaders(auth)
 
@@ -1105,6 +1143,31 @@ func (c *Client) post(ctx context.Context, rpcID string,
 			// supply the header order as well as the headers — and neither made
 			// any difference to that rejection. The setters went with the
 			// upscale code; the values are what they always resolved to.
+			c.mu.Lock()
+			browserRPC := c.browserRPC
+			c.mu.Unlock()
+			if browserRPC != nil && browserRPCs[rpcID] {
+				if captchaAction != "" {
+					log.Printf("batchexecute: minting %s captcha in the Flow page with %s", captchaAction, rpcID)
+				}
+				status, text, err := browserRPC(ctx, fullURL, body.Encode(), captchaAction, BrowserCaptchaTokenPlaceholder)
+				if err != nil {
+					return nil, submissionUnknown(rpcID, fmt.Errorf("batchexecute: %s browser request failed: %w", rpcID, err))
+				}
+				resp := &httpx.Response{Status: status, Body: []byte(text)}
+				if resp.Status == 200 {
+					return resp, nil
+				}
+				if attempt == 1 && resp.Status == 400 {
+					if token := extractXSRF(resp.Text()); token != "" {
+						c.setToken(token)
+						log.Printf("batchexecute: %s primed; retrying", rpcID)
+						continue
+					}
+				}
+				return resp, nil
+			}
+
 			resp, err := c.hc.Do(ctx, &httpx.Request{
 				Method:      "POST",
 				URL:         fullURL,
@@ -1662,6 +1725,19 @@ func buildVideoArgument(req GenerateVideoRequest) []any {
 			request = append(request, videoImageBlock(req.EndImage, req.EndFrame))
 		}
 		request = append(request, []any{nil, nil, nil, nil, uuid.NewString(), uuid.NewString()})
+		if req.VideoOption != nil {
+			// The Flow composer sets this optional field on the generation message.
+			// Its observed wire value is [4]. It is not present in every capture, so
+			// callers must pass it through instead of us inventing a default.
+			switch {
+			case req.StartImage == "" && req.EndImage == "":
+				request = append(request, nil, nil, req.VideoOption)
+			case req.StartImage != "" && req.EndImage != "":
+				request = append(request, nil, nil, req.VideoOption)
+			default:
+				request = append(request, nil, nil, nil, req.VideoOption)
+			}
+		}
 		requests = append(requests, request)
 	}
 
@@ -2320,6 +2396,10 @@ type GenerateVideoRequest struct {
 	// flag is 2 for text and 1 for image-conditioned, and whether a third value
 	// selects the reference-image behaviour is unknown.
 	ModeOverride *int
+	// VideoOption is the optional composer value serialized after the variation
+	// fields (the observed wire value is [4]). It is opaque because the bundle
+	// passes it through as c.Yj without exposing its product meaning.
+	VideoOption any
 }
 
 // Video generation modes, read off the app's own requests.
@@ -2496,15 +2576,6 @@ func (c *Client) GenerateVideoEdit(ctx context.Context, req EditVideoRequest, op
 	return retryIfEmpty(ctx, opts, frames, carriesNoMediaIDs, submit)
 }
 
-// referenceTail is the value the app puts at request[0][0][10] of a
-// reference-image submission.
-//
-// The zero tail marks it as a fixed value rather than a per-request id — a
-// generated uuid never ends in twelve zeros — and it was identical across the
-// capture, so it is reproduced verbatim. What it selects is not known: a style, a
-// preset, or a feature flag.
-const referenceTail = "d351dd3c-0a12-1522-0000-000000000000"
-
 // ReferenceVideoRequest describes a video generation conditioned on reference
 // images.
 type ReferenceVideoRequest struct {
@@ -2520,6 +2591,10 @@ type ReferenceVideoRequest struct {
 	Count int
 	// CaptchaToken is a reCAPTCHA token, minted for the VIDEO_GENERATION action.
 	CaptchaToken string
+	// ModeOverride and VideoOption preserve optional composer values. The bundle
+	// forwards these independently of the model and reference list.
+	ModeOverride *int
+	VideoOption  any
 }
 
 /* ------------------------------------------------------------------ *
@@ -2580,7 +2655,7 @@ func (r ReferenceVideoRequest) withCaptcha(token string) ReferenceVideoRequest {
 //	"abra_r2v_4s", 2, null,
 //	[null, null, null, null, <uuid>, <uuid>],
 //	null, null, null, null,
-//	[["d351dd3c-0a12-1522-0000-000000000000"]]
+//	optional composer fields follow the UUID pair and vary by model.
 func buildReferenceArgument(req ReferenceVideoRequest) []any {
 	count := req.Count
 	if count < 1 {
@@ -2594,16 +2669,23 @@ func buildReferenceArgument(req ReferenceVideoRequest) []any {
 
 	requests := make([]any, 0, count)
 	for i := 0; i < count; i++ {
-		requests = append(requests, []any{
+		request := []any{
 			[]any{nil, nil, []any{[]any{[]any{req.Prompt}}}},
 			refs,
 			req.Model,
 			videoModeImage,
 			nil,
 			[]any{nil, nil, nil, nil, uuid.NewString(), uuid.NewString()},
-			nil, nil, nil, nil,
-			[]any{[]any{referenceTail}},
-		})
+		}
+		if req.ModeOverride != nil {
+			request[3] = *req.ModeOverride
+		}
+		if req.VideoOption != nil {
+			// The app's optional c.Yj field is the final slot in the captured
+			// reference request. Keep intervening absent fields as nulls.
+			request = append(request, nil, nil, nil, nil, nil, req.VideoOption)
+		}
+		requests = append(requests, request)
 	}
 
 	contextBlock := []any{

@@ -531,13 +531,13 @@ func LabsAPIKey() string { return labsAPIKey }
 // no error — the calls simply go out claiming to be an older frontend than the
 // one they are talking to.
 //
-// The current value was read back off https://flow.google.com/ on 2026-09-23
-// rather than assumed, which is the only way this stays true:
+// The current value was read from a live request on 2026-10-21. Update it when
+// a newer live request shows a different frontend build:
 //
 //	curl -sS -A "<a Chrome UA>" https://flow.google.com/ \
 //	  | grep -oE 'boq_labs-ai-sandbox-frontend_[0-9]+\.[0-9]+_p[0-9]'
 func BuildLabel() string {
-	return envOr("FLOW_BUILD_LABEL", "boq_labs-ai-sandbox-frontend_20260922.00_p0")
+	return envOr("FLOW_BUILD_LABEL", "boq_labs-ai-sandbox-frontend_20261019.11_p0")
 }
 
 // LoadEnv reads .env and config.env if present. Real environment variables win,

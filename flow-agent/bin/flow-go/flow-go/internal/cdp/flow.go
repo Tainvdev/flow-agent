@@ -143,6 +143,55 @@ func (c *Client) FlowAt(ctx context.Context, fallback string) (json.RawMessage, 
 	return c.flowCall(ctx, "flow.at", nil, fallback)
 }
 
+// FlowRPC submits one allowlisted batchexecute form through the Flow page. When
+// captchaAction is set, the extension mints and inserts the token in the same
+// page operation immediately before submitting the form.
+func (c *Client) FlowRPC(ctx context.Context, requestURL, body, captchaAction, captchaPlaceholder string) (int, string, error) {
+	if !c.hasFlowOps() {
+		return 0, "", fmt.Errorf("cdp: the attached extension does not implement Flow RPC submission")
+	}
+	c.opsMu.Lock()
+	supported := false
+	for _, op := range c.advertised {
+		if op == "flow.rpc" {
+			supported = true
+			break
+		}
+	}
+	c.opsMu.Unlock()
+	if !supported {
+		return 0, "", fmt.Errorf("cdp: the attached Flow extension does not advertise flow.rpc; reload the updated extension")
+	}
+	if captchaAction != "" {
+		c.opsMu.Lock()
+		inlineCaptchaSupported := false
+		for _, op := range c.advertised {
+			if op == "flow.rpc.inline_captcha" {
+				inlineCaptchaSupported = true
+				break
+			}
+		}
+		c.opsMu.Unlock()
+		if !inlineCaptchaSupported {
+			return 0, "", fmt.Errorf("cdp: the attached Flow extension does not support inline captcha submission; reload the updated extension")
+		}
+	}
+	var out struct {
+		Status int    `json:"status"`
+		Text   string `json:"text"`
+	}
+	if err := c.Call(ctx, "flow.rpc", map[string]string{
+		"url": requestURL, "body": body,
+		"captcha_action": captchaAction, "captcha_placeholder": captchaPlaceholder,
+	}, &out); err != nil {
+		return 0, "", err
+	}
+	if out.Status == 0 {
+		return 0, "", fmt.Errorf("cdp: flow.rpc returned no HTTP status")
+	}
+	return out.Status, out.Text, nil
+}
+
 // FlowCaptchaResult is either a probe answer or a minted token.
 type FlowCaptchaResult struct {
 	// Available reports whether the page has the client loaded at all. It is the

@@ -155,6 +155,8 @@ Generates a video clip from text, or animates a starting image into video.
 | `quality` | string | ❌ | `"720p"` | Resolution: `"360p"`, `"720p"` |
 | `count` | integer | ❌ | `1` | Number of variations — `1` to `4` |
 | `start_image` | string | ❌ | `null` | Local image path or uploaded media ID for image-to-video |
+| `video_mode` | integer | ❌ | Builder default | Optional raw mode value copied into the video request; use only when reproducing a captured Flow request. |
+| `video_option` | JSON value | ❌ | omitted | Optional raw composer field copied into each variation. For captures carrying it, the observed value is `[4]`; its product meaning is unknown. |
 | `all_accounts` | boolean | ❌ | `false` | Snapshot eligible accounts at acceptance and fan out through durable child jobs |
 | `account_id` | string | Optional | `null` | Run on one registered account; preferred selector in service mode. |
 | `cookies` | string | ❌ | `null` | Path to a specific account bundle |

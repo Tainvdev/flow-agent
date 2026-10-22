@@ -83,9 +83,10 @@ type Config struct {
 
 // App holds the assembled system.
 type App struct {
-	Store  *store.Store
-	Bridge *bridge.Bridge
-	Engine *engine.Engine
+	Store       *store.Store
+	Bridge      *bridge.Bridge
+	Engine      *engine.Engine
+	captchaMode string
 }
 
 // Build opens the database, creates the bridge, and constructs the engine. It
@@ -94,6 +95,10 @@ type App struct {
 func Build(cfg Config) (*App, error) {
 	if err := config.EnsureDirs(); err != nil {
 		return nil, err
+	}
+	captchaMode := strings.TrimSpace(cfg.CaptchaMode)
+	if captchaMode == "" {
+		captchaMode = "auto"
 	}
 
 	dbPath := cfg.DBPath
@@ -124,7 +129,7 @@ func Build(cfg Config) (*App, error) {
 	eng, err := engine.New(st, br, engine.Options{
 		ProjectID:    cfg.ProjectID,
 		ProxyURL:     cfg.ProxyURL,
-		CaptchaMode:  cfg.CaptchaMode,
+		CaptchaMode:  captchaMode,
 		AccountIndex: config.AccountIndex,
 		AtToken:      cfg.AtToken,
 		Fsid:         cfg.Fsid,
@@ -141,7 +146,7 @@ func Build(cfg Config) (*App, error) {
 		return nil, err
 	}
 
-	return &App{Store: st, Bridge: br, Engine: eng}, nil
+	return &App{Store: st, Bridge: br, Engine: eng, captchaMode: captchaMode}, nil
 }
 
 // Close releases resources.
@@ -275,10 +280,11 @@ func (a *App) RunService(ctx context.Context, listenAddr, token string, workers 
 	if err != nil {
 		return err
 	}
-	manager, err := service.NewAccountManagerWithMediaLimits(a.Store, a.Bridge, workers, pollLimit, downloadLimit)
+	manager, err := service.NewAccountManagerWithMediaLimits(a.Store, a.Bridge, workers, pollLimit, downloadLimit, a.captchaMode)
 	if err != nil {
 		return err
 	}
+	log.Printf("app: service reCAPTCHA strategy=%q", a.captchaMode)
 	queueWorkers, err := queueWorkersFromEnv(workers)
 	if err != nil {
 		return err

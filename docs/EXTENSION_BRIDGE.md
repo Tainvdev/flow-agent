@@ -47,6 +47,8 @@ sequenceDiagram
 
 The extension sends cookie rotation events as a signal to resync, not as a cookie delta. The bridge fetches the complete scoped cookie set, writes the account bundle atomically, then publishes the update to the account registry. A failed sync or failed bundle write does not publish the new session. Service jobs use the persisted account bundle and do not pull cookies immediately before submission. Cookie freshness defaults to strict: service mode requires the owning extension to remain connected so rotation events can update the bundle. `FLOW_COOKIE_FRESHNESS=cached` allows a persisted snapshot to be used while the extension is offline.
 
+Image and video generation submissions keep their payload and batchexecute envelope in Go, then use the attached extension's `flow.rpc` operation to POST to the fixed Flow batchexecute endpoint from the Flow page with browser credentials. In `broker` captcha mode, image generation asks `flow.rpc` to mint the reCAPTCHA token in the page, insert it into the prepared body, and submit the request in the same page operation. The extension accepts only the known generation RPC IDs and returns the HTTP status and response text for the existing Go parser path. Other batchexecute calls keep their existing transports.
+
 ---
 
 ## 3. Extension Installation

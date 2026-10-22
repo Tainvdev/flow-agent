@@ -347,6 +347,23 @@ func (e *Engine) NewBatchexecuteClient(jar *cookiejar.Jar, hc *httpx.Client) *ba
 // a fingerprint mismatch. Read-only calls are unaffected either way.
 func (e *Engine) newBatchexecuteClient(jar *cookiejar.Jar, hc *httpx.Client) *batchexecute.Client {
 	client := batchexecute.New(jar, hc)
+	client.SetBrowserRPCTransport(func(ctx context.Context, requestURL, body, captchaAction, captchaPlaceholder string) (int, string, error) {
+		if e.bridge == nil {
+			return 0, "", fmt.Errorf("engine: this Flow RPC requires a connected browser extension")
+		}
+		browser := e.bridge.Current()
+		if browser == nil || !browser.Connected() {
+			return 0, "", fmt.Errorf("engine: this Flow RPC requires a connected browser extension")
+		}
+		var status int
+		var responseText string
+		err := e.bridge.WithProfileOperation(ctx, browser, func() error {
+			var callErr error
+			status, responseText, callErr = browser.FlowRPC(ctx, requestURL, body, captchaAction, captchaPlaceholder)
+			return callErr
+		})
+		return status, responseText, err
+	})
 
 	e.mu.RLock()
 	fp := e.fingerprint
@@ -2629,7 +2646,9 @@ func (e *Engine) GenerateVideo(ctx context.Context, req VideoRequest) (*VideoOut
 		log.Printf("engine: could not record the job: %v", err)
 	}
 
-	cost := config.CreditsPerVideo[req.Duration] * req.Count
+	// Do not gate submission on a cached balance. Flow decides whether the
+	// account can accept the requested render.
+	cost := 0
 
 	// The widget only exists in a Flow editor, so the browser has to be sitting
 	// on one before a page-minted token can be asked for.
@@ -3094,8 +3113,10 @@ type BatchVideoRequest struct {
 	EndImage   string
 	// StartFrame and EndFrame are the per-image crop values. The app sends them
 	// with every condition image and a submission without them returns empty.
-	StartFrame []float64
-	EndFrame   []float64
+	StartFrame   []float64
+	EndFrame     []float64
+	ModeOverride *int
+	VideoOption  any
 }
 
 // BatchVideoOutcome is the result of a video submission.
@@ -3576,49 +3597,21 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 	}
 
 	client := e.newBatchexecuteClient(jar, e.hc)
-
-	// Decide whether this account can pay for the render before anything is spent
-	// on the request.
-	//
-	// This runs ahead of the reCAPTCHA mint deliberately: a token is a browser
-	// round trip, and minting one for a render the balance cannot cover wastes it
-	// and buries the real reason behind a captcha failure.
-	cost, known, _ := videoJobCost(req.Duration, req.Count, quality)
-	if !known {
-		log.Printf("engine: no recorded cost for %ds at %s; the balance cannot be checked "+
-			"before submitting", req.Duration, quality)
+	cost, knownCost, _ := videoJobCost(req.Duration, req.Count, quality)
+	plan := videoPlan{Model: model, Quality: quality, Cost: cost}
+	if !knownCost {
+		log.Printf("engine: no recorded cost for %ds at %s; submitting without a credit preflight",
+			req.Duration, quality)
 	}
-
-	// ensureAffordable reads the balance and, when this account cannot pay and
-	// the request is allowed to travel, moves to one that can — returning the
-	// rebuilt client, jar and project. `canMoveAccounts` is false when the
-	// request is conditioned on an existing asset, because moving accounts moves
-	// the project with it and the id would not be in the new listing.
-	target := e.ensureAffordable(ctx, generationTarget{
-		Client: client, Jar: jar, ProjectID: projectID,
-	}, cost, canMoveAccounts(req))
-	client, jar, projectID = target.Client, target.Jar, target.ProjectID
-
-	// The refusal is decided here rather than inside ensureAffordable, so the
-	// message keeps quoting the duration, quality and count the price came from.
-	// decideVideoPlan is the tested statement of that rule — including that an
-	// unaffordable quality is refused rather than quietly downgraded.
-	plan := decideVideoPlan(req.Duration, req.Count, model, quality, target.Balance)
-	if !plan.Affordable() {
-		err := &InsufficientCreditsError{Message: "engine: " + plan.Reason}
-		e.finishJob(jobID, "failed", nil, start, err, accountID)
-		return nil, err
-	}
-	model, quality = plan.Model, plan.Quality
 
 	// startImage/endImage take content ids, not media ids. Resolve whatever the
 	// caller supplied so a freshly uploaded file's media id also works.
-	startImage, err := e.conditionImageID(ctx, req.StartImage)
+	startImage, err := e.conditionImageIDInProject(ctx, req.StartImage, projectID)
 	if err != nil {
 		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		return nil, err
 	}
-	endImage, err := e.conditionImageID(ctx, req.EndImage)
+	endImage, err := e.conditionImageIDInProject(ctx, req.EndImage, projectID)
 	if err != nil {
 		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		return nil, err
@@ -3651,6 +3644,8 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 			EndImage:     endImage,
 			StartFrame:   req.StartFrame,
 			EndFrame:     req.EndFrame,
+			ModeOverride: req.ModeOverride,
+			VideoOption:  req.VideoOption,
 		}, e.captchaOptions(recaptcha.ActionVideo, batchexecute.CallOptions{
 			SourcePath: "/project/" + projectID,
 			BuildLabel: config.BuildLabel(),
@@ -3931,35 +3926,13 @@ func (e *Engine) EditVideoViaBatch(ctx context.Context, req BatchEditRequest) (*
 	}
 	client := e.newBatchexecuteClient(jar, e.hc)
 
-	// Can this account pay for an edit? Before this, the path minted a token and
-	// submitted, and the server accepted a job the balance could not cover and
-	// answered with no media — which reads as a broken request rather than as an
-	// empty wallet.
-	//
-	// The check runs before the mint and before the source is resolved, for the
-	// same reason it does on the video path: a token is a browser round trip and
-	// resolving an asset is a listing read, and neither should be spent on a job
-	// that cannot be paid for.
-	//
-	// An edit cannot move accounts. Its source is an asset id inside this
-	// account's project, and moving accounts moves the project with it — so the
-	// id would not be in the new listing. See canMoveAccounts.
-	target := e.ensureAffordable(ctx, generationTarget{
-		Client: client, Jar: jar, ProjectID: projectID,
-	}, config.CreditsPerVideoEdit, false)
-	client, projectID = target.Client, target.ProjectID
-	if err := e.refuseIfShort(target, config.CreditsPerVideoEdit, "a video edit"); err != nil {
-		e.finishJob(jobID, "failed", nil, start, err, accountID)
-		return nil, err
-	}
-
 	captcha, err := e.CaptchaToken(ctx, recaptcha.ActionVideo)
 	if err != nil {
 		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
 	}
 
-	source, err := e.conditionImageID(ctx, req.Source)
+	source, err := e.conditionImageIDInProject(ctx, req.Source, projectID)
 	if err != nil {
 		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		return nil, err
@@ -4054,8 +4027,10 @@ type BatchReferenceRequest struct {
 	Quality   string
 	ProjectID string
 	// Wait polls until the render is downloadable. Download implies Wait.
-	Wait     bool
-	Download bool
+	Wait         bool
+	Download     bool
+	ModeOverride *int
+	VideoOption  any
 }
 
 // ReferenceImageData is an image supplied inline instead of by local path or
@@ -4144,33 +4119,10 @@ func (e *Engine) GenerateVideoFromReferencesViaBatch(ctx context.Context, req Ba
 	}
 	client := e.newBatchexecuteClient(jar, e.hc)
 
-	// Can this account pay for a reference render? Same reasoning as the edit
-	// path: without the check the submission is accepted and answered with
-	// nothing, which reads as a broken request rather than as an empty wallet.
-	//
-	// A reference render cannot move accounts either. Its references are asset
-	// ids inside this account's project, and moving accounts moves the project
-	// with it — so they would not be in the new listing.
-	target := e.ensureAffordable(ctx, generationTarget{
-		Client: client, Jar: jar, ProjectID: projectID,
-	}, config.CreditsPerReferenceVideo, false)
-	client, projectID = target.Client, target.ProjectID
-	if err := e.refuseIfShort(target, config.CreditsPerReferenceVideo,
-		"a reference-image video"); err != nil {
-		e.finishJob(jobID, "failed", nil, start, err, accountID)
-		return nil, err
-	}
-
-	captcha, err := e.CaptchaToken(ctx, recaptcha.ActionVideo)
-	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err, accountID)
-		return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
-	}
-
 	// The RPC takes content ids, the same as the condition images do.
 	refs := make([]string, 0, len(req.References))
 	for _, ref := range req.References {
-		resolved, err := e.conditionImageID(ctx, ref)
+		resolved, err := e.conditionImageIDInProject(ctx, ref, projectID)
 		if err != nil {
 			e.finishJob(jobID, "failed", nil, start, err, accountID)
 			return nil, err
@@ -4202,6 +4154,16 @@ func (e *Engine) GenerateVideoFromReferencesViaBatch(ctx context.Context, req Ba
 		}
 		refs = append(refs, contentID)
 	}
+	if err := awaitProjectContentIDs(ctx, client, projectID, refs, "video reference images"); err != nil {
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
+		return nil, err
+	}
+
+	captcha, err := e.CaptchaToken(ctx, recaptcha.ActionVideo)
+	if err != nil {
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
+		return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
+	}
 
 	frames, err := client.GenerateVideoFromReferences(ctx, batchexecute.ReferenceVideoRequest{
 		ProjectID:    projectID,
@@ -4209,6 +4171,8 @@ func (e *Engine) GenerateVideoFromReferencesViaBatch(ctx context.Context, req Ba
 		Prompt:       req.Prompt,
 		References:   refs,
 		CaptchaToken: captcha,
+		ModeOverride: req.ModeOverride,
+		VideoOption:  req.VideoOption,
 	}, e.captchaOptions(recaptcha.ActionVideo, batchexecute.CallOptions{
 		SourcePath: "/project/" + projectID,
 		BuildLabel: config.BuildLabel(),
@@ -4386,6 +4350,44 @@ func awaitAsset(ctx context.Context, resolve func() (bool, error)) (bool, error)
 	}
 }
 
+// awaitProjectContentIDs waits until every uploaded content ID appears in the
+// selected project's asset listing before a generation RPC refers to it.
+func awaitProjectContentIDs(ctx context.Context, client *batchexecute.Client, projectID string,
+	contentIDs []string, description string) error {
+	expected := make(map[string]struct{}, len(contentIDs))
+	for _, id := range contentIDs {
+		if strings.TrimSpace(id) != "" {
+			expected[id] = struct{}{}
+		}
+	}
+	if len(expected) == 0 {
+		return nil
+	}
+
+	found, err := awaitAsset(ctx, func() (bool, error) {
+		assets, err := client.ProjectAssets(ctx, projectID)
+		if err != nil {
+			return false, err
+		}
+		present := make(map[string]struct{}, len(expected))
+		for _, asset := range assets {
+			if _, ok := expected[asset.ContentID]; ok {
+				present[asset.ContentID] = struct{}{}
+			}
+		}
+		return len(present) == len(expected), nil
+	})
+	if err != nil {
+		return fmt.Errorf("engine: checking %s in project %s: %w", description, projectID, err)
+	}
+	if !found {
+		return fmt.Errorf("engine: %s did not appear in project %s within %s",
+			description, projectID, assetResolveWindow)
+	}
+	log.Printf("engine: all %d %s are visible in project %s", len(expected), description, projectID)
+	return nil
+}
+
 // conditionImageID resolves whatever the caller supplied into the id a generation
 // actually needs — the asset's *content* id.
 //
@@ -4397,11 +4399,21 @@ func awaitAsset(ctx context.Context, resolve func() (bool, error)) (bool, error)
 // An id that is not in the listing yet is retried rather than rejected, for the
 // upload reason above.
 func (e *Engine) conditionImageID(ctx context.Context, id string) (string, error) {
+	return e.conditionImageIDInProject(ctx, id, e.ProjectID())
+}
+
+func (e *Engine) conditionImageIDInProject(ctx context.Context, id, projectID string) (string, error) {
 	if strings.TrimSpace(id) == "" {
 		return "", nil
 	}
 	if !e.Ready() {
 		return "", fmt.Errorf("engine: not ready — call Bootstrap first")
+	}
+	if projectID == "" {
+		projectID = e.ProjectID()
+	}
+	if projectID == "" {
+		return "", fmt.Errorf("engine: no project id resolved")
 	}
 
 	if info, err := os.Stat(id); err == nil && !info.IsDir() {
@@ -4415,6 +4427,14 @@ func (e *Engine) conditionImageID(ctx context.Context, id string) (string, error
 			return "", fmt.Errorf("engine: upload condition image %s: %w", id, err)
 		}
 		if contentID != "" {
+			jar := e.Jar()
+			if jar == nil {
+				return "", fmt.Errorf("engine: no cookies loaded")
+			}
+			client := e.newBatchexecuteClient(jar, e.hc)
+			if err := awaitProjectContentIDs(ctx, client, projectID, []string{contentID}, "uploaded condition image"); err != nil {
+				return "", err
+			}
 			return contentID, nil
 		}
 		id = mediaID
@@ -4436,7 +4456,7 @@ func (e *Engine) conditionImageID(ctx context.Context, id string) (string, error
 
 	resolved := ""
 	found, err := awaitAsset(ctx, func() (bool, error) {
-		assets, err := client.ProjectAssets(ctx, e.ProjectID())
+		assets, err := client.ProjectAssets(ctx, projectID)
 		if err != nil {
 			return false, err
 		}
@@ -4834,12 +4854,6 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 	}
 
 	client := e.newBatchexecuteClient(jar, e.hc)
-
-	target := e.ensureAffordable(ctx, generationTarget{
-		Client: client, Jar: jar, ProjectID: projectID,
-	}, 0, true)
-	client, projectID = target.Client, target.ProjectID
-
 	maxAttempts := 1
 	if autoRetryEnabled() {
 		maxAttempts = 3
@@ -4858,45 +4872,27 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 			}
 			referenceMediaIDs = append(referenceMediaIDs, uploaded...)
 
-			expected := make(map[string]struct{}, len(uploaded))
-			for _, contentID := range uploaded {
-				expected[contentID] = struct{}{}
-			}
-			log.Printf("engine: checking project listing for %d uploaded image reference(s)", len(expected))
-			found, waitErr := awaitAsset(ctx, func() (bool, error) {
-				assets, listErr := client.ProjectAssets(ctx, projectID)
-				if listErr != nil {
-					return false, listErr
-				}
-				present := make(map[string]struct{}, len(expected))
-				for _, asset := range assets {
-					if _, ok := expected[asset.ContentID]; ok {
-						present[asset.ContentID] = struct{}{}
-					}
-				}
-				return len(present) == len(expected), nil
-			})
-			if waitErr != nil {
-				e.finishJob(jobID, "failed", nil, start, waitErr, accountID)
-				return nil, fmt.Errorf("engine: checking uploaded image references in project: %w", waitErr)
-			}
-			if !found {
-				err := fmt.Errorf("engine: uploaded image references did not appear in project %s within %s", projectID, assetResolveWindow)
+			if waitErr := awaitProjectContentIDs(ctx, client, projectID, uploaded, "uploaded image references"); waitErr != nil {
+				err := waitErr
 				e.finishJob(jobID, "failed", nil, start, err, accountID)
 				return nil, err
 			}
-			log.Printf("engine: all %d uploaded image reference(s) are visible in the project", len(expected))
 		}
 
-		// Mint the generation token after upload/listing confirmation so a delayed
-		// project listing does not age it before the generation request is sent.
+		// Mint after upload/listing confirmation so a delayed project listing
+		// does not age the token before the generation request is sent. In broker
+		// mode this asks the extension for a page-minted token first; the token
+		// then travels through Go in the RPC body.
 		captcha, err := e.CaptchaToken(ctx, recaptcha.ActionImage)
 		if err != nil {
 			e.finishJob(jobID, "failed", nil, start, err, accountID)
 			return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
 		}
-
 		reportPhase(ctx, "submitting", "sending image generation request")
+		callOptions := e.captchaOptions(recaptcha.ActionImage, batchexecute.CallOptions{
+			SourcePath: "/project/" + projectID,
+			BuildLabel: config.BuildLabel(),
+		})
 		media, err = client.GenerateMedia(ctx, batchexecute.GenerateRequest{
 			ProjectID:         projectID,
 			ReferenceMediaIDs: referenceMediaIDs,
@@ -4905,10 +4901,7 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 			Count:             count,
 			AspectRatio:       req.Aspect,
 			CaptchaToken:      captcha,
-		}, e.captchaOptions(recaptcha.ActionImage, batchexecute.CallOptions{
-			SourcePath: "/project/" + projectID,
-			BuildLabel: config.BuildLabel(),
-		}))
+		}, callOptions)
 
 		rejected = nil
 		if err != nil && !errors.As(err, &rejected) {

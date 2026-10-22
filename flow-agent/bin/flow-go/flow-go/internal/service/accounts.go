@@ -33,6 +33,7 @@ type AccountManager struct {
 	store             *store.Store
 	bridge            *bridge.Bridge
 	workers           int
+	captchaMode       string
 	strictFresh       bool
 	mu                sync.RWMutex
 	backgroundMu      sync.Mutex
@@ -83,6 +84,8 @@ type generationPayload struct {
 	References        []string                    `json:"references,omitempty"`
 	ReferenceData     []engine.ReferenceImageData `json:"reference_data,omitempty"`
 	ReferenceMediaIDs []string                    `json:"reference_media_ids,omitempty"`
+	VideoMode         *int                        `json:"video_mode,omitempty"`
+	VideoOption       any                         `json:"video_option,omitempty"`
 	AccountID         string                      `json:"account_id"`
 	AllAccounts       bool                        `json:"all_accounts"`
 	Cookies           string                      `json:"cookies"`
@@ -102,7 +105,7 @@ func NewAccountManager(st *store.Store, br *bridge.Bridge, workers int) (*Accoun
 
 // NewAccountManagerWithMediaLimits shares poll and download limits across all
 // per-account engines without coupling them to the account submission slots.
-func NewAccountManagerWithMediaLimits(st *store.Store, br *bridge.Bridge, workers, pollLimit, downloadLimit int) (*AccountManager, error) {
+func NewAccountManagerWithMediaLimits(st *store.Store, br *bridge.Bridge, workers, pollLimit, downloadLimit int, captchaModes ...string) (*AccountManager, error) {
 	if st == nil || br == nil {
 		return nil, fmt.Errorf("service: account manager requires a store and browser bridge")
 	}
@@ -120,6 +123,9 @@ func NewAccountManagerWithMediaLimits(st *store.Store, br *bridge.Bridge, worker
 		reloadLocks: make(map[string]*sync.Mutex), updates: make(chan bridge.CookieUpdate, 128),
 		global: make(chan struct{}, workers), mediaPollGate: make(chan struct{}, pollLimit),
 		mediaDownloadGate: make(chan struct{}, downloadLimit), done: make(chan struct{}), initialized: make(chan struct{}),
+	}
+	if len(captchaModes) > 0 {
+		manager.captchaMode = captchaModes[0]
 	}
 	manager.runtimeFactory = manager.buildAccountRuntime
 	return manager, nil
@@ -256,6 +262,7 @@ func (m *AccountManager) buildAccountRuntime(ctx context.Context, id, path strin
 	localBridge := m.bridge.AccountView(id)
 	eng, err := engine.New(m.store, localBridge, engine.Options{
 		AccountID: id, CookieFile: path, DefaultProjectID: config.ProjectID, RefreshCreditsOnBoot: true,
+		CaptchaMode:   m.captchaMode,
 		MediaPollGate: m.mediaPollGate, MediaDownloadGate: m.mediaDownloadGate,
 		SchedulerOwnsFailover: true,
 	})
@@ -920,7 +927,9 @@ func (m *AccountManager) runOne(ctx context.Context, jobID, kind string, payload
 	if strings.TrimSpace(payload.Prompt) == "" && kind != "upload-video" {
 		return nil, fmt.Errorf("service: prompt is required")
 	}
-	cost := generationCreditCost(kind, payload)
+	// Generation submission no longer waits for a credit preflight. Flow remains
+	// authoritative about whether the account can accept the requested render.
+	cost := 0
 	var scheduled *pool.Worker
 	var err error
 	if accountID != "" {
@@ -1028,6 +1037,7 @@ func (m *AccountManager) runOne(ctx context.Context, jobID, kind string, payload
 			return runtime.engine.GenerateVideoFromReferencesViaBatch(ctx, engine.BatchReferenceRequest{
 				Prompt: payload.Prompt, References: payload.References, ReferenceData: payload.ReferenceData, ProjectID: payload.ProjectID,
 				Duration: duration, Quality: payload.Quality, Wait: !payload.NoDownload, Download: !payload.NoDownload,
+				ModeOverride: payload.VideoMode, VideoOption: payload.VideoOption,
 			})
 		}
 		duration := 8
@@ -1046,6 +1056,7 @@ func (m *AccountManager) runOne(ctx context.Context, jobID, kind string, payload
 			Prompt: payload.Prompt, Aspect: payload.Aspect, ProjectID: payload.ProjectID, Duration: duration,
 			Quality: payload.Quality, Count: count, StartImage: payload.StartImage,
 			Wait: !payload.NoDownload, Download: !payload.NoDownload,
+			ModeOverride: payload.VideoMode, VideoOption: payload.VideoOption,
 		})
 	default:
 		return nil, fmt.Errorf("service: unsupported job kind %q", kind)
@@ -1083,23 +1094,6 @@ func (m *AccountManager) validateReferenceOwnership(ctx context.Context, e *engi
 		}
 	}
 	return nil
-}
-
-// refreshImageBalance reads the authoritative balance immediately before an
-// image submission and publishes it to the scheduler and account store. A
-// failed balance read is best-effort: it must not prevent image generation.
-func (m *AccountManager) refreshImageBalance(ctx context.Context, runtime *accountRuntime) {
-	if runtime == nil || runtime.engine == nil {
-		return
-	}
-	creditCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	credits, err := runtime.engine.Credits(creditCtx)
-	if err != nil {
-		log.Printf("service: refresh image balance for account %s: %v", runtime.id, err)
-		return
-	}
-	m.publishObservedBalance(runtime, credits)
 }
 
 func (m *AccountManager) startBackground(task func()) bool {
@@ -1277,7 +1271,6 @@ func (m *AccountManager) generateImage(ctx context.Context, runtime *accountRunt
 	if count > 4 {
 		return nil, fmt.Errorf("service: image count must be between 1 and 4")
 	}
-	m.refreshImageBalance(ctx, runtime)
 	referenceMediaIDs := make([]string, 0, len(payload.ReferenceMediaIDs))
 	for _, mediaID := range payload.ReferenceMediaIDs {
 		referenceMediaIDs = append(referenceMediaIDs, strings.TrimSpace(mediaID))

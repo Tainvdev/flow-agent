@@ -12,6 +12,7 @@
  *   flow.navigate     move the attached tab, inside the tab scope
  *   flow.projects     the project links on the current page
  *   flow.captcha      is the client loaded, and mint a token for an action
+ *   flow.rpc          submit an allowlisted Flow RPC to Flow
  *
  * Every operation above is load-bearing and must not be trimmed. The engine's
  * Bootstrap resolves its project through flow.navigate + flow.projects, reached
@@ -42,6 +43,7 @@ let socket = null;
 let reconnectTimer = null;
 let attachedTabId = null;
 let config = null;
+let lastFlowRPCReqId = 0;
 
 // The tab this extension opened for itself, and nothing else.
 //
@@ -563,7 +565,7 @@ async function dispatch(op, params = {}) {
           'tabs.list', 'tabs.open', 'tab.attach', 'tab.detach', 'tab.current',
           'events.read', 'cookies.list', 'cookies.names',
           'flow.fingerprint', 'flow.navigate', 'flow.projects',
-          'flow.captcha', 'flow.at', 'status',
+          'flow.captcha', 'flow.at', 'flow.rpc', 'flow.rpc.inline_captcha', 'status',
         ],
       };
 
@@ -746,6 +748,109 @@ async function dispatch(op, params = {}) {
     case 'flow.at': {
       const t = await inPage(readPageTokens);
       return { at: String((t && t.at) || ''), fsid: String((t && t.fsid) || '') };
+    }
+
+    case 'flow.rpc': {
+      const rawURL = String(params.url || '');
+      const body = String(params.body || '');
+      const captchaAction = String(params.captcha_action || '');
+      const captchaPlaceholder = String(params.captcha_placeholder || '');
+      const parsed = new URL(rawURL);
+      const allowedRPCs = new Set(['ogiZ0b', 'YhhmEf', 'nprQif', 'eb1hJf', 'MZZa6b', 'jIps6']);
+      if (parsed.origin !== 'https://flow.google.com' || parsed.pathname !== '/_/AiSandboxAngularFrontend/data/batchexecute' || parsed.username || parsed.password || parsed.hash) {
+        throw new Error('Refusing a request outside the fixed Flow batchexecute endpoint');
+      }
+      if (parsed.searchParams.get('rpcids') && !allowedRPCs.has(parsed.searchParams.get('rpcids'))) {
+        throw new Error('Refusing a non-allowlisted Flow RPC');
+      }
+      const form = new URLSearchParams(body);
+      if (form.getAll('f.req').length !== 1 || [...form.keys()].some((key) => key !== 'f.req' && key !== 'at')) {
+        throw new Error('Unexpected batchexecute form fields');
+      }
+      let envelope;
+      try { envelope = JSON.parse(form.get('f.req') || ''); } catch { throw new Error('Invalid batchexecute form body'); }
+      const rpcID = envelope?.[0]?.[0]?.[0];
+      if (!allowedRPCs.has(rpcID) || parsed.searchParams.get('rpcids') !== rpcID || !form.has('f.req')) {
+        throw new Error('Refusing a body that does not match an allowlisted Flow RPC');
+      }
+      if (captchaAction) {
+        if (rpcID !== 'ogiZ0b' || captchaAction !== 'IMAGE_GENERATION') {
+          throw new Error('Inline captcha is only supported for image generation');
+        }
+        const fReq = form.get('f.req') || '';
+        if (!captchaPlaceholder || !fReq.includes(captchaPlaceholder)) {
+          throw new Error('Image request is missing the inline captcha placeholder');
+        }
+      }
+      const siteKey = cfg.recaptchaSiteKey || '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV';
+      const response = await inPage(async (url, encodedBody, action, key, placeholder, lastAssignedReqId) => {
+        const requestURL = new URL(url);
+        const observedReqId = performance.getEntriesByType('resource').reduce((max, entry) => {
+          try {
+            const observedURL = new URL(entry.name);
+            if (observedURL.origin !== requestURL.origin || observedURL.pathname !== requestURL.pathname) return max;
+            const value = Number(observedURL.searchParams.get('_reqid'));
+            return Number.isSafeInteger(value) ? Math.max(max, value) : max;
+          } catch {
+            return max;
+          }
+        }, 0);
+        const previousReqId = Math.max(lastAssignedReqId, observedReqId);
+        let reqId;
+        if (previousReqId > 0) {
+          reqId = previousReqId + 100000;
+        } else {
+          const now = new Date();
+          const secondsSinceMidnight = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+          reqId = secondsSinceMidnight + 1;
+        }
+        requestURL.searchParams.set('_reqid', String(reqId));
+        const orderedParams = new URLSearchParams();
+        const orderedKeys = ['rpcids', 'source-path', 'bl', 'f.sid', 'hl', '_reqid', 'rt'];
+        for (const key of orderedKeys) {
+          for (const value of requestURL.searchParams.getAll(key)) orderedParams.append(key, value);
+        }
+        for (const [key, value] of requestURL.searchParams) {
+          if (!orderedKeys.includes(key)) orderedParams.append(key, value);
+        }
+        requestURL.search = orderedParams.toString();
+        if (action) {
+          if (!window.grecaptcha || !window.grecaptcha.enterprise) {
+            throw new Error('the Flow page has no reCAPTCHA enterprise client loaded');
+          }
+          await new Promise((resolve) => window.grecaptcha.enterprise.ready(resolve));
+          const executeSource = Function.prototype.toString.call(window.grecaptcha.enterprise.execute);
+          if (executeSource.includes('extension_hijack_detected')) {
+            throw new Error(
+              'Flow reCAPTCHA execute wrapper detected: the page may rewrite this action; RPC was not sent',
+            );
+          }
+          const token = await window.grecaptcha.enterprise.execute(key, { action });
+          if (typeof token !== 'string' || !token) throw new Error('reCAPTCHA returned an empty token');
+          const form = new URLSearchParams(encodedBody);
+          const fReq = form.get('f.req') || '';
+          if (!placeholder || !fReq.includes(placeholder)) {
+            throw new Error('inline captcha placeholder was missing');
+          }
+          // The image builder repeats its context block at the request level
+          // and the payload level. Both copies must carry the same minted token.
+          form.set('f.req', fReq.split(placeholder).join(token));
+          encodedBody = form.toString();
+        }
+        const response = await fetch(requestURL.toString(), {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+            'x-same-domain': '1',
+          },
+          body: encodedBody,
+        });
+        return { status: response.status, text: await response.text(), captcha_minted: !!action, reqid: reqId };
+      }, [rawURL, body, captchaAction, siteKey, captchaPlaceholder, lastFlowRPCReqId]);
+      if (Number.isSafeInteger(response?.reqid)) lastFlowRPCReqId = response.reqid;
+      if (response?.captcha_minted) state.captchaMints++;
+      return response;
     }
 
     case 'flow.captcha': {
