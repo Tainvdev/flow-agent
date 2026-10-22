@@ -3506,21 +3506,15 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 		return nil, err
 	}
 
-	// Image generation is extension-only. Do not use the Go CAPTCHA provider,
+	// Video generation is extension-only. Do not use the Go CAPTCHA provider,
 	// escalation path, or automatic replay here: the browser page must mint and
-	// insert the token for the one submission. Video keeps the older retry policy.
+	// insert the token for the one submission.
 	maxAttempts := 1
 
 	var frames []batchexecute.Frame
 	var rejected *batchexecute.RejectedError
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		captcha, err := e.CaptchaToken(ctx, recaptcha.ActionVideo)
-		if err != nil {
-			e.finishJob(jobID, "failed", nil, start, err, accountID)
-			return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
-		}
-
 		reportPhase(ctx, "submitting", "sending video generation request")
 		frames, err = client.GenerateVideo(ctx, batchexecute.GenerateVideoRequest{
 			ProjectID:    projectID,
@@ -3528,17 +3522,18 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 			Prompt:       req.Prompt,
 			Count:        req.Count,
 			AspectRatio:  req.Aspect,
-			CaptchaToken: captcha,
+			CaptchaToken: batchexecute.BrowserCaptchaTokenPlaceholder,
 			StartImage:   startImage,
 			EndImage:     endImage,
 			StartFrame:   req.StartFrame,
 			EndFrame:     req.EndFrame,
 			ModeOverride: req.ModeOverride,
 			VideoOption:  req.VideoOption,
-		}, e.captchaOptions(recaptcha.ActionVideo, batchexecute.CallOptions{
-			SourcePath: "/project/" + projectID,
-			BuildLabel: config.BuildLabel(),
-		}))
+		}, batchexecute.CallOptions{
+			SourcePath:           "/project/" + projectID,
+			BuildLabel:           config.BuildLabel(),
+			BrowserCaptchaAction: recaptcha.ActionVideo,
+		})
 
 		rejected = nil
 		if err != nil && !errors.As(err, &rejected) {
@@ -3815,12 +3810,6 @@ func (e *Engine) EditVideoViaBatch(ctx context.Context, req BatchEditRequest) (*
 	}
 	client := e.newBatchexecuteClient(jar, e.hc)
 
-	captcha, err := e.CaptchaToken(ctx, recaptcha.ActionVideo)
-	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err, accountID)
-		return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
-	}
-
 	source, err := e.conditionImageIDInProject(ctx, req.Source, projectID)
 	if err != nil {
 		e.finishJob(jobID, "failed", nil, start, err, accountID)
@@ -3832,11 +3821,12 @@ func (e *Engine) EditVideoViaBatch(ctx context.Context, req BatchEditRequest) (*
 		SourceID:     source,
 		Prompt:       req.Prompt,
 		Model:        model,
-		CaptchaToken: captcha,
-	}, e.captchaOptions(recaptcha.ActionVideo, batchexecute.CallOptions{
-		SourcePath: "/project/" + projectID,
-		BuildLabel: config.BuildLabel(),
-	}))
+		CaptchaToken: batchexecute.BrowserCaptchaTokenPlaceholder,
+	}, batchexecute.CallOptions{
+		SourcePath:           "/project/" + projectID,
+		BuildLabel:           config.BuildLabel(),
+		BrowserCaptchaAction: recaptcha.ActionVideo,
+	})
 	if err != nil {
 		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		_ = e.store.RecordAccountOutcome(e.AccountID(), true, err.Error())
@@ -4048,24 +4038,19 @@ func (e *Engine) GenerateVideoFromReferencesViaBatch(ctx context.Context, req Ba
 		return nil, err
 	}
 
-	captcha, err := e.CaptchaToken(ctx, recaptcha.ActionVideo)
-	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err, accountID)
-		return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
-	}
-
 	frames, err := client.GenerateVideoFromReferences(ctx, batchexecute.ReferenceVideoRequest{
 		ProjectID:    projectID,
 		Model:        model,
 		Prompt:       req.Prompt,
 		References:   refs,
-		CaptchaToken: captcha,
+		CaptchaToken: batchexecute.BrowserCaptchaTokenPlaceholder,
 		ModeOverride: req.ModeOverride,
 		VideoOption:  req.VideoOption,
-	}, e.captchaOptions(recaptcha.ActionVideo, batchexecute.CallOptions{
-		SourcePath: "/project/" + projectID,
-		BuildLabel: config.BuildLabel(),
-	}))
+	}, batchexecute.CallOptions{
+		SourcePath:           "/project/" + projectID,
+		BuildLabel:           config.BuildLabel(),
+		BrowserCaptchaAction: recaptcha.ActionVideo,
+	})
 	if err != nil {
 		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		_ = e.store.RecordAccountOutcome(e.AccountID(), true, err.Error())

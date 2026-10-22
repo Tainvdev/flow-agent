@@ -1,26 +1,70 @@
 // chrome.scripting serializes this function, so it cannot refer to module scope.
-export async function prepareImageRpc(engineBody) {
-  const log = (step, details = {}) => console.info('[Flow Bridge image RPC]', step, details);
-  const previous = window.__flowBridgeImageRpc;
-  if (previous && !previous.done) throw new Error('An image RPC is already pending in this tab');
+export async function prepareRpc(engineBody, label = 'image') {
+  const requestedRpc = label === 'image' ? 'ogiZ0b' : null;
+  const log = (step, details = {}) => console.info(`[Flow Bridge ${label} RPC]`, step, details);
+  const stateKey = label === 'image' ? '__flowBridgeImageRpc' : '__flowBridgeVideoRpc';
+  const previous = window[stateKey];
+  if (previous && !previous.done) throw new Error(`A ${label} RPC is already pending in this tab`);
 
   const engineForm = new URLSearchParams(engineBody);
   const engineEnvelope = JSON.parse(engineForm.get('f.req') || '');
   const engineCall = engineEnvelope?.[0]?.[0];
-  if (!Array.isArray(engineCall) || engineCall[0] !== 'ogiZ0b') {
-    throw new Error('Engine body is not an ogiZ0b envelope');
+  const rpcID = String(engineCall?.[0] || '');
+  if (!Array.isArray(engineCall) || (requestedRpc && rpcID !== requestedRpc) ||
+      (label === 'video' && !['YhhmEf', 'nprQif', 'eb1hJf', 'MZZa6b', 'jIps6'].includes(rpcID))) {
+    throw new Error(`Engine body is not an allowlisted ${label} envelope`);
   }
+  // Video CAPTCHA is shared by the video RPC family. Use the known browser
+  // request as the token source, while keeping the RPC/body prepared by Go as
+  // the request that is ultimately submitted.
+  const captureRpcID = label === 'video' ? 'YhhmEf' : rpcID;
   const engineArgument = typeof engineCall[1] === 'string'
     ? JSON.parse(engineCall[1]) : engineCall[1];
-  const contextToken = engineArgument?.[3]?.[10];
-  const requests = engineArgument?.[1];
-  if (!Array.isArray(contextToken) || !Array.isArray(requests) || !requests.length ||
-      requests.some((request) => !Array.isArray(request?.[7]?.[10]))) {
-    throw new Error('Engine body has no image CAPTCHA slots');
+  const captchaSlots = (argument) => {
+    if (rpcID === 'ogiZ0b') {
+      const slots = [argument?.[3]?.[10]];
+      for (const request of argument?.[1] || []) slots.push(request?.[7]?.[10]);
+      return slots;
+    }
+    return [argument?.[1]?.[10]];
+  };
+  const engineCaptchaSlots = captchaSlots(engineArgument);
+  if (engineCaptchaSlots.some((slot) => !Array.isArray(slot) || !slot.length) ||
+      (label === 'image' && (!Array.isArray(engineArgument?.[1]) || !engineArgument[1].length))) {
+    throw new Error(`Engine body has no ${label} CAPTCHA slots`);
   }
+
+  const desiredMode = label === 'image' ? 'Hình ảnh' : 'Video';
+  const normalizedText = (value) => String(value || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLocaleLowerCase();
+  const modeText = normalizedText(desiredMode);
+  const findModeItem = () => {
+    for (const container of document.querySelectorAll('.settings-content')) {
+      const candidates = [container, ...container.querySelectorAll('*')];
+      const exact = candidates.find((element) => normalizedText(element.textContent) === modeText);
+      if (exact) return exact;
+    }
+    return null;
+  };
+  const summary = document.querySelector('.settings-summary');
+  if (!summary) throw new Error('Flow settings summary was not found');
+  summary.click();
+  const modeDeadline = Date.now() + 2000;
+  let modeItem = findModeItem();
+  while (!modeItem && Date.now() < modeDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    modeItem = findModeItem();
+  }
+  if (!modeItem) throw new Error(`Flow ${desiredMode} mode item was not found`);
+  modeItem.click();
+  log('generation mode selected', { mode: desiredMode });
+
   log('engine payload parsed', {
-    rpc: 'ogiZ0b',
-    requests: requests.length,
+    rpc: rpcID,
+    requests: Array.isArray(engineArgument?.[0]) ? engineArgument[0].length :
+      (Array.isArray(engineArgument?.[1]) ? engineArgument[1].length : 1),
     bodyCharacters: engineBody.length,
     hasAtField: engineForm.has('at'),
     body: engineBody,
@@ -28,15 +72,15 @@ export async function prepareImageRpc(engineBody) {
 
   const originalFetch = window.fetch;
   const state = { done: false, originalFetch, result: null };
-  window.__flowBridgeImageRpc = state;
+  window[stateKey] = state;
 
-  const isImageRequest = (url, method) => {
+  const isTargetRequest = (url, method) => {
     try {
       const target = new URL(url, location.href);
       return method.toUpperCase() === 'POST' &&
         target.origin === 'https://flow.google.com' &&
         target.pathname === '/_/AiSandboxAngularFrontend/data/batchexecute' &&
-        target.searchParams.get('rpcids') === 'ogiZ0b';
+        target.searchParams.get('rpcids') === captureRpcID;
     } catch {
       return false;
     }
@@ -47,19 +91,19 @@ export async function prepareImageRpc(engineBody) {
     if (body instanceof URLSearchParams) return body.toString();
     if (typeof FormData !== 'undefined' && body instanceof FormData) {
       if ([...body.values()].some((value) => typeof value !== 'string')) {
-        throw new Error('Image request FormData contains a file');
+        throw new Error(`${label} request FormData contains a file`);
       }
       return new URLSearchParams(body).toString();
     }
-    throw new Error('Unsupported image request body type');
+    throw new Error(`Unsupported ${label} request body type`);
   };
 
   const wrappedFetch = async function (input, init) {
     const url = input instanceof Request ? input.url : String(input);
     const method = init?.method || (input instanceof Request ? input.method : 'GET');
-    if (!isImageRequest(url, method)) return originalFetch.call(this, input, init);
+    if (!isTargetRequest(url, method)) return originalFetch.call(this, input, init);
 
-    // Only one user-generated image request belongs to this flow.rpc call.
+    // Only one user-generated media request belongs to this flow.rpc call.
     window.fetch = originalFetch;
     let receivedResponse = null;
     try {
@@ -67,7 +111,8 @@ export async function prepareImageRpc(engineBody) {
         ? await input.clone().text()
         : init?.body);
       log('Flow source request captured', {
-        rpc: 'ogiZ0b',
+        rpc: captureRpcID,
+        engineRpc: rpcID,
         method: method.toUpperCase(),
         url,
         bodyType: init?.body === undefined && input instanceof Request ? 'Request' : typeof init?.body,
@@ -79,30 +124,30 @@ export async function prepareImageRpc(engineBody) {
       const sourceForm = new URLSearchParams(sourceBody);
       const envelope = JSON.parse(sourceForm.get('f.req') || '');
       const rpcCall = envelope?.[0]?.[0];
-      if (!Array.isArray(rpcCall) || rpcCall[0] !== 'ogiZ0b') {
-        throw new Error('Observed request is not an ogiZ0b envelope');
+      if (!Array.isArray(rpcCall) || rpcCall[0] !== captureRpcID) {
+        throw new Error(`Observed request is not a ${captureRpcID} envelope`);
       }
       const argument = typeof rpcCall[1] === 'string' ? JSON.parse(rpcCall[1]) : rpcCall[1];
-      const captcha = argument?.[3]?.[10]?.[0] ?? argument?.[1]?.[0]?.[7]?.[10]?.[0];
+      const observedCaptchaSlots = captchaSlots(argument);
+      const captcha = observedCaptchaSlots.map((slot) => slot?.[0])
+        .find((value) => typeof value === 'string' && value);
       const at = sourceForm.get('at');
       if (typeof captcha !== 'string' || !captcha || !at) {
-        throw new Error('Observed image request has no CAPTCHA or at token');
+        throw new Error(`Observed ${label} request has no CAPTCHA or at token`);
       }
       log('request tokens extracted', { captcha, at, captchaLength: captcha.length, atLength: at.length });
 
-      contextToken[0] = captcha;
-      for (const request of requests) {
-        const requestToken = request?.[7]?.[10];
-        requestToken[0] = captcha;
-      }
+      for (const slot of engineCaptchaSlots) slot[0] = captcha;
       engineCall[1] = JSON.stringify(engineArgument);
       engineForm.set('f.req', JSON.stringify(engineEnvelope));
       engineForm.set('at', at);
       const replacement = engineForm.toString();
+      const targetURL = new URL(url, location.href);
+      targetURL.searchParams.set('rpcids', rpcID);
       log('engine body populated with captured tokens', {
-        rpc: 'ogiZ0b',
-        requests: requests.length,
-        captchaSlotsReplaced: requests.length + 1,
+        rpc: rpcID,
+        capturedFromRpc: captureRpcID,
+        captchaSlotsReplaced: engineCaptchaSlots.length,
         atReplaced: true,
         bodyCharacters: replacement.length,
         body: replacement,
@@ -111,15 +156,28 @@ export async function prepareImageRpc(engineBody) {
       if (init?.headers) new Headers(init.headers).forEach((value, name) => headers.set(name, value));
       headers.set('Content-Type', 'application/x-www-form-urlencoded;charset=UTF-8');
       if (input instanceof Request) {
-        input = new Request(input, { ...init, body: replacement, headers });
+        input = new Request(targetURL, {
+          method: input.method,
+          headers,
+          body: replacement,
+          credentials: input.credentials,
+          mode: input.mode,
+          cache: input.cache,
+          redirect: input.redirect,
+          referrer: input.referrer,
+          referrerPolicy: input.referrerPolicy,
+          integrity: input.integrity,
+          keepalive: input.keepalive,
+        });
         init = undefined;
       } else {
         init = { ...init, body: replacement, headers };
       }
       log('request body replaced', {
-        rpc: 'ogiZ0b',
+        rpc: rpcID,
         method: method.toUpperCase(),
-        url,
+        url: targetURL.toString(),
+        capturedFromUrl: url,
         bodyCharacters: replacement.length,
         body: replacement,
         contentType: headers.get('Content-Type'),
@@ -128,18 +186,18 @@ export async function prepareImageRpc(engineBody) {
         preservesOriginalRequest: input instanceof Request,
       });
       log('sending modified request to Flow', {
-        rpc: 'ogiZ0b',
+        rpc: rpcID,
         method: method.toUpperCase(),
-        url,
+        url: targetURL.toString(),
         body: replacement,
       });
-      const response = await originalFetch.call(this, input, init);
+      const response = await originalFetch.call(this, input instanceof Request ? input : targetURL.toString(), init);
       receivedResponse = response;
       const responseText = await response.clone().text();
       state.result = {
         status: response.status,
         text: responseText,
-        reqid: Number(new URL(url, location.href).searchParams.get('_reqid')) || null,
+        reqid: Number(targetURL.searchParams.get('_reqid')) || null,
       };
       state.done = true;
       log('Flow response received', {
@@ -153,7 +211,7 @@ export async function prepareImageRpc(engineBody) {
     } catch (error) {
       state.result = { error: String(error) };
       state.done = true;
-      console.error('[Flow Bridge image RPC] interception failed', error);
+      console.error(`[Flow Bridge ${label} RPC] interception failed`, error);
       if (receivedResponse) return receivedResponse;
       throw error;
     }

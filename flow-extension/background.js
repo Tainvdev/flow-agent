@@ -25,8 +25,8 @@
  * flow.upscale" rather than quietly doing nothing. That is the honest answer, and
  * the reason this note is here.
  *
- * Page-level work uses chrome.scripting.executeScript. The ogiZ0b flow.rpc
- * path also uses chrome.debugger briefly to click Flow's Generate button with
+ * Page-level work uses chrome.scripting.executeScript. Media flow.rpc paths
+ * also use chrome.debugger briefly to click Flow's Generate button with
  * browser input; other operations do not expose general DevTools commands.
  *
  * Wire format is the backend's: {id, op, params} in, {id, result} or
@@ -34,7 +34,7 @@
  */
 
 import { loadConfig, saveConfig, resetConfig, urlAllowed, domainAllowed } from './config.js';
-import { prepareImageRpc } from './image-rpc.js';
+import { prepareRpc } from './image-rpc.js';
 
 const PROTOCOL_VERSION = 1;
 
@@ -455,27 +455,28 @@ async function inPage(fn, args = []) {
   return results[0].result;
 }
 
-/** Generate one ogiZ0b request through Flow's UI and replace its body in MAIN world. */
-async function submitImageRpcThroughPage(engineBody) {
-  console.info('[Flow Bridge image RPC] engine body received', {
+/** Generate one Flow media request through the UI and replace its body in MAIN world. */
+async function submitRpcThroughPage(engineBody, label) {
+  const stateKey = label === 'image' ? '__flowBridgeImageRpc' : '__flowBridgeVideoRpc';
+  console.info(`[Flow Bridge ${label} RPC] engine body received`, {
     characters: engineBody.length,
     contentType: 'application/x-www-form-urlencoded',
     body: engineBody,
   });
   const tab = await resolveTab();
-  console.info('[Flow Bridge image RPC] preparing Flow page interceptor', { tabId: tab.id });
+  console.info(`[Flow Bridge ${label} RPC] preparing Flow page interceptor`, { tabId: tab.id });
   const target = { tabId: tab.id };
   const [prepared] = await chrome.scripting.executeScript({
     target,
     world: 'MAIN',
-    func: prepareImageRpc,
-    args: [engineBody],
+    func: prepareRpc,
+    args: [engineBody, label],
   });
   const point = prepared?.result;
   if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) {
-    throw new Error('Flow Generate button position was not available');
+    throw new Error(`Flow ${label} Generate button position was not available`);
   }
-  console.info('[Flow Bridge image RPC] Generate button ready', point);
+  console.info(`[Flow Bridge ${label} RPC] Generate button ready`, point);
 
   try {
     const debuggee = { tabId: tab.id };
@@ -491,11 +492,11 @@ async function submitImageRpcThroughPage(engineBody) {
           ...(type === 'mouseMoved' ? {} : { button: 'left', clickCount: 1 }),
         });
       }
-      console.info('[Flow Bridge image RPC] browser click dispatched', { tabId: tab.id });
+      console.info(`[Flow Bridge ${label} RPC] browser click dispatched`, { tabId: tab.id });
     } finally {
       if (attached) {
         try { await chrome.debugger.detach(debuggee); } catch (error) {
-          console.warn('[Flow Bridge image RPC] debugger detach failed', error);
+          console.warn(`[Flow Bridge ${label} RPC] debugger detach failed`, error);
         }
       }
     }
@@ -507,8 +508,8 @@ async function submitImageRpcThroughPage(engineBody) {
       const [snapshot] = await chrome.scripting.executeScript({
         target,
         world: 'MAIN',
-        func: () => {
-          const state = window.__flowBridgeImageRpc;
+        func: (key) => {
+          const state = window[key];
           return state && {
             done: state.done,
             clickSeen: state.clickSeen,
@@ -516,19 +517,20 @@ async function submitImageRpcThroughPage(engineBody) {
             result: state.done ? state.result : null,
           };
         },
+        args: [stateKey],
       });
       const state = snapshot?.result;
-      if (!state) throw new Error('Image RPC interceptor disappeared from the Flow tab');
+      if (!state) throw new Error(`${label} RPC interceptor disappeared from the Flow tab`);
       if (state.clickSeen && !clickLogged) {
-        console.info('[Flow Bridge image RPC] Generate click observed', { trusted: state.clickTrusted });
+        console.info(`[Flow Bridge ${label} RPC] Generate click observed`, { trusted: state.clickTrusted });
         clickLogged = true;
       }
       if (state.done) {
         if (state.result?.error) throw new Error(state.result.error);
         if (!state.result || !Number.isFinite(state.result.status)) {
-          throw new Error('Image RPC completed without a response');
+          throw new Error(`${label} RPC completed without a response`);
         }
-        console.info('[Flow Bridge image RPC] response received', {
+        console.info(`[Flow Bridge ${label} RPC] response received`, {
           status: state.result.status,
           reqid: state.result.reqid,
         });
@@ -542,20 +544,21 @@ async function submitImageRpcThroughPage(engineBody) {
       }
       await sleep(250);
     }
-    throw new Error('Timed out waiting for Flow image RPC response');
+    throw new Error(`Timed out waiting for Flow ${label} RPC response`);
   } finally {
     await chrome.scripting.executeScript({
       target,
       world: 'MAIN',
-      func: () => {
-        const state = window.__flowBridgeImageRpc;
+      func: (key) => {
+        const state = window[key];
         if (state && window.fetch === state.wrappedFetch) {
           window.fetch = state.originalFetch;
         }
         if (state) state.done = true;
       },
+      args: [stateKey],
     }).catch((error) => {
-      console.warn('[Flow Bridge image RPC] interceptor cleanup failed', error);
+      console.warn(`[Flow Bridge ${label} RPC] interceptor cleanup failed`, error);
     });
   }
 }
@@ -884,7 +887,7 @@ async function dispatch(op, params = {}) {
         if (captchaAction && captchaAction !== 'IMAGE_GENERATION') {
           throw new Error('Invalid captcha action for image generation');
         }
-        const imageResponse = await submitImageRpcThroughPage(body);
+        const imageResponse = await submitRpcThroughPage(body, 'image');
         console.info('[Flow Bridge flow.rpc] sending result to engine', {
           rpc: rpcID,
           status: imageResponse.status,
@@ -895,7 +898,18 @@ async function dispatch(op, params = {}) {
         return imageResponse;
       }
       if (captchaAction || captchaPlaceholder) {
-        throw new Error('CAPTCHA is supported only by the intercepted image request');
+        if (captchaAction && captchaAction !== 'VIDEO_GENERATION') {
+          throw new Error('Invalid captcha action for video generation');
+        }
+        const videoResponse = await submitRpcThroughPage(body, 'video');
+        console.info('[Flow Bridge flow.rpc] sending video result to engine', {
+          rpc: rpcID,
+          status: videoResponse.status,
+          responseCharacters: videoResponse.text?.length || 0,
+          response: videoResponse,
+        });
+        if (Number.isSafeInteger(videoResponse.reqid)) lastFlowRPCReqId = videoResponse.reqid;
+        return videoResponse;
       }
       const response = await inPage(async (url, encodedBody, lastAssignedReqId) => {
         const requestURL = new URL(url);
