@@ -26,16 +26,16 @@
  * flow.upscale" rather than quietly doing nothing. That is the honest answer, and
  * the reason this note is here.
  *
- * Everything page-level runs through chrome.scripting.executeScript rather than
- * chrome.debugger. That is the substantive difference from the generic bridge:
- * no `debugger` permission, so Chrome never shows the "started debugging this
- * browser" banner, and no generic escape hatch ships to a user.
+ * Page-level work uses chrome.scripting.executeScript. The ogiZ0b flow.rpc
+ * path also uses chrome.debugger briefly to click Flow's Generate button with
+ * browser input; other operations do not expose general DevTools commands.
  *
  * Wire format is the backend's: {id, op, params} in, {id, result} or
  * {id, error:{message}} out. Events are pushed as {event, params}.
  */
 
 import { loadConfig, saveConfig, resetConfig, urlAllowed, domainAllowed } from './config.js';
+import { prepareImageRpc } from './image-rpc.js';
 
 const PROTOCOL_VERSION = 1;
 
@@ -457,6 +457,111 @@ async function inPage(fn, args = []) {
   return results[0].result;
 }
 
+/** Generate one ogiZ0b request through Flow's UI and replace its body in MAIN world. */
+async function submitImageRpcThroughPage(engineBody) {
+  console.info('[Flow Bridge image RPC] engine body received', {
+    characters: engineBody.length,
+    contentType: 'application/x-www-form-urlencoded',
+    body: engineBody,
+  });
+  const tab = await resolveTab();
+  console.info('[Flow Bridge image RPC] preparing Flow page interceptor', { tabId: tab.id });
+  const target = { tabId: tab.id };
+  const [prepared] = await chrome.scripting.executeScript({
+    target,
+    world: 'MAIN',
+    func: prepareImageRpc,
+    args: [engineBody],
+  });
+  const point = prepared?.result;
+  if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) {
+    throw new Error('Flow Generate button position was not available');
+  }
+  console.info('[Flow Bridge image RPC] Generate button ready', point);
+
+  try {
+    const debuggee = { tabId: tab.id };
+    let attached = false;
+    try {
+      await chrome.debugger.attach(debuggee, '1.3');
+      attached = true;
+      for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
+        await chrome.debugger.sendCommand(debuggee, 'Input.dispatchMouseEvent', {
+          type,
+          x: point.x,
+          y: point.y,
+          ...(type === 'mouseMoved' ? {} : { button: 'left', clickCount: 1 }),
+        });
+      }
+      console.info('[Flow Bridge image RPC] browser click dispatched', { tabId: tab.id });
+    } finally {
+      if (attached) {
+        try { await chrome.debugger.detach(debuggee); } catch (error) {
+          console.warn('[Flow Bridge image RPC] debugger detach failed', error);
+        }
+      }
+    }
+
+    const deadline = Date.now() + 45000;
+    const clickDeadline = Date.now() + 2000;
+    let clickLogged = false;
+    while (Date.now() < deadline) {
+      const [snapshot] = await chrome.scripting.executeScript({
+        target,
+        world: 'MAIN',
+        func: () => {
+          const state = window.__flowBridgeImageRpc;
+          return state && {
+            done: state.done,
+            clickSeen: state.clickSeen,
+            clickTrusted: state.clickTrusted,
+            result: state.done ? state.result : null,
+          };
+        },
+      });
+      const state = snapshot?.result;
+      if (!state) throw new Error('Image RPC interceptor disappeared from the Flow tab');
+      if (state.clickSeen && !clickLogged) {
+        console.info('[Flow Bridge image RPC] Generate click observed', { trusted: state.clickTrusted });
+        clickLogged = true;
+      }
+      if (state.done) {
+        if (state.result?.error) throw new Error(state.result.error);
+        if (!state.result || !Number.isFinite(state.result.status)) {
+          throw new Error('Image RPC completed without a response');
+        }
+        console.info('[Flow Bridge image RPC] response received', {
+          status: state.result.status,
+          reqid: state.result.reqid,
+        });
+        return state.result;
+      }
+      if (Date.now() > clickDeadline && !state.clickSeen) {
+        throw new Error('Flow Generate did not receive the browser mouse click');
+      }
+      if (state.clickSeen && state.clickTrusted === false) {
+        throw new Error('Flow Generate received an untrusted click');
+      }
+      await sleep(250);
+    }
+    throw new Error('Timed out waiting for Flow image RPC response');
+  } finally {
+    await chrome.scripting.executeScript({
+      target,
+      world: 'MAIN',
+      func: () => {
+        const state = window.__flowBridgeImageRpc;
+        if (state && window.fetch === state.wrappedFetch) {
+          window.fetch = state.originalFetch;
+        }
+        if (state) state.done = true;
+      },
+    }).catch((error) => {
+      console.warn('[Flow Bridge image RPC] interceptor cleanup failed', error);
+    });
+  }
+}
+
 /**
  * The page's own request identity.
  *
@@ -751,6 +856,14 @@ async function dispatch(op, params = {}) {
     }
 
     case 'flow.rpc': {
+      // CLICK BUTTON SEND
+
+      // LẮNG NGHE REQUEST CÓ RPC TẠO ẢNH
+
+      // BÓC CAPCAHTTOKEN TỪ BODY
+
+      // GỬI LẠI REQUEST VỚI CAPTCHA TOKEN
+
       const rawURL = String(params.url || '');
       const body = String(params.body || '');
       const captchaAction = String(params.captcha_action || '');
@@ -772,6 +885,31 @@ async function dispatch(op, params = {}) {
       const rpcID = envelope?.[0]?.[0]?.[0];
       if (!allowedRPCs.has(rpcID) || parsed.searchParams.get('rpcids') !== rpcID || !form.has('f.req')) {
         throw new Error('Refusing a body that does not match an allowlisted Flow RPC');
+      }
+      console.info('[Flow Bridge flow.rpc] engine request accepted', {
+        rpc: rpcID,
+        method: 'POST',
+        url: parsed.toString(),
+        bodyCharacters: body.length,
+        formFields: [...new Set(form.keys())],
+        params,
+        body,
+      });
+      if (rpcID === 'ogiZ0b') {
+        if (captchaAction && captchaAction !== 'IMAGE_GENERATION') {
+          throw new Error('Invalid captcha action for image generation');
+        }
+        const imageResponse = await submitImageRpcThroughPage(body);
+        console.info('[Flow Bridge flow.rpc] sending result to engine', {
+          rpc: rpcID,
+          status: imageResponse.status,
+          responseCharacters: imageResponse.text?.length || 0,
+          captchaMinted: !!imageResponse.captcha_minted,
+          response: imageResponse,
+        });
+        if (Number.isSafeInteger(imageResponse.reqid)) lastFlowRPCReqId = imageResponse.reqid;
+        if (imageResponse.captcha_minted) state.captchaMints++;
+        return imageResponse;
       }
       if (captchaAction) {
         if (rpcID !== 'ogiZ0b' || captchaAction !== 'IMAGE_GENERATION') {
@@ -814,6 +952,25 @@ async function dispatch(op, params = {}) {
           if (!orderedKeys.includes(key)) orderedParams.append(key, value);
         }
         requestURL.search = orderedParams.toString();
+        {
+          const form = new URLSearchParams(encodedBody);
+          const fReq = form.get('f.req') || '';
+          let envelope;
+          try { envelope = JSON.parse(fReq); } catch { throw new Error('Invalid batchexecute body'); }
+          const rpcID = envelope?.[0]?.[0]?.[0];
+          if (rpcID === 'ogiZ0b') {
+            const argumentText = envelope[0][0][1];
+            let argument;
+            try { argument = JSON.parse(argumentText); } catch { throw new Error('Invalid image generation argument'); }
+            if (!Array.isArray(argument?.[1]?.[0]) || argument[1][0].length <= 5) {
+              throw new Error('Image generation model slot was not found');
+            }
+            argument[1][0][5] = 'BELUGA';
+            envelope[0][0][1] = JSON.stringify(argument);
+            form.set('f.req', JSON.stringify(envelope));
+            encodedBody = form.toString();
+          }
+        }
         if (action) {
           if (!window.grecaptcha || !window.grecaptcha.enterprise) {
             throw new Error('the Flow page has no reCAPTCHA enterprise client loaded');
@@ -836,6 +993,14 @@ async function dispatch(op, params = {}) {
           // and the payload level. Both copies must carry the same minted token.
           form.set('f.req', fReq.split(placeholder).join(token));
           encodedBody = form.toString();
+        }
+        if (placeholder) {
+          const form = new URLSearchParams(encodedBody);
+          const fReq = form.get('f.req') || '';
+          if (fReq.includes(placeholder)) {
+            form.set('f.req', fReq.split(placeholder).join('abc'));
+            encodedBody = form.toString();
+          }
         }
         const response = await fetch(requestURL.toString(), {
           method: 'POST',

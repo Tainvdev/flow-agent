@@ -1,0 +1,26 @@
+
+{
+  "manifest_version": 3,
+  "name": "Local Request Lab",
+  "version": "1.0.0",
+  "description": "Inspect and transform matching JSON requests on Flow for testing.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "debugger"
+  ],
+  "action": {
+    "default_title": "Flow Request Lab",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://flow.google.com/*"
+      ],
+      "js": ["interceptor.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ]
+}

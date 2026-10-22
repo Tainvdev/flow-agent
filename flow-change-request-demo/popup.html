@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Flow Request Lab</title>
+    <style>
+      body {
+        width: 260px;
+        margin: 0;
+        padding: 16px;
+        color: #172033;
+        background: #f6f8fb;
+        font: 13px/1.5 system-ui, sans-serif;
+      }
+      h1 { margin: 0 0 8px; font-size: 15px; }
+      p { margin: 0 0 12px; color: #596579; }
+      button {
+        width: 100%;
+        padding: 9px 12px;
+        border: 0;
+        border-radius: 7px;
+        color: #fff;
+        background: #2563eb;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button:disabled { opacity: .6; cursor: wait; }
+      #result { min-height: 1.5em; margin: 10px 0 0; }
+      #result.error { color: #b42318; }
+      #result.ok { color: #087443; }
+    </style>
+  </head>
+  <body>
+    <h1>Flow Request Lab</h1>
+    <p>Focus the prompt editor, type “a”, then click Generate.</p>
+    <button id="run" type="button">Run test generation</button>
+    <p id="result" role="status" aria-live="polite"></p>
+    <script src="popup.js"></script>
+  </body>
+</html>

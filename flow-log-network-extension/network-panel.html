@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flow Network</title>
+  <link rel="stylesheet" href="network-panel.css">
+</head>
+<body>
+  <header>
+    <div><strong>Flow Network</strong><small id="summary">Waiting for requests…</small></div>
+    <div class="actions"><input id="filter" type="search" placeholder="Filter URL / method"><button id="download-json">Download JSON</button><button id="download-csv">Download CSV</button><button id="clear">Clear</button></div>
+  </header>
+  <main>
+    <section class="list" aria-label="Requests"><table><thead><tr><th>Status</th><th>Method</th><th>Type</th><th>Time</th><th>URL</th></tr></thead><tbody id="requests"></tbody></table></section>
+    <section class="detail"><div id="empty">Select a request to view its full URL, headers, cookies, and request/response bodies when DevTools provides them.</div><pre id="details" hidden></pre></section>
+  </main>
+  <script src="network-panel.js"></script>
+</body>
+</html>

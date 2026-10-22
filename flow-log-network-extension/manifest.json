@@ -1,0 +1,8 @@
+{
+  "manifest_version": 3,
+  "name": "Flow Network Inspector",
+  "version": "1.0.0",
+  "description": "Inspect network requests for the tab attached to Chrome DevTools.",
+  "minimum_chrome_version": "116",
+  "devtools_page": "devtools.html"
+}

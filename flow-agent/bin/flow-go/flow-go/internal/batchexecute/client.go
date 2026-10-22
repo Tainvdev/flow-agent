@@ -418,7 +418,7 @@ type Client struct {
 
 // BrowserCaptchaTokenPlaceholder marks the captcha field that the Flow page
 // replaces after minting a token inline with an image submission.
-const BrowserCaptchaTokenPlaceholder = "__FLOW_IMAGE_CAPTCHA_TOKEN__"
+const BrowserCaptchaTokenPlaceholder = "CAPTCHA_THAY_THE"
 
 // BrowserRPCTransport submits a batchexecute form through the signed-in Flow
 // page and returns the HTTP status and response text. captchaAction, when set,
@@ -884,6 +884,12 @@ func (c *Client) call(ctx context.Context, rpcID string, opts CallOptions,
 					rpcID, err)
 			}
 			token = fresh
+		}
+		// The Flow page mints the image token immediately before fetch. Keep the
+		// literal marker in every browser-submitted attempt, including retries;
+		// transport-minted tokens remain in use for non-browser calls.
+		if useBrowserRPC && rpcID == RPCIDGenerate && opts.BrowserCaptchaAction != "" {
+			token = BrowserCaptchaTokenPlaceholder
 		}
 
 		payload, err := build(token)

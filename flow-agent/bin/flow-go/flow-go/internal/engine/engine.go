@@ -4879,19 +4879,13 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 			}
 		}
 
-		// Mint after upload/listing confirmation so a delayed project listing
-		// does not age the token before the generation request is sent. In broker
-		// mode this asks the extension for a page-minted token first; the token
-		// then travels through Go in the RPC body.
-		captcha, err := e.CaptchaToken(ctx, recaptcha.ActionImage)
-		if err != nil {
-			e.finishJob(jobID, "failed", nil, start, err, accountID)
-			return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
-		}
+		// The Flow extension captures a fresh token from the page's own image
+		// request and replaces this marker in the engine-built payload.
 		reportPhase(ctx, "submitting", "sending image generation request")
 		callOptions := e.captchaOptions(recaptcha.ActionImage, batchexecute.CallOptions{
-			SourcePath: "/project/" + projectID,
-			BuildLabel: config.BuildLabel(),
+			SourcePath:           "/project/" + projectID,
+			BuildLabel:           config.BuildLabel(),
+			BrowserCaptchaAction: recaptcha.ActionImage,
 		})
 		media, err = client.GenerateMedia(ctx, batchexecute.GenerateRequest{
 			ProjectID:         projectID,
@@ -4900,7 +4894,7 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 			Prompt:            req.Prompt,
 			Count:             count,
 			AspectRatio:       req.Aspect,
-			CaptchaToken:      captcha,
+			CaptchaToken:      "CAPTCHA_THAY_THE",
 		}, callOptions)
 
 		rejected = nil

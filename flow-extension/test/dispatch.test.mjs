@@ -29,10 +29,10 @@ const extDir = path.resolve(here, '..');
  * ------------------------------------------------------------------ */
 
 // The extension has no package.json, so Node would read background.js as
-// CommonJS and choke on its `import`. Copying the two real files into a staged
+// CommonJS and choke on its `import`. Copying the module files into a staged
 // directory with a one-line package.json keeps the originals untouched.
 const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'fgext-'));
-for (const file of ['background.js', 'config.js', 'popup.js']) {
+for (const file of ['background.js', 'config.js', 'image-rpc.js', 'popup.js']) {
   fs.copyFileSync(path.join(extDir, file), path.join(stage, file));
 }
 fs.writeFileSync(path.join(stage, 'package.json'), JSON.stringify({ type: 'module' }));
