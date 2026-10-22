@@ -8,7 +8,6 @@ UI works without knowing anything about Flow.
 
 from __future__ import annotations
 
-import base64
 from contextlib import asynccontextmanager
 import json
 import time
@@ -149,16 +148,6 @@ class ChatCompletionRequest(BaseModel):
 # --------------------------------------------------------------------------- #
 
 
-def _media_url(request: Request, path: str) -> str:
-    """The URL a client can fetch one generated file from.
-
-    Built from the request's own base URL rather than a hardcoded host, so the
-    response is correct whether this is reached on localhost, a LAN address or
-    behind a proxy.
-    """
-    return f"{str(request.base_url).rstrip('/')}/api/v1/media/{Path(path).name}"
-
-
 def _no_image_detail(result: dict) -> str:
     """Why a run that exited zero produced nothing usable.
 
@@ -205,24 +194,35 @@ def _engine_http_exception(exc: EngineError) -> HTTPException:
     )
 
 
-def _image_payload(request: Request, result: dict, response_format: str) -> dict:
-    """Turn an engine result into the OpenAI images response."""
-    files = result.get("files") or []
-    data: list[dict] = []
-
-    for item in files:
-        path = item.get("path")
-        if not path:
-            continue
-        if response_format == "b64_json":
-            try:
-                data.append(
-                    {"b64_json": base64.b64encode(Path(path).read_bytes()).decode()}
-                )
-            except OSError:
-                continue
+def _image_urls(result: dict) -> list[str]:
+    """Extract signed Flow image URLs without reading image bytes."""
+    urls: list[str] = []
+    for item in result.get("media") or []:
+        if isinstance(item, str):
+            url = item
+        elif isinstance(item, dict):
+            url = item.get("url") or item.get("signed_url") or item.get("download_url")
         else:
-            data.append({"url": _media_url(request, path)})
+            url = None
+        if isinstance(url, str) and url.strip():
+            urls.append(url)
+
+    # Keep the flat URL view as a fallback for service/CLI results produced by
+    # older or alternate engine serializers. It contains the same signed Flow
+    # URLs and does not reintroduce downloading.
+    if not urls:
+        for url in result.get("urls") or []:
+            if isinstance(url, str) and url.strip():
+                urls.append(url)
+
+    return urls
+
+
+def _image_payload(result: dict) -> dict:
+    """Turn an engine result into the OpenAI images response."""
+    # Image generation keeps Flow's signed URL. The Go engine deliberately does
+    # not download image bytes or create local media files.
+    data = [{"url": url} for url in _image_urls(result)]
 
     return {"created": int(time.time()), "data": data, "flow": result}
 
@@ -343,7 +343,7 @@ async def openai_images(
     except EngineError as exc:
         raise _engine_http_exception(exc) from exc
 
-    payload_out = _image_payload(request, result, payload.response_format)
+    payload_out = _image_payload(result)
     # A run that produced nothing is not a success. Returning 200 with an empty
     # `data` would tell an OpenAI client the request worked and there simply
     # were no images, which is the opposite of what happened.
@@ -378,14 +378,14 @@ async def openai_chat(
     except EngineError as exc:
         raise _engine_http_exception(exc) from exc
 
-    files = result.get("files") or []
-    if not files:
+    image_urls = _image_urls(result)
+    if not image_urls:
         markdown = _no_image_detail(result)
     else:
         links = "\n".join(
-            f"![generated image]({_media_url(request, f['path'])})" for f in files if f.get("path")
+            f"![generated image]({url})" for url in image_urls
         )
-        markdown = links or "The engine reported files but named no paths."
+        markdown = links
 
     body = _completion_body(payload.model, markdown)
     return _sse(body) if payload.stream else body

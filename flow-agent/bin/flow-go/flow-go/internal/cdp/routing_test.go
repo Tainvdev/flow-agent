@@ -81,7 +81,7 @@ func (f *fakeExtension) answer(op string) any {
 				"ping", "config.get", "config.set", "tabs.list", "tabs.open",
 				"tab.attach", "tab.detach", "tab.current", "events.read",
 				"cookies.list", "flow.fingerprint", "flow.navigate",
-				"flow.projects", "flow.captcha", "flow.upscale",
+				"flow.projects", "flow.rpc", "flow.upscale",
 			}
 		}
 		return pong
@@ -96,8 +96,6 @@ func (f *fakeExtension) answer(op string) any {
 		return []string{"https://flow.google.com/project/one"}
 	case "flow.navigate":
 		return map[string]any{"tabId": 1, "url": "https://flow.google.com/"}
-	case "flow.captcha":
-		return map[string]any{"available": true, "token": strings.Repeat("t", 40)}
 	case "flow.upscale":
 		return map[string]any{"data": strings.Repeat("A", 600)}
 

@@ -35,7 +35,6 @@ func TestGenerationOutcomesAgreeOnTheProjectKey(t *testing.T) {
 	outcomes := map[string]any{
 		"VideoOutcome":      VideoOutcome{},
 		"BatchVideoOutcome": BatchVideoOutcome{},
-		"ImageOutcome":      ImageOutcome{},
 	}
 
 	for name, outcome := range outcomes {
@@ -66,18 +65,6 @@ func TestVideoOutcomeCarriesTheProject(t *testing.T) {
 	}
 }
 
-func TestImageOutcomeCarriesTheProject(t *testing.T) {
-	decoded := marshalToMap(t, ImageOutcome{
-		JobID:     "job-2",
-		Account:   "acct-b",
-		ProjectID: "project-b",
-	})
-
-	if decoded["project_id"] != "project-b" {
-		t.Errorf("project_id = %v, want project-b", decoded["project_id"])
-	}
-}
-
 // An unresolved project stays visible as an empty string rather than being
 // dropped from the payload. The key's presence is what tells a caller the field
 // was considered, so `omitempty` here would make "no project resolved" and "a
@@ -85,7 +72,6 @@ func TestImageOutcomeCarriesTheProject(t *testing.T) {
 func TestOutcomesKeepAnEmptyProjectKey(t *testing.T) {
 	for name, decoded := range map[string]map[string]any{
 		"VideoOutcome": marshalToMap(t, VideoOutcome{JobID: "job-1"}),
-		"ImageOutcome": marshalToMap(t, ImageOutcome{JobID: "job-2"}),
 	} {
 		value, ok := decoded["project_id"]
 		if !ok {

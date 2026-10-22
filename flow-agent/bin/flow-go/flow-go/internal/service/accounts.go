@@ -1278,7 +1278,6 @@ func (m *AccountManager) generateImage(ctx context.Context, runtime *accountRunt
 	return runtime.engine.GenerateImageViaBatch(ctx, engine.BatchImageRequest{
 		Prompt: payload.Prompt, Model: payload.Model, ProjectID: payload.ProjectID, Aspect: payload.Aspect,
 		Count: count, ReferenceData: payload.ReferenceData, ReferenceMediaIDs: referenceMediaIDs,
-		Download: !payload.NoDownload,
 	})
 }
 

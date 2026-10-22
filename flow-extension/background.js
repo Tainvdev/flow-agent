@@ -11,7 +11,6 @@
  *   flow.fingerprint  the identity a generation request has to present
  *   flow.navigate     move the attached tab, inside the tab scope
  *   flow.projects     the project links on the current page
- *   flow.captcha      is the client loaded, and mint a token for an action
  *   flow.rpc          submit an allowlisted Flow RPC to Flow
  *
  * Every operation above is load-bearing and must not be trimmed. The engine's
@@ -96,7 +95,6 @@ const state = {
   lastOp: null,
   lastError: null,
   lastActivity: null,
-  captchaMints: 0,
   // What the popup reports as "Cookie Sync". `lastSyncTime` is when the backend
   // last pulled cookies, or when a rotation was announced; `cookieCount` is how
   // many essential cookies that read yielded.
@@ -611,19 +609,6 @@ function readPageTokens() {
  * scores low enough that the upstream rejects the call. A token of the right
  * length is therefore not evidence that this worked.
  */
-async function mintCaptcha(siteKey, action) {
-  try {
-    if (!window.grecaptcha || !window.grecaptcha.enterprise) {
-      return { available: false, error: 'the page has no reCAPTCHA client loaded' };
-    }
-    await new Promise((resolve) => window.grecaptcha.enterprise.ready(resolve));
-    const token = await window.grecaptcha.enterprise.execute(siteKey, { action });
-    return { available: true, token };
-  } catch (e) {
-    return { available: true, error: String(e) };
-  }
-}
-
 /* ------------------------------------------------------------------ *
  * Operations
  * ------------------------------------------------------------------ */
@@ -670,7 +655,7 @@ async function dispatch(op, params = {}) {
           'tabs.list', 'tabs.open', 'tab.attach', 'tab.detach', 'tab.current',
           'events.read', 'cookies.list', 'cookies.names',
           'flow.fingerprint', 'flow.navigate', 'flow.projects',
-          'flow.captcha', 'flow.at', 'flow.rpc', 'flow.rpc.inline_captcha', 'status',
+          'flow.at', 'flow.rpc', 'flow.rpc.inline_captcha', 'status',
         ],
       };
 
@@ -904,24 +889,15 @@ async function dispatch(op, params = {}) {
           rpc: rpcID,
           status: imageResponse.status,
           responseCharacters: imageResponse.text?.length || 0,
-          captchaMinted: !!imageResponse.captcha_minted,
           response: imageResponse,
         });
         if (Number.isSafeInteger(imageResponse.reqid)) lastFlowRPCReqId = imageResponse.reqid;
-        if (imageResponse.captcha_minted) state.captchaMints++;
         return imageResponse;
       }
-      if (captchaAction) {
-        if (rpcID !== 'ogiZ0b' || captchaAction !== 'IMAGE_GENERATION') {
-          throw new Error('Inline captcha is only supported for image generation');
-        }
-        const fReq = form.get('f.req') || '';
-        if (!captchaPlaceholder || !fReq.includes(captchaPlaceholder)) {
-          throw new Error('Image request is missing the inline captcha placeholder');
-        }
+      if (captchaAction || captchaPlaceholder) {
+        throw new Error('CAPTCHA is supported only by the intercepted image request');
       }
-      const siteKey = cfg.recaptchaSiteKey || '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV';
-      const response = await inPage(async (url, encodedBody, action, key, placeholder, lastAssignedReqId) => {
+      const response = await inPage(async (url, encodedBody, lastAssignedReqId) => {
         const requestURL = new URL(url);
         const observedReqId = performance.getEntriesByType('resource').reduce((max, entry) => {
           try {
@@ -971,37 +947,6 @@ async function dispatch(op, params = {}) {
             encodedBody = form.toString();
           }
         }
-        if (action) {
-          if (!window.grecaptcha || !window.grecaptcha.enterprise) {
-            throw new Error('the Flow page has no reCAPTCHA enterprise client loaded');
-          }
-          await new Promise((resolve) => window.grecaptcha.enterprise.ready(resolve));
-          const executeSource = Function.prototype.toString.call(window.grecaptcha.enterprise.execute);
-          if (executeSource.includes('extension_hijack_detected')) {
-            throw new Error(
-              'Flow reCAPTCHA execute wrapper detected: the page may rewrite this action; RPC was not sent',
-            );
-          }
-          const token = await window.grecaptcha.enterprise.execute(key, { action });
-          if (typeof token !== 'string' || !token) throw new Error('reCAPTCHA returned an empty token');
-          const form = new URLSearchParams(encodedBody);
-          const fReq = form.get('f.req') || '';
-          if (!placeholder || !fReq.includes(placeholder)) {
-            throw new Error('inline captcha placeholder was missing');
-          }
-          // The image builder repeats its context block at the request level
-          // and the payload level. Both copies must carry the same minted token.
-          form.set('f.req', fReq.split(placeholder).join(token));
-          encodedBody = form.toString();
-        }
-        if (placeholder) {
-          const form = new URLSearchParams(encodedBody);
-          const fReq = form.get('f.req') || '';
-          if (fReq.includes(placeholder)) {
-            form.set('f.req', fReq.split(placeholder).join('abc'));
-            encodedBody = form.toString();
-          }
-        }
         const response = await fetch(requestURL.toString(), {
           method: 'POST',
           credentials: 'include',
@@ -1011,25 +956,10 @@ async function dispatch(op, params = {}) {
           },
           body: encodedBody,
         });
-        return { status: response.status, text: await response.text(), captcha_minted: !!action, reqid: reqId };
-      }, [rawURL, body, captchaAction, siteKey, captchaPlaceholder, lastFlowRPCReqId]);
+        return { status: response.status, text: await response.text(), reqid: reqId };
+      }, [rawURL, body, lastFlowRPCReqId]);
       if (Number.isSafeInteger(response?.reqid)) lastFlowRPCReqId = response.reqid;
-      if (response?.captcha_minted) state.captchaMints++;
       return response;
-    }
-
-    case 'flow.captcha': {
-      const action = String(params.action || '');
-      const siteKey = cfg.recaptchaSiteKey || params.siteKey || '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV';
-      if (!action) {
-        // A probe: the caller wants to know whether the page can mint at all,
-        // usually to decide whether to navigate somewhere that can.
-        const fp = await inPage(() => !!(window.grecaptcha && window.grecaptcha.enterprise && window.grecaptcha.enterprise.execute));
-        return { available: !!fp };
-      }
-      const out = await inPage(mintCaptcha, [siteKey, action]);
-      if (out && out.token) state.captchaMints++;
-      return out || { available: false, error: 'the page returned nothing' };
     }
 
     case 'status': {

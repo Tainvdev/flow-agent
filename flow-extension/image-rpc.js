@@ -139,7 +139,6 @@ export async function prepareImageRpc(engineBody) {
       state.result = {
         status: response.status,
         text: responseText,
-        captcha_minted: true,
         reqid: Number(new URL(url, location.href).searchParams.get('_reqid')) || null,
       };
       state.done = true;

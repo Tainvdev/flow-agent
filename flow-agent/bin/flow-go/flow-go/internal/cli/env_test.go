@@ -113,9 +113,7 @@ func TestAnExplicitFlagBeatsTheEnvironment(t *testing.T) {
 	}
 }
 
-// IMAGE_MODEL was a third ghost: read by config.DefaultImageModel, which only the
-// dead flowapi path calls, so it had no effect on `flow-go image` at all. It is
-// bound to the model flag now.
+// IMAGE_MODEL is bound to the image model flag used by the batchexecute path.
 func TestImageModelIsBoundToTheImageModelFlag(t *testing.T) {
 	t.Setenv("IMAGE_MODEL", "gem_pix_2")
 

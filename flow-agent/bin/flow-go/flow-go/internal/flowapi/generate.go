@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log"
-	"regexp"
 	"strings"
 
 	"github.com/kodelyx/flow-go/flow-go/internal/config"
@@ -188,128 +187,6 @@ func (c *Client) submitVideo(ctx context.Context, endpoint string, body map[stri
 	log.Printf("flow[%s]: submitted %d media (credits left: %d)",
 		c.opts.AccountID, len(ids), out.RemainingCredits)
 	return out, nil
-}
-
-/* ------------------------------------------------------------------ *
- * Image generation
- * ------------------------------------------------------------------ */
-
-// ImageRequest describes one text-to-image submission.
-type ImageRequest struct {
-	Prompt       string
-	Aspect       string // landscape, 4x3, square, 3x4, portrait
-	Count        int
-	Seed         *int64
-	Model        string   // friendly name or enum; empty uses the configured default
-	ReferenceIDs []string // media IDs to use as reference images
-}
-
-// ImageResult is one generated image.
-type ImageResult struct {
-	MediaID  string
-	ImageURL string
-	Model    string
-}
-
-// GenerateImage submits a text-to-image job and returns the resulting images.
-//
-// Unlike video, this endpoint is synchronous: the URLs come back in the response,
-// so no polling is needed.
-func (c *Client) GenerateImage(ctx context.Context, req ImageRequest) ([]ImageResult, error) {
-	if req.Count < 1 {
-		req.Count = 1
-	}
-	if req.Count > config.MaxCount {
-		req.Count = config.MaxCount
-	}
-
-	aspect := config.ImageAspects[req.Aspect]
-	if aspect == "" {
-		aspect = req.Aspect
-	}
-
-	model := config.ImageModels[strings.ToLower(req.Model)]
-	if model == "" {
-		model = req.Model
-	}
-	if model == "" {
-		model = config.DefaultImageModel()
-	}
-
-	requests := make([]map[string]any, 0, req.Count)
-	for i := 0; i < req.Count; i++ {
-		item := map[string]any{
-			"seed": resolveSeed(req.Seed, i),
-			// Images take the prompt parts directly. Video wraps them in a
-			// textInput block; images do not, and using the video helper here
-			// produces a doubly nested structuredPrompt that the API rejects with
-			// `Unknown name "structuredPrompt"`.
-			"structuredPrompt": promptParts(req.Prompt),
-			"imageAspectRatio": aspect,
-			"imageModelName":   model,
-			"imageInputs":      []any{},
-		}
-		if len(req.ReferenceIDs) > 0 {
-			inputs := make([]map[string]any, 0, len(req.ReferenceIDs))
-			for _, id := range req.ReferenceIDs {
-				inputs = append(inputs, map[string]any{
-					"name":           id,
-					"imageInputType": "IMAGE_INPUT_TYPE_REFERENCE",
-				})
-			}
-			item["imageInputs"] = inputs
-		}
-		requests = append(requests, item)
-	}
-
-	// The image endpoint expects these at the top level unconditionally, unlike
-	// the video path where they only appear for reference-conditioned requests.
-	body := map[string]any{
-		"requests":               requests,
-		"mediaGenerationContext": buildGenerationContext(""),
-		"useNewMedia":            true,
-	}
-
-	endpoint := config.Endpoints["batch_images"]
-	result, err := c.Call(ctx, endpoint, body, recaptchaActionImage)
-	if err != nil {
-		return nil, err
-	}
-
-	var parsed GenerateResponse
-	if err := result.JSON(&parsed); err != nil {
-		return nil, fmt.Errorf("flow: decode image response: %w", err)
-	}
-
-	images := parseImages(parsed.Media, model)
-	if len(images) == 0 {
-		return nil, fmt.Errorf("flow: image generation returned no images")
-	}
-
-	log.Printf("flow[%s]: generated %d image(s)", c.opts.AccountID, len(images))
-	return images, nil
-}
-
-var uuidRe = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
-
-func parseImages(items []MediaItem, model string) []ImageResult {
-	out := make([]ImageResult, 0, len(items))
-	for _, item := range items {
-		img := ImageResult{Model: model}
-		if uuidRe.MatchString(item.Name) {
-			img.MediaID = item.Name
-		}
-		url := item.Image.GeneratedImage.FifeURL
-		if url == "" {
-			url = item.Image.GeneratedImage.ImageURI
-		}
-		img.ImageURL = url
-		if img.MediaID == "" && url != "" {
-			img.MediaID = uuidRe.FindString(url)
-		}
-		out = append(out, img)
-	}
-	return out
 }
 
 /* ------------------------------------------------------------------ *
@@ -573,7 +450,6 @@ func (c *Client) Credits(ctx context.Context) (credits int, sku string, err erro
 // Captcha actions, re-exported so callers do not need the recaptcha package.
 const (
 	recaptchaActionVideo = "VIDEO_GENERATION"
-	recaptchaActionImage = "IMAGE_GENERATION"
 )
 
 // promptParts is the inner prompt shape: {"parts":[{"text": "..."}]}.

@@ -132,15 +132,6 @@ var Aspects = map[string]string{
 	"landscape": "VIDEO_ASPECT_RATIO_LANDSCAPE",
 }
 
-// ImageAspects mirrors t2i.IMAGE_ASPECTS.
-var ImageAspects = map[string]string{
-	"landscape": "IMAGE_ASPECT_RATIO_LANDSCAPE",
-	"4x3":       "IMAGE_ASPECT_RATIO_4_3",
-	"square":    "IMAGE_ASPECT_RATIO_SQUARE",
-	"3x4":       "IMAGE_ASPECT_RATIO_3_4",
-	"portrait":  "IMAGE_ASPECT_RATIO_PORTRAIT",
-}
-
 /* ------------------------------------------------------------------ *
  * Endpoints
  * ------------------------------------------------------------------ */
@@ -158,7 +149,6 @@ var Endpoints = map[string]string{
 	"poll_status":     "/v1/video:batchCheckAsyncVideoGenerationStatus",
 	"get_media":       "/v1/media/{media_id}",
 	"get_credits":     "/v1/credits",
-	"batch_images":    "/v1/projects/{project_id}/flowMedia:batchGenerateImages",
 	"batch_check":     "/v1/projects/{project_id}/flowMedia:batchCheckAsync",
 	"project_credits": "/v1/projects/{project_id}/credits",
 }
@@ -290,38 +280,6 @@ func VideoModelFor(duration int, hasStart, hasEnd bool) (string, bool) {
 
 // EditModel is the video-to-video edit model key.
 const EditModel = "abra_edit"
-
-// ImageModels maps friendly names to the Flow image model enum.
-var ImageModels = map[string]string{
-	"harbor_seal":     "HARBOR_SEAL",
-	"lite":            "HARBOR_SEAL",
-	"beluga":          "BELUGA",
-	"nano_banano_2.1": "BELUGA",
-	"nano_banana_2.1": "BELUGA",
-	"narwhal":         "BELUGA", // Legacy alias.
-	"nano_banana_2":   "BELUGA",
-	"standard":        "BELUGA",
-	"gem_pix_2":       "GEM_PIX_2",
-	"pro":             "GEM_PIX_2",
-}
-
-// DefaultImageModel resolves IMAGE_MODEL, accepting either a friendly key or an
-// already-resolved enum value.
-func DefaultImageModel() string {
-	raw := os.Getenv("IMAGE_MODEL")
-	if raw == "" {
-		return "BELUGA"
-	}
-	if resolved, ok := ImageModels[strings.ToLower(raw)]; ok {
-		return resolved
-	}
-	for _, v := range ImageModels {
-		if v == raw {
-			return raw
-		}
-	}
-	return "BELUGA"
-}
 
 /* ------------------------------------------------------------------ *
  * Upsampling

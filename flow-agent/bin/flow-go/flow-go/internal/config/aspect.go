@@ -2,7 +2,9 @@ package config
 
 // Aspect ratios on the batchexecute transport.
 //
-// These are NOT the same values as Aspects / ImageAspects above. Those two hold
+// These are the batchexecute aspect values. The old REST image aspect tables
+// were removed with the legacy image submission path.
+/*
 // the *legacy aisandbox* enum strings ("VIDEO_ASPECT_RATIO_PORTRAIT") and are
 // read only by internal/flowapi, which is reachable only through
 // Engine.SubmitVideo — a path with no callers. The tables here hold the
@@ -10,6 +12,7 @@ package config
 // entirely. Do not merge the two: the strings are not translatable into these
 // numbers, and a submission built from the wrong one is accepted by the server
 // and renders nothing.
+*/
 //
 // The integers come from the Flow frontend bundle, where the video and image
 // protobuf classes each expose a setter that writes one field, and the two

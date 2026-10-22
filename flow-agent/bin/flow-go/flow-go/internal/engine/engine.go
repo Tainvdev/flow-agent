@@ -702,7 +702,7 @@ func (e *Engine) AccountsCredits(ctx context.Context, max int) ([]AccountCredits
 		max = 4
 	}
 	if !e.Ready() {
-		return nil, fmt.Errorf("engine: not ready — call Bootstrap first")
+		return nil, fmt.Errorf("engine: not ready - call Bootstrap first")
 	}
 	jar := e.Jar()
 	if jar == nil {
@@ -2970,117 +2970,6 @@ func mimeFor(path string) string {
 }
 
 /* ------------------------------------------------------------------ *
- * Images
- * ------------------------------------------------------------------ */
-
-// ImageRequest is a caller-facing image generation request.
-type ImageRequest struct {
-	Prompt       string
-	Aspect       string
-	Count        int
-	Seed         *int64
-	Model        string
-	ReferenceIDs []string
-	Download     bool
-}
-
-// ImageOutcome is the result of an image generation.
-type ImageOutcome struct {
-	JobID string `json:"job_id"`
-	// Account and ProjectID name the worker the pool routed this job to. Read off
-	// that worker rather than from the engine, for the reason VideoOutcome gives:
-	// with more than one account registered the engine-level pair describes only
-	// the account that bootstrapped last.
-	Account   string                `json:"account_id"`
-	ProjectID string                `json:"project_id"`
-	Images    []flowapi.ImageResult `json:"images"`
-	Files     []MediaFile           `json:"files,omitempty"`
-	ElapsedS  float64               `json:"elapsed_seconds"`
-	Status    string                `json:"status"`
-}
-
-// GenerateImage submits an image job and downloads the results.
-func (e *Engine) GenerateImage(ctx context.Context, req ImageRequest) (*ImageOutcome, error) {
-	if !e.Ready() {
-		return nil, fmt.Errorf("engine: not ready — call Bootstrap first")
-	}
-	if strings.TrimSpace(req.Prompt) == "" {
-		return nil, fmt.Errorf("engine: a prompt is required")
-	}
-
-	jobID := uuid.NewString()
-	start := time.Now()
-
-	rowID, err := e.store.RecordGeneration(store.Generation{
-		JobID:  jobID,
-		Kind:   "image",
-		Prompt: req.Prompt,
-		Model:  req.Model,
-		Aspect: req.Aspect,
-		Count:  req.Count,
-		Status: "submitted",
-	})
-	if err != nil {
-		log.Printf("engine: could not record the job: %v", err)
-	}
-
-	var images []flowapi.ImageResult
-	var accountID, projectID string
-
-	// Image generation is free on the tiers this targets, so the cost gate is 0.
-	poolErr := e.pool.Execute(ctx, 0, func(ctx context.Context, worker *pool.Worker) error {
-		var callErr error
-		images, callErr = worker.Client.GenerateImage(ctx, flowapi.ImageRequest{
-			Prompt:       req.Prompt,
-			Aspect:       req.Aspect,
-			Count:        req.Count,
-			Seed:         req.Seed,
-			Model:        req.Model,
-			ReferenceIDs: req.ReferenceIDs,
-		})
-		if callErr == nil {
-			accountID, projectID = servingWorker(worker)
-		}
-		return callErr
-	})
-
-	if poolErr != nil {
-		e.finishJob(jobID, "failed", nil, start, poolErr, accountID)
-		_ = e.store.RecordAccountOutcome(accountID, true, poolErr.Error())
-		return nil, poolErr
-	}
-
-	outcome := &ImageOutcome{
-		JobID:     jobID,
-		Account:   accountID,
-		ProjectID: projectID,
-		Images:    images,
-		Status:    "succeeded",
-	}
-
-	if req.Download {
-		for _, img := range images {
-			if img.ImageURL == "" {
-				continue
-			}
-			file, err := e.downloadOne(ctx, img.ImageURL, img.MediaID, "image", "", req.Prompt, rowID)
-			if err != nil {
-				log.Printf("engine: image download failed: %v", err)
-				continue
-			}
-			outcome.Files = append(outcome.Files, file)
-		}
-	}
-
-	outcome.ElapsedS = time.Since(start).Seconds()
-	e.finishJob(jobID, outcome.Status, nil, start, nil, accountID)
-	_ = e.store.RecordAccountOutcome(accountID, false, "")
-	e.clearError()
-
-	return outcome, nil
-}
-
-/* ------------------------------------------------------------------ *
  * Upscaling
  * ------------------------------------------------------------------ */
 
@@ -3617,10 +3506,10 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 		return nil, err
 	}
 
+	// Image generation is extension-only. Do not use the Go CAPTCHA provider,
+	// escalation path, or automatic replay here: the browser page must mint and
+	// insert the token for the one submission. Video keeps the older retry policy.
 	maxAttempts := 1
-	if autoRetryEnabled() {
-		maxAttempts = 3
-	}
 
 	var frames []batchexecute.Frame
 	var rejected *batchexecute.RejectedError
@@ -4730,17 +4619,17 @@ func (e *Engine) ResumeAcceptedMedia(ctx context.Context, projectID string, medi
 		reportPhase(ctx, "rendering", "resuming video render polling")
 		urls, files = e.collectVideo(ctx, client, projectID, mediaIDs, prompt, 0, true)
 	} else if kind == "image" {
-		reportPhase(ctx, "downloading", "resolving and downloading accepted images")
+		// Image URLs are already returned by Flow. Keep the signed upstream URLs;
+		// do not download or persist image bytes during recovery.
 		for _, id := range mediaIDs {
 			url, err := client.ResolveImageURL(ctx, projectID, id)
 			if err != nil {
 				continue
 			}
 			urls = append(urls, url)
-			file, err := e.downloadGenerated(ctx, batchexecute.GeneratedMedia{MediaID: id, URL: url, Kind: "image"}, "image", prompt, 0)
-			if err == nil {
-				files = append(files, file)
-			}
+		}
+		if len(urls) > 0 {
+			result["status"] = "ready"
 		}
 	} else {
 		return nil, fmt.Errorf("engine: cannot resume media kind %q", kind)
@@ -4779,8 +4668,6 @@ type BatchImageRequest struct {
 	ReferenceData []ReferenceImageData
 	// ReferenceMediaIDs are already-uploaded project images to attach to the request.
 	ReferenceMediaIDs []string
-	// Download writes the result to output/.
-	Download bool
 }
 
 // BatchOutcome is the result of a batchexecute generation.
@@ -4790,9 +4677,12 @@ type BatchOutcome struct {
 	ProjectID string                        `json:"project_id"`
 	Model     string                        `json:"model"`
 	Media     []batchexecute.GeneratedMedia `json:"media"`
-	Files     []MediaFile                   `json:"files,omitempty"`
-	ElapsedS  float64                       `json:"elapsed_seconds"`
-	Status    string                        `json:"status"`
+	// URLs is kept as a flat compatibility view for API clients. The URLs are
+	// the signed Flow links already present in Media; no image bytes are read.
+	URLs     []string    `json:"urls,omitempty"`
+	Files    []MediaFile `json:"files,omitempty"`
+	ElapsedS float64     `json:"elapsed_seconds"`
+	Status   string      `json:"status"`
 }
 
 // GenerateImageViaBatch generates an image over the batchexecute transport.
@@ -4831,7 +4721,7 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 	// Known up front on this path — see the note in GenerateVideoViaBatch.
 	accountID := e.AccountID()
 
-	rowID, err := e.store.RecordGeneration(store.Generation{
+	_, err := e.store.RecordGeneration(store.Generation{
 		JobID:     jobID,
 		AccountID: accountID,
 		Kind:      "image",
@@ -4882,11 +4772,11 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 		// The Flow extension captures a fresh token from the page's own image
 		// request and replaces this marker in the engine-built payload.
 		reportPhase(ctx, "submitting", "sending image generation request")
-		callOptions := e.captchaOptions(recaptcha.ActionImage, batchexecute.CallOptions{
+		callOptions := batchexecute.CallOptions{
 			SourcePath:           "/project/" + projectID,
 			BuildLabel:           config.BuildLabel(),
 			BrowserCaptchaAction: recaptcha.ActionImage,
-		})
+		}
 		media, err = client.GenerateMedia(ctx, batchexecute.GenerateRequest{
 			ProjectID:         projectID,
 			ReferenceMediaIDs: referenceMediaIDs,
@@ -4987,6 +4877,11 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 		Media:     media,
 		Status:    "succeeded",
 	}
+	for _, item := range media {
+		if strings.TrimSpace(item.URL) != "" {
+			outcome.URLs = append(outcome.URLs, item.URL)
+		}
+	}
 	if len(media) > 0 && len(media) < count {
 		outcome.Status = "partial"
 	}
@@ -5012,24 +4907,6 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 			Frames:   frames,
 			Rejected: reason,
 			Hint:     hintForRejection(reason, e.emptyImageHint()),
-		}
-	}
-
-	if req.Download {
-		reportPhase(ctx, "downloading", "downloading generated images")
-		for _, item := range media {
-			if item.URL == "" {
-				continue
-			}
-			file, dlErr := e.downloadGenerated(ctx, item, "image", req.Prompt, rowID)
-			if dlErr != nil {
-				log.Printf("engine: could not download %s: %v", shortID(item.MediaID), dlErr)
-				continue
-			}
-			outcome.Files = append(outcome.Files, file)
-		}
-		if len(outcome.Files) > 0 {
-			reportPhase(ctx, "download_complete", "image files downloaded")
 		}
 	}
 

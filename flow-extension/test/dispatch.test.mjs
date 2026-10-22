@@ -481,7 +481,7 @@ await check('ping advertises every op the backend calls', async () => {
   const needed = [
     'ping', 'config.get', 'config.set', 'tabs.list', 'tabs.open', 'tab.attach',
     'tab.detach', 'tab.current', 'events.read', 'cookies.list',
-    'flow.fingerprint', 'flow.navigate', 'flow.projects', 'flow.captcha',
+    'flow.fingerprint', 'flow.navigate', 'flow.projects', 'flow.rpc',
   ];
   const missing = needed.filter((op) => !pong.ops.includes(op));
   assert.deepEqual(missing, [], `not advertised: ${missing.join(', ')}`);
@@ -550,20 +550,6 @@ await check('flow.at returns the page tokens the app sends', async () => {
   // together from one live capture.
   assert.equal(out.at, 'at-value');
   assert.equal(out.fsid, '-56329636');
-});
-
-await check('flow.captcha probe matches FlowCaptchaResult', async () => {
-  const probe = await call('flow.captcha', {});
-  assert.equal(typeof probe.available, 'boolean');
-  assert.equal(probe.available, true);
-  assert.equal(probe.token, undefined, 'a probe must not carry a token');
-});
-
-await check('flow.captcha mint matches FlowCaptchaResult', async () => {
-  const mint = await call('flow.captcha', { action: 'VIDEO_GENERATION' });
-  assert.equal(mint.available, true);
-  assert.equal(typeof mint.token, 'string');
-  assert.ok(mint.token.length > 0);
 });
 
 // Four `flow.upscale` cases used to sit here, covering the frame parse, an

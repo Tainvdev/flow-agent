@@ -50,7 +50,7 @@ func (c *Client) hasFlowOps() bool {
 	c.opsMu.Unlock()
 
 	for _, op := range out.Ops {
-		if op == "flow.captcha" {
+		if op == "flow.rpc" {
 			c.flowOps.Store(1)
 			return true
 		}

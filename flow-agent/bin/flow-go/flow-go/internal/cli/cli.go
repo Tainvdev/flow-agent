@@ -1364,7 +1364,6 @@ func runImage(args []string) int {
 	count := fs.Int("count", 1, "number of variations")
 	model := fs.String("model", envDefault("IMAGE_MODEL", ""),
 		"harbor_seal, nano_banano_2.1, or gem_pix_2 (from $IMAGE_MODEL, else nano_banano_2.1)")
-	noDownload := fs.Bool("no-download", false, "skip writing the result to disk")
 	// --seed is not implemented on the batchexecute transport; declared, and
 	// named when passed, but the run continues without it.
 	//
@@ -1411,7 +1410,7 @@ func runImage(args []string) int {
 	if configuredServiceURL() != "" {
 		payload := map[string]any{
 			"prompt": *prompt, "count": *count, "model": *model,
-			"aspect": *aspect, "no_download": *noDownload, "all_accounts": *all,
+			"aspect": *aspect, "all_accounts": *all,
 			"project_id": common.projectID,
 		}
 		if common.cookies != "" {
@@ -1433,7 +1432,7 @@ func runImage(args []string) int {
 			files := make([]string, 0, *count)
 			for i := 0; i < *count; i++ {
 				outcome, err := a.Engine.GenerateImageViaBatch(ctx, engine.BatchImageRequest{
-					Prompt: *prompt, Model: *model, Aspect: *aspect, Download: !*noDownload,
+					Prompt: *prompt, Model: *model, Aspect: *aspect,
 				})
 				if err != nil {
 					if len(outcomes) == 0 {
@@ -1478,10 +1477,9 @@ func runImage(args []string) int {
 
 	// The batchexecute path, which is the one the HTTP API already uses.
 	outcome, err := a.Engine.GenerateImageViaBatch(ctx, engine.BatchImageRequest{
-		Prompt:   *prompt,
-		Model:    *model,
-		Aspect:   *aspect,
-		Download: !*noDownload,
+		Prompt: *prompt,
+		Model:  *model,
+		Aspect: *aspect,
 	})
 	if err != nil {
 		return fail(err)
@@ -1668,7 +1666,6 @@ func runBatchAll(args []string) int {
 	prompt := fs.String("prompt", "", "prompt to generate (required)")
 	model := fs.String("model", envDefault("IMAGE_MODEL", "nano_banano_2.1"),
 		"image model: nano_banano_2.1|lite|pro (from $IMAGE_MODEL, else nano_banano_2.1)")
-	download := fs.Bool("download", true, "write the results to output/")
 	jsonOutput := fs.Bool("json", false, "print the aggregate result as JSON (for scripts)")
 	_ = fs.Parse(args)
 
@@ -1682,9 +1679,8 @@ func runBatchAll(args []string) int {
 
 	return runAllAccounts(ctx, common, "batch-all", *jsonOutput, func(ctx context.Context, a *app.App) (accountGenerationResult, error) {
 		outcome, err := a.Engine.GenerateImageViaBatch(ctx, engine.BatchImageRequest{
-			Prompt:   *prompt,
-			Model:    *model,
-			Download: *download,
+			Prompt: *prompt,
+			Model:  *model,
 		})
 		if err != nil {
 			return accountGenerationResult{}, err
