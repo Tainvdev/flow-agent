@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flow Agent · SQLite</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { margin:0; background:#111827; color:#e5e7eb } header { padding:20px 28px; border-bottom:1px solid #374151; display:flex; justify-content:space-between; align-items:center; gap:16px }
+    h1 { margin:0; font-size:21px } .muted,.status { color:#9ca3af; font-size:13px } main { padding:22px 28px } .toolbar,.pager { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:16px }
+    select,input,button { background:#1f2937; color:#e5e7eb; border:1px solid #4b5563; border-radius:6px; padding:8px 10px } button { cursor:pointer } button:hover { background:#374151 }
+    .table-wrap { overflow:auto; border:1px solid #374151; border-radius:8px; background:#0f172a } table { border-collapse:collapse; min-width:100%; font-size:13px }
+    th,td { text-align:left; padding:9px 11px; border-bottom:1px solid #263244; white-space:nowrap; max-width:420px } th { position:sticky; top:0; background:#1e293b; color:#93c5fd } td { vertical-align:top; white-space:pre-wrap; word-break:break-word; min-width:140px } .error { color:#fca5a5 }
+    @media (max-width:700px) { header,main { padding:16px } th,td { padding:7px } }
+  </style>
+</head>
+<body>
+  <header><div><h1>Flow Agent · SQLite viewer</h1><div class="muted">Chế độ chỉ đọc · không chỉnh sửa dữ liệu</div></div><button id="refresh">Làm mới</button></header>
+  <main>
+    <div class="toolbar"><label for="table">Bảng:</label><select id="table"></select><input id="search" placeholder="Lọc nội dung…"><label>Trang:</label><input id="pageSize" type="number" min="10" max="200" value="50" style="width:65px"></div>
+    <div id="status" class="status">Đang tải danh sách bảng…</div>
+    <div class="table-wrap"><table><thead id="head"></thead><tbody id="body"></tbody></table></div>
+    <div class="pager"><button id="prev">‹ Trước</button><span id="page"></span><button id="next">Sau ›</button></div>
+  </main>
+  <script>
+    const $=id=>document.getElementById(id); let currentPage=0,total=0;
+    const esc=v=>{if(v===null||v===undefined)return'NULL';if(typeof v==='object')return JSON.stringify(v);return String(v)};
+    async function getJson(url){const r=await fetch(url);const d=await r.json();if(!r.ok)throw Error(d.detail||r.statusText);return d}
+    async function loadTables(){try{const d=await getJson('/api/v1/db/tables');$('table').innerHTML=d.tables.map(t=>`<option value="${t.name}">${t.name} (${t.count})</option>`).join('');await loadRows()}catch(e){showError(e)}}
+    async function loadRows(){const name=$('table').value;if(!name)return;const size=Math.min(200,Math.max(10,Number($('pageSize').value)||50));$('status').textContent='Đang tải…';try{const q=new URLSearchParams({page:currentPage,page_size:size});if($('search').value)q.set('q',$('search').value);const d=await getJson('/api/v1/db/tables/'+encodeURIComponent(name)+'?'+q);total=d.total;$('head').innerHTML='<tr>'+d.columns.map(c=>`<th>${c}</th>`).join('')+'</tr>';$('body').innerHTML=d.rows.map(row=>'<tr>'+row.map(v=>`<td>${esc(v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}</td>`).join('')+'</tr>').join('');$('status').textContent=`${d.table}: ${total} dòng · database: ${d.database}`;$('page').textContent=`Trang ${currentPage+1} / ${Math.max(1,Math.ceil(total/size))}`;$('prev').disabled=currentPage===0;$('next').disabled=(currentPage+1)*size>=total}catch(e){showError(e)}}
+    function showError(e){$('status').className='status error';$('status').textContent=e.message}
+    $('table').onchange=()=>{currentPage=0;loadRows()};$('refresh').onclick=loadRows;$('prev').onclick=()=>{if(currentPage){currentPage--;loadRows()}};$('next').onclick=()=>{currentPage++;loadRows()};$('pageSize').onchange=()=>{currentPage=0;loadRows()};let timer;$('search').oninput=()=>{clearTimeout(timer);timer=setTimeout(()=>{currentPage=0;loadRows()},250)};loadTables();
+  </script>
+</body>
+</html>

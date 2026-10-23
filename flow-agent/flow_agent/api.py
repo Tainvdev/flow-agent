@@ -10,13 +10,15 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import json
+import re
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Literal, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .engine import EngineError, FlowEngine
@@ -68,6 +70,23 @@ SIZE_TO_ASPECT = {
 }
 
 MEDIA_DIR = engine.output_dir
+BASE_DIR = Path(__file__).resolve().parent
+IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _database_connection() -> sqlite3.Connection:
+    """Open the configured database read-only for the operator dashboard."""
+    connect = getattr(engine, "_connect", None)
+    if connect is not None:
+        return connect()
+    db_path = Path(getattr(engine, "db_path", ""))
+    return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+
+
+def _json_value(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return {"type": "bytes", "hex": value.hex()}
+    return value
 
 
 # --------------------------------------------------------------------------- #
@@ -394,6 +413,62 @@ async def openai_chat(
 # --------------------------------------------------------------------------- #
 # native
 # --------------------------------------------------------------------------- #
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    return FileResponse(BASE_DIR / "dashboard.html", media_type="text/html")
+
+
+@app.get("/api/v1/db/tables")
+async def database_tables():
+    """List SQLite tables and row counts without exposing write access."""
+    try:
+        with _database_connection() as conn:
+            tables = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+            result = []
+            for (name,) in tables:
+                quoted = '"' + name.replace('"', '""') + '"'
+                count = conn.execute(f"SELECT COUNT(*) FROM {quoted}").fetchone()[0]
+                result.append({"name": name, "count": count})
+        return {"database": str(getattr(engine, "db_path", "")), "tables": result}
+    except (sqlite3.Error, OSError) as exc:
+        raise HTTPException(status_code=503, detail=f"database unavailable: {exc}") from exc
+
+
+@app.get("/api/v1/db/tables/{table_name}")
+async def database_table(table_name: str, page: int = 0, page_size: int = 50, q: str = ""):
+    """Read one SQLite table with bounded pagination and optional text filter."""
+    if not IDENTIFIER.fullmatch(table_name):
+        raise HTTPException(status_code=400, detail="invalid table name")
+    if page < 0 or not 1 <= page_size <= 200:
+        raise HTTPException(status_code=400, detail="page must be >= 0 and page_size must be 1..200")
+    quoted = '"' + table_name.replace('"', '""') + '"'
+    try:
+        with _database_connection() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table_name,)
+            ).fetchone()
+            if not exists:
+                raise HTTPException(status_code=404, detail="table not found")
+            info = conn.execute(f"PRAGMA table_info({quoted})").fetchall()
+            columns = [row[1] for row in info]
+            where, args = "", []
+            if q.strip() and columns:
+                safe_columns = [f'"{c.replace(chr(34), chr(34) * 2)}"' for c in columns]
+                where = " WHERE " + " OR ".join(f"CAST({c} AS TEXT) LIKE ?" for c in safe_columns)
+                args = [f"%{q}%"] * len(columns)
+            total = conn.execute(f"SELECT COUNT(*) FROM {quoted}{where}", args).fetchone()[0]
+            order = " ORDER BY rowid DESC" if any(row[5] for row in info) else ""
+            rows = conn.execute(f"SELECT * FROM {quoted}{where}{order} LIMIT ? OFFSET ?", [*args, page_size, page * page_size]).fetchall()
+            return {"database": str(getattr(engine, "db_path", "")), "table": table_name, "columns": columns, "rows": [[_json_value(v) for v in row] for row in rows], "page": page, "page_size": page_size, "total": total}
+    except HTTPException:
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise HTTPException(status_code=503, detail=f"database unavailable: {exc}") from exc
 
 
 @app.post("/api/v1/jobs")

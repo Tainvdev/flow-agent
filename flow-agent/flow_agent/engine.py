@@ -167,7 +167,17 @@ class FlowEngine:
                 self.root = pkg_dir.parent
 
         self.binary = self._find_binary(self.root, binary)
-        self.db_path = Path(db_path) if db_path else self.root / "data" / "flow.db"
+        # Keep Python/FastAPI on the same SQLite file as the Go service.  The
+        # service has always supported FLOW_DB_PATH and FLOW_DATA_DIR; without
+        # reading them here, the dashboard and /stats silently looked under
+        # the Python package directory instead.
+        configured_db = db_path or os.getenv("FLOW_DB_PATH")
+        if configured_db:
+            self.db_path = Path(configured_db).resolve()
+        else:
+            configured_data = os.getenv("FLOW_DATA_DIR")
+            data_dir = Path(configured_data) if configured_data else self.root / "data"
+            self.db_path = (data_dir / "flow.db").resolve()
         configured_output = output_dir or os.getenv("FLOW_OUTPUT_DIR")
         self.output_dir = Path(configured_output).resolve() if configured_output else self.root / "output"
         self.timeout = timeout

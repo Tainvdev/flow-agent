@@ -31,6 +31,9 @@ py-modules = ["main"]
 [tool.setuptools.packages.find]
 include = ["flow_agent*"]
 
+[tool.setuptools.package-data]
+flow_agent = ["dashboard.html"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
