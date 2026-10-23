@@ -31,6 +31,57 @@ func TestCreateJobIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestMonitorQueriesReturnBoundedPayloadFreeIntakeAndJobs(t *testing.T) {
+	st := openTemp(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if _, _, err := st.CreateJob(ctx, Job{ID: "monitor-job", Kind: "video", Payload: `{"prompt":"private"}`}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordIntakeRequest(ctx, IntakeRequest{
+		RequestID: "monitor-request", Endpoint: "/internal/v1/jobs", Kind: "video",
+		Outcome: "accepted", HTTPStatus: 202, JobID: "monitor-job", ElapsedMS: 3.5, ReceivedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE jobs SET status='failed',finished_at=? WHERE job_id=?`, dbTimestamp(now), "monitor-job"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.StartJobAttempt(ctx, "monitor-job", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.StartJobAttempt(ctx, "monitor-job", 2); err != nil {
+		t.Fatal(err)
+	}
+	intake, err := st.RecentIntakeRequests(ctx, 10)
+	if err != nil || len(intake) != 1 || intake[0].JobID != "monitor-job" || intake[0].Outcome != "accepted" {
+		t.Fatalf("intake=%+v err=%v", intake, err)
+	}
+	counts, err := st.IntakeCountsSince(ctx, now.Add(-time.Minute))
+	if err != nil || counts["accepted"] != 1 || counts["rejected"] != 0 {
+		t.Fatalf("intake counts=%v err=%v", counts, err)
+	}
+	outcomes, err := st.JobOutcomeCountsSince(ctx, now.Add(-time.Minute))
+	if err != nil || outcomes["failed"] != 1 {
+		t.Fatalf("job outcomes=%v err=%v", outcomes, err)
+	}
+	retries, err := st.RetryCountSince(ctx, now.Add(-time.Minute))
+	if err != nil || retries != 1 {
+		t.Fatalf("retry count=%d err=%v", retries, err)
+	}
+	timeline, err := st.IntakeTimeline(ctx, now)
+	if err != nil || len(timeline) != 12 {
+		t.Fatalf("timeline buckets=%d err=%v, want 12 buckets", len(timeline), err)
+	}
+	jobs, err := st.RecentMonitorJobs(ctx, 10, "failed", "video")
+	if err != nil || len(jobs) != 1 || jobs[0].JobID != "monitor-job" || jobs[0].Status != "failed" {
+		t.Fatalf("monitor jobs=%+v err=%v", jobs, err)
+	}
+	if _, err := st.RecentMonitorJobs(ctx, 201, "", ""); err == nil {
+		t.Fatal("monitor query accepted an unbounded limit")
+	}
+}
+
 func TestCreateJobDefaultsAndValidatesPayloadVersion(t *testing.T) {
 	st := openTemp(t)
 	ctx := context.Background()

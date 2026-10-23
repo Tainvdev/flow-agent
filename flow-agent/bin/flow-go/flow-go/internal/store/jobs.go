@@ -54,7 +54,7 @@ type JobAttempt struct {
 	SessionRevision string                 `json:"session_revision,omitempty"`
 	Phase           string                 `json:"phase"`
 	UpstreamIDs     []string               `json:"upstream_ids,omitempty"`
-	Result          string                 `json:"-"`
+	Result          string                 `json:"result,omitempty"`
 	Error           string                 `json:"error,omitempty"`
 	StartedAt       time.Time              `json:"started_at"`
 	UpdatedAt       time.Time              `json:"updated_at"`
@@ -75,6 +75,285 @@ type JobEvent struct {
 	Type  string          `json:"type"`
 	Data  json.RawMessage `json:"data"`
 	At    time.Time       `json:"at"`
+}
+
+// IntakeRequest is safe operational metadata for one authenticated request to
+// the durable job intake endpoint. It never contains the request payload.
+type IntakeRequest struct {
+	RequestID  string    `json:"request_id"`
+	Endpoint   string    `json:"endpoint"`
+	Kind       string    `json:"kind,omitempty"`
+	Outcome    string    `json:"outcome"`
+	Reason     string    `json:"reason,omitempty"`
+	HTTPStatus int       `json:"http_status"`
+	JobID      string    `json:"job_id,omitempty"`
+	ElapsedMS  float64   `json:"elapsed_ms"`
+	ReceivedAt time.Time `json:"received_at"`
+}
+
+// MonitorJob is the small, payload-free job row shown in the admin monitor.
+type MonitorJob struct {
+	JobID      string     `json:"job_id"`
+	Kind       string     `json:"kind"`
+	Status     string     `json:"status"`
+	Attempts   int        `json:"attempts"`
+	ParentID   string     `json:"parent_id,omitempty"`
+	ChildIndex int        `json:"child_index,omitempty"`
+	Phase      string     `json:"phase,omitempty"`
+	AccountID  string     `json:"account_id,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	AttemptAt  *time.Time `json:"attempt_started_at,omitempty"`
+}
+
+// RecordIntakeRequest persists metadata for an authenticated intake attempt.
+func (s *Store) RecordIntakeRequest(ctx context.Context, item IntakeRequest) error {
+	if strings.TrimSpace(item.RequestID) == "" || strings.TrimSpace(item.Endpoint) == "" ||
+		(item.Outcome != "accepted" && item.Outcome != "replayed" && item.Outcome != "rejected") {
+		return fmt.Errorf("store: intake request id, endpoint, and valid outcome are required")
+	}
+	if item.ReceivedAt.IsZero() {
+		item.ReceivedAt = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO intake_requests
+		(request_id, endpoint, kind, outcome, reason, http_status, job_id, elapsed_ms, received_at)
+		VALUES(?,?,?,?,?,?,?,?,?)`, item.RequestID, item.Endpoint, item.Kind, item.Outcome, item.Reason,
+		item.HTTPStatus, item.JobID, item.ElapsedMS, dbTimestamp(item.ReceivedAt.UTC().Round(0)))
+	if err != nil {
+		return fmt.Errorf("store: record intake request: %w", err)
+	}
+	return nil
+}
+
+// RecentIntakeRequests returns bounded, payload-free intake history.
+func (s *Store) RecentIntakeRequests(ctx context.Context, limit int) ([]IntakeRequest, error) {
+	if limit < 1 || limit > 200 {
+		return nil, fmt.Errorf("store: intake request limit must be between 1 and 200")
+	}
+	items, _, err := s.IntakeRequestsPage(ctx, limit, 0)
+	return items, err
+}
+
+// IntakeRequestsPage returns newest-first request metadata without payloads.
+func (s *Store) IntakeRequestsPage(ctx context.Context, limit, offset int) ([]IntakeRequest, int64, error) {
+	if limit < 1 || limit > 200 || offset < 0 {
+		return nil, 0, fmt.Errorf("store: intake request page is out of range")
+	}
+	var total int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM intake_requests`).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("store: count intake requests: %w", err)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT request_id, endpoint, COALESCE(kind,''), outcome,
+		COALESCE(reason,''), http_status, COALESCE(job_id,''), elapsed_ms, received_at
+		FROM intake_requests ORDER BY received_at DESC, request_id DESC LIMIT ? OFFSET ?`, limit, offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("store: list intake requests: %w", err)
+	}
+	defer rows.Close()
+	result := make([]IntakeRequest, 0, limit)
+	for rows.Next() {
+		var item IntakeRequest
+		if err := rows.Scan(&item.RequestID, &item.Endpoint, &item.Kind, &item.Outcome,
+			&item.Reason, &item.HTTPStatus, &item.JobID, &item.ElapsedMS, &item.ReceivedAt); err != nil {
+			return nil, 0, fmt.Errorf("store: scan intake request: %w", err)
+		}
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("store: iterate intake requests: %w", err)
+	}
+	return result, total, nil
+}
+
+// IntakeCountsSince returns request totals grouped by accepted/replayed/rejected.
+func (s *Store) IntakeCountsSince(ctx context.Context, since time.Time) (map[string]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT outcome, COUNT(*) FROM intake_requests
+		WHERE julianday(received_at) >= julianday(?) GROUP BY outcome`, dbTimestamp(since.UTC().Round(0)))
+	if err != nil {
+		return nil, fmt.Errorf("store: count intake requests: %w", err)
+	}
+	defer rows.Close()
+	counts := map[string]int64{"accepted": 0, "replayed": 0, "rejected": 0}
+	for rows.Next() {
+		var outcome string
+		var count int64
+		if err := rows.Scan(&outcome, &count); err != nil {
+			return nil, err
+		}
+		counts[outcome] = count
+	}
+	return counts, rows.Err()
+}
+
+// IntakeTimeline returns five-minute intake buckets for the previous hour.
+func (s *Store) IntakeTimeline(ctx context.Context, now time.Time) ([]map[string]any, error) {
+	start := now.UTC().Truncate(5 * time.Minute).Add(-55 * time.Minute)
+	rows, err := s.db.QueryContext(ctx, `SELECT CAST(strftime('%s', received_at) AS INTEGER) / 300 AS bucket,
+		SUM(outcome='accepted'), SUM(outcome='replayed'), SUM(outcome='rejected')
+		FROM intake_requests WHERE julianday(received_at) >= julianday(?)
+		GROUP BY bucket ORDER BY bucket`, dbTimestamp(start))
+	if err != nil {
+		return nil, fmt.Errorf("store: read intake timeline: %w", err)
+	}
+	defer rows.Close()
+	buckets := make(map[int64]map[string]any)
+	for rows.Next() {
+		var bucket, accepted, replayed, rejected int64
+		if err := rows.Scan(&bucket, &accepted, &replayed, &rejected); err != nil {
+			return nil, err
+		}
+		buckets[bucket] = map[string]any{
+			"at": time.Unix(bucket*300, 0).UTC(), "accepted": accepted,
+			"replayed": replayed, "rejected": rejected,
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	result := make([]map[string]any, 0, 12)
+	first := start.Unix() / 300
+	for bucket := first; bucket <= now.UTC().Unix()/300; bucket++ {
+		if item, ok := buckets[bucket]; ok {
+			result = append(result, item)
+		} else {
+			result = append(result, map[string]any{
+				"at": time.Unix(bucket*300, 0).UTC(), "accepted": int64(0),
+				"replayed": int64(0), "rejected": int64(0),
+			})
+		}
+	}
+	return result, nil
+}
+
+// JobOutcomeCountsSince counts logical top-level jobs completed in a time window.
+func (s *Store) JobOutcomeCountsSince(ctx context.Context, since time.Time) (map[string]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM jobs
+		WHERE COALESCE(parent_id,'')='' AND finished_at IS NOT NULL
+		AND julianday(finished_at) >= julianday(?) GROUP BY status`, dbTimestamp(since.UTC().Round(0)))
+	if err != nil {
+		return nil, fmt.Errorf("store: count job outcomes: %w", err)
+	}
+	defer rows.Close()
+	counts := map[string]int64{"succeeded": 0, "partial": 0, "failed": 0, "cancelled": 0, "submission_unknown": 0}
+	for rows.Next() {
+		var status string
+		var count int64
+		if err := rows.Scan(&status, &count); err != nil {
+			return nil, err
+		}
+		counts[status] = count
+	}
+	return counts, rows.Err()
+}
+
+// RetryCountSince counts worker attempts after the initial attempt in a window.
+func (s *Store) RetryCountSince(ctx context.Context, since time.Time) (int64, error) {
+	var count int64
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM job_attempts
+		WHERE attempt_no > 1 AND julianday(started_at) >= julianday(?)`, dbTimestamp(since.UTC().Round(0))).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("store: count job retries: %w", err)
+	}
+	return count, nil
+}
+
+// RecentMonitorJobs lists jobs with active work first, then newest submissions.
+// Filters are optional and all values are bound parameters.
+func (s *Store) RecentMonitorJobs(ctx context.Context, limit int, status, kind string) ([]MonitorJob, error) {
+	if limit < 1 || limit > 200 {
+		return nil, fmt.Errorf("store: monitor job limit must be between 1 and 200")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT j.job_id, j.kind, j.status, j.attempts,
+		COALESCE(j.parent_id,''), j.child_index, COALESCE(a.phase,''), COALESCE(a.account_id,''),
+		j.created_at, j.updated_at, j.finished_at, a.started_at
+		FROM jobs j
+		LEFT JOIN job_attempts a ON a.job_id=j.job_id AND a.attempt_no=(
+			SELECT MAX(latest.attempt_no) FROM job_attempts latest WHERE latest.job_id=j.job_id)
+		WHERE (?='' OR j.status=?) AND (?='' OR j.kind=?)
+		ORDER BY CASE WHEN j.status IN ('queued','running','waiting_children') THEN 0 ELSE 1 END,
+			j.created_at DESC LIMIT ?`, status, status, kind, kind, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: list monitor jobs: %w", err)
+	}
+	defer rows.Close()
+	result := make([]MonitorJob, 0, limit)
+	for rows.Next() {
+		var item MonitorJob
+		var finished, attemptAt sql.NullTime
+		if err := rows.Scan(&item.JobID, &item.Kind, &item.Status, &item.Attempts, &item.ParentID,
+			&item.ChildIndex, &item.Phase, &item.AccountID, &item.CreatedAt, &item.UpdatedAt,
+			&finished, &attemptAt); err != nil {
+			return nil, fmt.Errorf("store: scan monitor job: %w", err)
+		}
+		if finished.Valid {
+			item.FinishedAt = &finished.Time
+		}
+		if attemptAt.Valid {
+			item.AttemptAt = &attemptAt.Time
+		}
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate monitor jobs: %w", err)
+	}
+	return result, nil
+}
+
+// MonitorJobsPage returns the newest matching jobs and the total number of
+// matches so the admin monitor can page through durable job history.
+func (s *Store) MonitorJobsPage(ctx context.Context, limit, offset int, status, kind string) ([]MonitorJob, int64, error) {
+	if limit < 1 || limit > 200 || offset < 0 {
+		return nil, 0, fmt.Errorf("store: invalid monitor job page")
+	}
+	var total int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs
+		WHERE (?='' OR status=?) AND (?='' OR kind=?)`, status, status, kind, kind).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("store: count monitor jobs: %w", err)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT j.job_id, j.kind, j.status, j.attempts,
+		COALESCE(j.parent_id,''), j.child_index, COALESCE(a.phase,''), COALESCE(a.account_id,''),
+		j.created_at, j.updated_at, j.finished_at, a.started_at
+		FROM jobs j
+		LEFT JOIN job_attempts a ON a.job_id=j.job_id AND a.attempt_no=(
+			SELECT MAX(latest.attempt_no) FROM job_attempts latest WHERE latest.job_id=j.job_id)
+		WHERE (?='' OR j.status=?) AND (?='' OR j.kind=?)
+		ORDER BY j.created_at DESC, j.job_id DESC LIMIT ? OFFSET ?`,
+		status, status, kind, kind, limit, offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("store: list monitor jobs page: %w", err)
+	}
+	defer rows.Close()
+	result := make([]MonitorJob, 0, limit)
+	for rows.Next() {
+		var item MonitorJob
+		var finished, attemptAt sql.NullTime
+		if err := rows.Scan(&item.JobID, &item.Kind, &item.Status, &item.Attempts, &item.ParentID,
+			&item.ChildIndex, &item.Phase, &item.AccountID, &item.CreatedAt, &item.UpdatedAt,
+			&finished, &attemptAt); err != nil {
+			return nil, 0, fmt.Errorf("store: scan monitor job page: %w", err)
+		}
+		if finished.Valid {
+			item.FinishedAt = &finished.Time
+		}
+		if attemptAt.Valid {
+			item.AttemptAt = &attemptAt.Time
+		}
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("store: iterate monitor jobs page: %w", err)
+	}
+	return result, total, nil
+}
+
+// DeleteIntakeBefore prunes old request metadata using the service retention window.
+func (s *Store) DeleteIntakeBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM intake_requests WHERE julianday(received_at) < julianday(?)`, dbTimestamp(cutoff.UTC().Round(0)))
+	if err != nil {
+		return 0, fmt.Errorf("store: prune intake requests: %w", err)
+	}
+	return result.RowsAffected()
 }
 
 // JobQueueStats is a bounded snapshot of durable job states for service

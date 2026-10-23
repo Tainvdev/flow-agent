@@ -434,6 +434,10 @@ func TestJobsAPIRequiresToken(t *testing.T) {
 	if res.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want unauthorized", res.Code)
 	}
+	intake, err := jobs.store.RecentIntakeRequests(context.Background(), 10)
+	if err != nil || len(intake) != 1 || intake[0].Outcome != "rejected" || intake[0].HTTPStatus != http.StatusUnauthorized {
+		t.Fatalf("unauthorized intake=%+v err=%v, want rejected request record", intake, err)
+	}
 }
 
 func TestJobsAPIAcceptsImageCountAsOneQueuedJob(t *testing.T) {
@@ -454,6 +458,13 @@ func TestJobsAPIAcceptsImageCountAsOneQueuedJob(t *testing.T) {
 	if err := json.Unmarshal(res.Body.Bytes(), &accepted); err != nil {
 		t.Fatal(err)
 	}
+	if res.Header().Get("X-Request-ID") == "" {
+		t.Fatal("accepted request has no request id")
+	}
+	intake, err := jobs.store.RecentIntakeRequests(context.Background(), 10)
+	if err != nil || len(intake) != 1 || intake[0].Outcome != "accepted" || intake[0].JobID != accepted.ID || intake[0].Kind != "image" {
+		t.Fatalf("accepted intake=%+v err=%v, want request linked to persisted image job", intake, err)
+	}
 	job, err := jobs.store.JobByID(context.Background(), accepted.ID)
 	children, childrenErr := jobs.store.ChildJobs(context.Background(), accepted.ID)
 	if err != nil || childrenErr != nil || accepted.Status != "queued" || job.Status != "queued" || len(children) != 0 {
@@ -462,6 +473,26 @@ func TestJobsAPIAcceptsImageCountAsOneQueuedJob(t *testing.T) {
 	var payload generationPayload
 	if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil || payload.Count != 2 {
 		t.Fatalf("queued payload=%s count=%d err=%v, want count preserved as 2", job.Payload, payload.Count, err)
+	}
+}
+
+func TestJobsAPIRecordsRejectedIntakeWithoutPayload(t *testing.T) {
+	jobs, _ := newTestJobs(t)
+	req := httptest.NewRequest(http.MethodPost, "/internal/v1/jobs", strings.NewReader(`{"kind":"unknown","payload":{}}`))
+	req.Header.Set("Authorization", "Bearer test-token")
+	res := httptest.NewRecorder()
+	jobs.ServeHTTP(res, req)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("rejected request status=%d body=%s", res.Code, res.Body.String())
+	}
+	intake, err := jobs.store.RecentIntakeRequests(context.Background(), 10)
+	if err != nil || len(intake) != 1 || intake[0].Outcome != "rejected" || intake[0].HTTPStatus != http.StatusBadRequest || intake[0].JobID != "" {
+		t.Fatalf("rejected intake=%+v err=%v, want payload-free rejection record", intake, err)
+	}
+	for _, field := range []string{intake[0].RequestID, intake[0].Endpoint, intake[0].Outcome} {
+		if strings.Contains(field, "unknown") || strings.Contains(field, "payload") {
+			t.Fatalf("intake metadata unexpectedly retained request content: %+v", intake[0])
+		}
 	}
 }
 

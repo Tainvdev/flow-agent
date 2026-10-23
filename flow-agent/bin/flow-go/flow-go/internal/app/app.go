@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kodelyx/flow-go/flow-go/internal/bridge"
@@ -258,15 +259,9 @@ func (a *App) RunService(ctx context.Context, listenAddr, token string, workers 
 	if err != nil {
 		return err
 	}
-	if err := a.Store.SetMaxOutstandingJobs(queueLimit); err != nil {
-		return err
-	}
 	retentionDays, err := positiveEnvInt("FLOW_JOB_RETENTION_DAYS", 30)
 	if err != nil {
 		return err
-	}
-	if _, err := a.Store.DeleteTerminalJobsBefore(ctx, time.Now().Add(-time.Duration(retentionDays)*24*time.Hour)); err != nil {
-		return fmt.Errorf("app: apply configured %d-day job retention: %w", retentionDays, err)
 	}
 	maxAttempts, err := jobMaxAttemptsFromEnv()
 	if err != nil {
@@ -280,45 +275,151 @@ func (a *App) RunService(ctx context.Context, listenAddr, token string, workers 
 	if err != nil {
 		return err
 	}
-	manager, err := service.NewAccountManagerWithMediaLimits(a.Store, a.Bridge, workers, pollLimit, downloadLimit, a.captchaMode)
-	if err != nil {
-		return err
-	}
-	log.Printf("app: service reCAPTCHA strategy=%q", a.captchaMode)
 	queueWorkers, err := queueWorkersFromEnv(workers)
 	if err != nil {
 		return err
 	}
-	jobs, err := service.NewJobs(a.Store, manager, token, queueWorkers)
+	preSubmitAttempts, err := jobRetryBudgetFromEnv("FLOW_JOB_MAX_PRE_SUBMIT_ATTEMPTS", maxAttempts)
 	if err != nil {
 		return err
 	}
-	if err := jobs.SetMaxAttempts(maxAttempts); err != nil {
+	resumeAttempts, err := jobRetryBudgetFromEnv("FLOW_JOB_MAX_RESUME_ATTEMPTS", maxAttempts)
+	if err != nil {
 		return err
 	}
-	for _, retryClass := range []struct{ class, env string }{
-		{class: "pre_submit_deadline", env: "FLOW_JOB_MAX_PRE_SUBMIT_ATTEMPTS"},
-		{class: "resume_media", env: "FLOW_JOB_MAX_RESUME_ATTEMPTS"},
-		{class: "account_throttle", env: "FLOW_JOB_MAX_THROTTLE_ATTEMPTS"},
-	} {
-		budget, err := jobRetryBudgetFromEnv(retryClass.env, maxAttempts)
-		if err != nil {
-			return err
-		}
-		if err := jobs.SetRetryBudget(retryClass.class, budget); err != nil {
-			return err
-		}
+	throttleAttempts, err := jobRetryBudgetFromEnv("FLOW_JOB_MAX_THROTTLE_ATTEMPTS", maxAttempts)
+	if err != nil {
+		return err
 	}
+	cookieFreshness := strings.ToLower(strings.TrimSpace(os.Getenv("FLOW_COOKIE_FRESHNESS")))
+	if cookieFreshness != "cached" {
+		cookieFreshness = "strict"
+	}
+	defaults := service.RuntimeSettings{
+		SubmissionConcurrency: workers, QueueWorkers: queueWorkers, AccountConcurrency: 1,
+		MediaPollConcurrency: pollLimit, MediaDownloadConcurrency: downloadLimit,
+		MaxOutstandingJobs: queueLimit, MaxJobAttempts: maxAttempts,
+		PreSubmitAttempts: preSubmitAttempts, ResumeAttempts: resumeAttempts,
+		ThrottleAttempts: throttleAttempts, JobRetentionDays: retentionDays,
+		CookieFreshness: cookieFreshness,
+	}
+	runtimeSettings, settingSources, err := service.LoadRuntimeSettings(a.Store, defaults)
+	if err != nil {
+		return err
+	}
+	if err := a.Store.SetMaxOutstandingJobs(runtimeSettings.MaxOutstandingJobs); err != nil {
+		return err
+	}
+	if _, err := a.Store.DeleteTerminalJobsBefore(ctx, time.Now().Add(-time.Duration(runtimeSettings.JobRetentionDays)*24*time.Hour)); err != nil {
+		return fmt.Errorf("app: apply configured %d-day job retention: %w", runtimeSettings.JobRetentionDays, err)
+	}
+	manager, err := service.NewAccountManagerWithMediaLimits(a.Store, a.Bridge, workers, pollLimit, downloadLimit, a.captchaMode)
+	if err != nil {
+		return err
+	}
+	manager.ApplyRuntimeSettings(runtimeSettings)
+	log.Printf("app: service reCAPTCHA strategy=%q", a.captchaMode)
+	jobs, err := service.NewJobs(a.Store, manager, token, runtimeSettings.QueueWorkers)
+	if err != nil {
+		return err
+	}
+	jobs.ApplyRuntimeSettings(runtimeSettings)
 	a.Bridge.OnCookieSync = manager.Notify
+	a.Bridge.OnConnectionChange = manager.NotifyConnectionChange
 	clearPairingMarker()
 	// Keep service workers alive after the caller requests shutdown so the
 	// bounded drain can finish active jobs before stop() cancels their runtime.
 	serviceCtx, stop := context.WithCancel(context.Background())
 	defer stop()
+	var runtimeSettingsMu sync.RWMutex
+	activeSettings := runtimeSettings
+	activeSources := settingSources
+	retentionWake := make(chan struct{}, 1)
+	pruneRetention := func(ctx context.Context) {
+		runtimeSettingsMu.RLock()
+		days := activeSettings.JobRetentionDays
+		runtimeSettingsMu.RUnlock()
+		cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
+		if _, err := a.Store.DeleteTerminalJobsBefore(ctx, cutoff); err != nil && ctx.Err() == nil {
+			log.Printf("app: periodic job retention cleanup failed: %v", err)
+		}
+		if _, err := a.Store.DeleteIntakeBefore(ctx, cutoff); err != nil && ctx.Err() == nil {
+			log.Printf("app: periodic intake retention cleanup failed: %v", err)
+		}
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/internal/v1/jobs", jobs)
 	mux.Handle("/internal/v1/jobs/", jobs)
+	mux.Handle("/internal/v1/settings", service.RequireToken(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeSettings := func() {
+			runtimeSettingsMu.RLock()
+			settingsSnapshot, sourcesSnapshot := activeSettings, make(map[string]string, len(activeSources))
+			for key, value := range activeSources {
+				sourcesSnapshot[key] = value
+			}
+			runtimeSettingsMu.RUnlock()
+			active := manager.RuntimeLimitStats()
+			queueTarget, queueLive := jobs.WorkerCounts()
+			active["queue_workers_target"] = queueTarget
+			active["queue_workers_live"] = queueLive
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"values": settingsSnapshot, "defaults": defaults, "sources": sourcesSnapshot, "active": active,
+			})
+		}
+		switch r.Method {
+		case http.MethodGet:
+			writeSettings()
+		case http.MethodPatch:
+			var request struct {
+				Values map[string]json.RawMessage `json:"values"`
+				Reset  []string                   `json:"reset"`
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			decoder := json.NewDecoder(r.Body)
+			decoder.DisallowUnknownFields()
+			if err := decoder.Decode(&request); err != nil {
+				http.Error(w, "invalid settings request: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			if len(request.Values) == 0 && len(request.Reset) == 0 {
+				http.Error(w, "provide values or reset keys", http.StatusBadRequest)
+				return
+			}
+			runtimeSettingsMu.Lock()
+			next, err := service.MergeRuntimeSettings(defaults, activeSettings, request.Values, request.Reset)
+			if err != nil {
+				runtimeSettingsMu.Unlock()
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if err := service.PersistRuntimeSettings(a.Store, next, request.Values, request.Reset); err != nil {
+				runtimeSettingsMu.Unlock()
+				http.Error(w, "could not persist settings", http.StatusInternalServerError)
+				return
+			}
+			_ = a.Store.SetMaxOutstandingJobs(next.MaxOutstandingJobs)
+			manager.ApplyRuntimeSettings(next)
+			jobs.ApplyRuntimeSettings(next)
+			activeSettings = next
+			for key := range request.Values {
+				activeSources[key] = "admin"
+			}
+			for _, key := range request.Reset {
+				activeSources[key] = "startup default"
+			}
+			runtimeSettingsMu.Unlock()
+			select {
+			case retentionWake <- struct{}{}:
+			default:
+			}
+			writeSettings()
+		default:
+			w.Header().Set("Allow", "GET, PATCH")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})))
 	mux.Handle("/internal/v1/balance", service.RequireToken(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		result, err := manager.Balance(r.Context(), r.URL.Query().Get("refresh") == "true")
 		if err != nil {
@@ -399,6 +500,122 @@ func (a *App) RunService(ctx context.Context, listenAddr, token string, workers 
 			},
 		})
 	})))
+	mux.Handle("/internal/v1/monitor", service.RequireToken(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		limit := 50
+		if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 1 || parsed > 200 {
+				http.Error(w, "limit must be between 1 and 200", http.StatusBadRequest)
+				return
+			}
+			limit = parsed
+		}
+		page := 0
+		if raw := strings.TrimSpace(r.URL.Query().Get("page")); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 0 || parsed > 1_000_000_000 {
+				http.Error(w, "page must be between 0 and 1000000000", http.StatusBadRequest)
+				return
+			}
+			page = parsed
+		}
+		pageSize := limit
+		if raw := strings.TrimSpace(r.URL.Query().Get("page_size")); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 1 || parsed > 200 {
+				http.Error(w, "page_size must be between 1 and 200", http.StatusBadRequest)
+				return
+			}
+			pageSize = parsed
+		}
+		jobs, jobTotal, err := a.Store.MonitorJobsPage(r.Context(), pageSize, page*pageSize,
+			strings.TrimSpace(r.URL.Query().Get("status")), strings.TrimSpace(r.URL.Query().Get("kind")))
+		if err != nil {
+			http.Error(w, "could not read monitor jobs", http.StatusInternalServerError)
+			return
+		}
+		intakePage := 0
+		if raw := strings.TrimSpace(r.URL.Query().Get("request_page")); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 0 || parsed > 1_000_000_000 {
+				http.Error(w, "request_page must be between 0 and 1000000000", http.StatusBadRequest)
+				return
+			}
+			intakePage = parsed
+		}
+		intakePageSize := 20
+		if raw := strings.TrimSpace(r.URL.Query().Get("request_page_size")); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 1 || parsed > 200 {
+				http.Error(w, "request_page_size must be between 1 and 200", http.StatusBadRequest)
+				return
+			}
+			intakePageSize = parsed
+		}
+		intake, intakeTotal, err := a.Store.IntakeRequestsPage(r.Context(), intakePageSize, intakePage*intakePageSize)
+		if err != nil {
+			http.Error(w, "could not read intake requests", http.StatusInternalServerError)
+			return
+		}
+		counts := make(map[string]map[string]int64, 3)
+		outcomes := make(map[string]map[string]int64, 3)
+		retries := make(map[string]int64, 3)
+		for name, duration := range map[string]time.Duration{
+			"5m": 5 * time.Minute, "1h": time.Hour, "24h": 24 * time.Hour,
+		} {
+			since := time.Now().Add(-duration)
+			value, err := a.Store.IntakeCountsSince(r.Context(), since)
+			if err != nil {
+				http.Error(w, "could not summarize intake requests", http.StatusInternalServerError)
+				return
+			}
+			counts[name] = value
+			valueByStatus, err := a.Store.JobOutcomeCountsSince(r.Context(), since)
+			if err != nil {
+				http.Error(w, "could not summarize job outcomes", http.StatusInternalServerError)
+				return
+			}
+			outcomes[name] = valueByStatus
+			retryCount, err := a.Store.RetryCountSince(r.Context(), since)
+			if err != nil {
+				http.Error(w, "could not summarize job retries", http.StatusInternalServerError)
+				return
+			}
+			retries[name] = retryCount
+		}
+		timeline, err := a.Store.IntakeTimeline(r.Context(), time.Now())
+		if err != nil {
+			http.Error(w, "could not read intake timeline", http.StatusInternalServerError)
+			return
+		}
+		queue, err := a.Store.JobQueueStats(r.Context())
+		if err != nil {
+			http.Error(w, "could not read job queue", http.StatusInternalServerError)
+			return
+		}
+		latency, latencyByKind, err := a.Store.PhaseLatencyBreakdown(r.Context(), 5000)
+		if err != nil {
+			http.Error(w, "could not read phase latency", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"generated_at": time.Now().UTC(),
+			"intake": map[string]any{"counts": counts, "timeline": timeline, "recent": intake,
+				"pagination": map[string]any{"page": intakePage, "page_size": intakePageSize, "total": intakeTotal}},
+			"jobs":            jobs,
+			"jobs_pagination": map[string]any{"page": page, "page_size": pageSize, "total": jobTotal},
+			"job_outcomes":    outcomes,
+			"retry_attempts":  retries,
+			"service": map[string]any{
+				"queue": queue, "ready_accounts": manager.ReadyAccounts(),
+				"connected_accounts":      manager.ConnectedAccounts(),
+				"strict_cookie_freshness": manager.RequiresLiveCookieSync(),
+				"cookie_sync_age_seconds": manager.CookieSyncAges(),
+			},
+			"latency": latency, "latency_by_kind": latencyByKind,
+		})
+	})))
 	mux.Handle("/health", serviceHealthHandler(manager, false))
 	mux.Handle("/readyz", serviceHealthHandler(manager, true))
 	server := &http.Server{
@@ -414,6 +631,7 @@ func (a *App) RunService(ctx context.Context, listenAddr, token string, workers 
 	go func() { jobs.Start(serviceCtx); close(jobsDone) }()
 	go func() {
 		defer close(cleanupDone)
+		pruneRetention(serviceCtx)
 		ticker := time.NewTicker(time.Hour)
 		defer ticker.Stop()
 		for {
@@ -421,10 +639,9 @@ func (a *App) RunService(ctx context.Context, listenAddr, token string, workers 
 			case <-serviceCtx.Done():
 				return
 			case <-ticker.C:
-				cutoff := time.Now().Add(-time.Duration(retentionDays) * 24 * time.Hour)
-				if _, err := a.Store.DeleteTerminalJobsBefore(serviceCtx, cutoff); err != nil && serviceCtx.Err() == nil {
-					log.Printf("app: periodic job retention cleanup failed: %v", err)
-				}
+				pruneRetention(serviceCtx)
+			case <-retentionWake:
+				pruneRetention(serviceCtx)
 			}
 		}
 	}()

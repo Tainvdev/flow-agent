@@ -1,6 +1,10 @@
 package engine
 
-import "context"
+import (
+	"context"
+
+	"github.com/kodelyx/flow-go/flow-go/internal/limit"
+)
 
 func acquireMediaLimit(ctx context.Context, gate chan struct{}) (func(), error) {
 	if gate == nil {
@@ -12,4 +16,11 @@ func acquireMediaLimit(ctx context.Context, gate chan struct{}) (func(), error) 
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+func acquireConfiguredMediaLimit(ctx context.Context, adjustable *limit.Gate, legacy chan struct{}) (func(), error) {
+	if adjustable != nil {
+		return adjustable.Acquire(ctx)
+	}
+	return acquireMediaLimit(ctx, legacy)
 }

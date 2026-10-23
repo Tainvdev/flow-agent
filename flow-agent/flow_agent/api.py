@@ -142,6 +142,12 @@ class AsyncJobRequest(BaseModel):
     payload: dict[str, Any]
 
 
+class RuntimeSettingsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    values: dict[str, Any] = Field(default_factory=dict)
+    reset: list[str] = Field(default_factory=list)
+
+
 class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -417,7 +423,11 @@ async def openai_chat(
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    return FileResponse(BASE_DIR / "dashboard.html", media_type="text/html")
+    return FileResponse(
+        BASE_DIR / "dashboard.html",
+        media_type="text/html",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/v1/db/tables")
@@ -613,6 +623,52 @@ async def flow_stats():
     """Generation history and engine totals, read from the database."""
     try:
         return await engine.get_stats()
+    except EngineError as exc:
+        raise _engine_http_exception(exc) from exc
+
+
+@app.get("/api/v1/monitor")
+async def flow_monitor(limit: int = 50, status: str = "", kind: str = "",
+                       page: Optional[int] = None, page_size: Optional[int] = None,
+                       request_page: Optional[int] = None, request_page_size: Optional[int] = None):
+    """Live Go service intake, durable jobs, queue pressure and phase latency."""
+    if not 1 <= limit <= 200:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 200")
+    if page is not None and not 0 <= page <= 1_000_000_000:
+        raise HTTPException(status_code=400, detail="page must be between 0 and 1000000000")
+    if page_size is not None and not 1 <= page_size <= 200:
+        raise HTTPException(status_code=400, detail="page_size must be between 1 and 200")
+    if request_page is not None and not 0 <= request_page <= 1_000_000_000:
+        raise HTTPException(status_code=400, detail="request_page must be between 0 and 1000000000")
+    if request_page_size is not None and not 1 <= request_page_size <= 200:
+        raise HTTPException(status_code=400, detail="request pagination is out of range")
+    try:
+        pagination = {}
+        if page is not None or page_size is not None:
+            pagination = {"page": page if page is not None else 0,
+                          "page_size": page_size if page_size is not None else 20}
+        if request_page is not None or request_page_size is not None:
+            pagination.update({"request_page": request_page if request_page is not None else 0,
+                               "request_page_size": request_page_size if request_page_size is not None else 20})
+        return await engine.get_monitor(limit=limit, status=status, kind=kind, **pagination)
+    except EngineError as exc:
+        raise _engine_http_exception(exc) from exc
+
+
+@app.get("/api/v1/settings")
+async def get_runtime_settings():
+    try:
+        return await engine.get_runtime_settings()
+    except EngineError as exc:
+        raise _engine_http_exception(exc) from exc
+
+
+@app.patch("/api/v1/settings")
+async def update_runtime_settings(request: RuntimeSettingsRequest):
+    if not request.values and not request.reset:
+        raise HTTPException(status_code=400, detail="provide values or reset keys")
+    try:
+        return await engine.update_runtime_settings(request.model_dump())
     except EngineError as exc:
         raise _engine_http_exception(exc) from exc
 

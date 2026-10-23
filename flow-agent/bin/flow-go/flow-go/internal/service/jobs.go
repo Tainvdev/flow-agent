@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -83,15 +84,50 @@ type Jobs struct {
 	retryBudgets map[string]int
 	owner        string
 
-	startOnce   sync.Once
-	wg          sync.WaitGroup
-	claimMu     sync.Mutex
-	stopOnce    sync.Once
-	stopClaim   chan struct{}
-	inflight    sync.WaitGroup
-	activeMu    sync.Mutex
-	active      map[string]context.CancelFunc
-	wakeWorkers chan struct{}
+	startOnce      sync.Once
+	workerMu       sync.Mutex
+	settingsMu     sync.RWMutex
+	workerChanged  chan struct{}
+	supervisorDone chan struct{}
+	workerLive     atomic.Int32
+	wg             sync.WaitGroup
+	claimMu        sync.Mutex
+	stopOnce       sync.Once
+	stopClaim      chan struct{}
+	inflight       sync.WaitGroup
+	activeMu       sync.Mutex
+	active         map[string]context.CancelFunc
+	wakeWorkers    chan struct{}
+}
+
+// intakeResponseWriter observes only the small response metadata needed to link
+// a request to a persisted job. Response bytes are never written to SQLite.
+type intakeResponseWriter struct {
+	http.ResponseWriter
+	status int
+	body   []byte
+}
+
+func (w *intakeResponseWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *intakeResponseWriter) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	if remaining := 4096 - len(w.body); remaining > 0 {
+		capture := body
+		if len(capture) > remaining {
+			capture = capture[:remaining]
+		}
+		w.body = append(w.body, capture...)
+	}
+	return w.ResponseWriter.Write(body)
 }
 
 func NewJobs(st *store.Store, runner Runner, token string, workers int) (*Jobs, error) {
@@ -108,13 +144,20 @@ func NewJobs(st *store.Store, runner Runner, token string, workers int) (*Jobs, 
 		store: st, runner: runner, token: token, workers: workers,
 		maxAttempts: defaultJobMaxAttempts, retryBudgets: make(map[string]int),
 		owner: uuid.NewString(), stopClaim: make(chan struct{}), active: make(map[string]context.CancelFunc),
-		wakeWorkers: make(chan struct{}, workers),
+		wakeWorkers: make(chan struct{}, 256), workerChanged: make(chan struct{}, 1),
+		supervisorDone: make(chan struct{}),
 	}, nil
 }
 
 // signalWorkers wakes idle workers when durable work becomes runnable. The
 // ticker remains as a recovery backstop for already-persisted jobs.
 func (j *Jobs) signalWorkers(count int) {
+	j.workerMu.Lock()
+	workers := j.workers
+	j.workerMu.Unlock()
+	if count > workers {
+		count = workers
+	}
 	for i := 0; i < count; i++ {
 		select {
 		case j.wakeWorkers <- struct{}{}:
@@ -125,14 +168,16 @@ func (j *Jobs) signalWorkers(count int) {
 }
 
 // SetMaxAttempts configures the total number of executions allowed for a job.
-// It must be called before Start. Automatic replay still requires the runner to
+// Automatic replay still requires the runner to
 // prove the prior attempt was safe to retry; this setting never retries an
 // ambiguous upstream submission.
 func (j *Jobs) SetMaxAttempts(total int) error {
 	if total < 1 || total > maxJobMaxAttempts {
 		return fmt.Errorf("service: max job attempts must be between 1 and %d", maxJobMaxAttempts)
 	}
+	j.settingsMu.Lock()
 	j.maxAttempts = total
+	j.settingsMu.Unlock()
 	return nil
 }
 
@@ -146,21 +191,143 @@ func (j *Jobs) SetRetryBudget(class string, total int) error {
 	if total < 1 || total > maxJobMaxAttempts {
 		return fmt.Errorf("service: retry budget must be between 1 and %d", maxJobMaxAttempts)
 	}
+	j.settingsMu.Lock()
 	j.retryBudgets[class] = total
+	j.settingsMu.Unlock()
 	return nil
+}
+
+func (j *Jobs) SetWorkerCount(workers int) error {
+	if workers < 1 || workers > 256 {
+		return fmt.Errorf("service: queue workers must be between 1 and 256")
+	}
+	j.workerMu.Lock()
+	j.workers = workers
+	j.workerMu.Unlock()
+	select {
+	case j.workerChanged <- struct{}{}:
+	default:
+	}
+	j.signalWorkers(workers)
+	return nil
+}
+
+func (j *Jobs) ApplyRuntimeSettings(settings RuntimeSettings) {
+	j.settingsMu.Lock()
+	j.maxAttempts = settings.MaxJobAttempts
+	j.retryBudgets = map[string]int{
+		"pre_submit_deadline": settings.PreSubmitAttempts,
+		"resume_media":        settings.ResumeAttempts,
+		"account_throttle":    settings.ThrottleAttempts,
+	}
+	j.settingsMu.Unlock()
+	_ = j.SetWorkerCount(settings.QueueWorkers)
+}
+
+func (j *Jobs) retryBudget(class string) (int, int) {
+	j.settingsMu.RLock()
+	defer j.settingsMu.RUnlock()
+	budget := j.retryBudgets[class]
+	if budget == 0 {
+		budget = j.maxAttempts
+	}
+	return budget, j.maxAttempts
 }
 
 // Start launches workers. It is safe to call once and returns when ctx is
 // cancelled and every active runner has had a chance to stop.
 func (j *Jobs) Start(ctx context.Context) {
 	j.startOnce.Do(func() {
-		for i := 0; i < j.workers; i++ {
-			j.wg.Add(1)
-			go j.worker(ctx, fmt.Sprintf("%s-%d", j.owner, i))
-		}
+		go j.superviseWorkers(ctx)
 	})
 	<-ctx.Done()
-	j.wg.Wait()
+	<-j.supervisorDone
+}
+
+type queueWorker struct {
+	id       int
+	retire   chan struct{}
+	retiring bool
+	done     chan struct{}
+}
+
+func (j *Jobs) superviseWorkers(ctx context.Context) {
+	defer close(j.supervisorDone)
+	slots := make(map[int]*queueWorker)
+	nextID := 0
+	reconcile := func() {
+		for id, slot := range slots {
+			select {
+			case <-slot.done:
+				delete(slots, id)
+			default:
+			}
+		}
+		j.workerMu.Lock()
+		target := j.workers
+		j.workerMu.Unlock()
+		active := 0
+		for _, slot := range slots {
+			if !slot.retiring {
+				active++
+			}
+		}
+		for active > target {
+			var selected *queueWorker
+			for _, slot := range slots {
+				if !slot.retiring && (selected == nil || slot.id > selected.id) {
+					selected = slot
+				}
+			}
+			if selected == nil {
+				break
+			}
+			selected.retiring = true
+			close(selected.retire)
+			active--
+		}
+		for active < target {
+			slot := &queueWorker{id: nextID, retire: make(chan struct{}), done: make(chan struct{})}
+			nextID++
+			slots[slot.id] = slot
+			active++
+			j.wg.Add(1)
+			j.workerLive.Add(1)
+			go func(slot *queueWorker) {
+				defer close(slot.done)
+				defer j.workerLive.Add(-1)
+				j.worker(ctx, fmt.Sprintf("%s-%d", j.owner, slot.id), slot.retire)
+			}(slot)
+		}
+	}
+	reconcile()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			for _, slot := range slots {
+				if !slot.retiring {
+					close(slot.retire)
+				}
+			}
+			for _, slot := range slots {
+				<-slot.done
+			}
+			return
+		case <-j.workerChanged:
+			reconcile()
+		case <-ticker.C:
+			reconcile()
+		}
+	}
+}
+
+func (j *Jobs) WorkerCounts() (target, live int) {
+	j.workerMu.Lock()
+	target = j.workers
+	j.workerMu.Unlock()
+	return target, int(j.workerLive.Load())
 }
 
 // StopClaiming prevents workers from leasing additional queued jobs. A claim
@@ -190,17 +357,15 @@ func (j *Jobs) Drain(ctx context.Context) error {
 }
 
 func (j *Jobs) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost && r.URL.Path == "/internal/v1/jobs" {
+		j.serveIntake(w, r)
+		return
+	}
 	if !authorized(r, j.token) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	switch {
-	case r.Method == http.MethodPost && r.URL.Path == "/internal/v1/jobs":
-		started := time.Now()
-		defer func() {
-			log.Printf("service_metric phase=job_accept_response elapsed_ms=%d", time.Since(started).Milliseconds())
-		}()
-		j.create(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/internal/v1/jobs/by-key":
 		j.getByIdempotencyKey(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/internal/v1/jobs/") && strings.HasSuffix(r.URL.Path, "/events"):
@@ -212,6 +377,56 @@ func (j *Jobs) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (j *Jobs) serveIntake(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	requestID := uuid.NewString()
+	w.Header().Set("X-Request-ID", requestID)
+	capture := &intakeResponseWriter{ResponseWriter: w}
+	defer func() {
+		status := capture.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		outcome := "rejected"
+		if status == http.StatusAccepted {
+			outcome = "accepted"
+		}
+		if status == http.StatusOK {
+			outcome = "replayed"
+		}
+		var ack struct {
+			JobID string `json:"job_id"`
+		}
+		_ = json.Unmarshal(capture.body, &ack)
+		reason := ""
+		if outcome == "rejected" {
+			reason = strings.TrimSpace(string(capture.body))
+			if reasonRunes := []rune(reason); len(reasonRunes) > 500 {
+				reason = string(reasonRunes[:500])
+			}
+		}
+		kind := ""
+		if ack.JobID != "" {
+			if job, err := j.store.JobByID(context.Background(), ack.JobID); err == nil {
+				kind = job.Kind
+			}
+		}
+		if err := j.store.RecordIntakeRequest(context.Background(), store.IntakeRequest{
+			RequestID: requestID, Endpoint: r.URL.Path, Kind: kind, Outcome: outcome, Reason: reason,
+			HTTPStatus: status, JobID: ack.JobID, ElapsedMS: float64(time.Since(started)) / float64(time.Millisecond),
+			ReceivedAt: started.UTC(),
+		}); err != nil {
+			log.Printf("service: record intake request %s: %v", requestID, err)
+		}
+		log.Printf("service_metric phase=job_accept_response elapsed_ms=%d", time.Since(started).Milliseconds())
+	}()
+	if !authorized(r, j.token) {
+		http.Error(capture, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	j.create(capture, r)
 }
 
 // RequireToken protects auxiliary internal service endpoints with the same
@@ -327,7 +542,7 @@ func (j *Jobs) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if created {
-		j.signalWorkers(j.workers)
+		j.signalWorkers(256)
 	}
 	writeAcceptedJob(w, job, created)
 }
@@ -561,8 +776,11 @@ func (j *Jobs) writeJobStatus(w http.ResponseWriter, r *http.Request, job *store
 	id := job.ID
 	view := map[string]any{
 		"job_id": job.ID, "kind": job.Kind, "payload_version": job.PayloadVersion, "status": job.Status,
-		"attempts": job.Attempts, "created_at": job.CreatedAt, "updated_at": job.UpdatedAt,
+		"attempts": job.Attempts, "child_index": job.ChildIndex, "created_at": job.CreatedAt, "updated_at": job.UpdatedAt,
 		"events_url": "/internal/v1/jobs/" + job.ID + "/events",
+	}
+	if job.ParentID != "" {
+		view["parent_id"] = job.ParentID
 	}
 	attempts, err := j.store.JobAttempts(r.Context(), id)
 	if err != nil {
@@ -591,11 +809,16 @@ func (j *Jobs) writeJobStatus(w http.ResponseWriter, r *http.Request, job *store
 	_ = json.NewEncoder(w).Encode(view)
 }
 
-func (j *Jobs) worker(ctx context.Context, owner string) {
+func (j *Jobs) worker(ctx context.Context, owner string, retire <-chan struct{}) {
 	defer j.wg.Done()
 	ticker := time.NewTicker(queuePoll)
 	defer ticker.Stop()
 	for {
+		select {
+		case <-retire:
+			return
+		default:
+		}
 		if ctx.Err() != nil {
 			return
 		}
@@ -628,6 +851,8 @@ func (j *Jobs) worker(ctx context.Context, owner string) {
 		}
 		select {
 		case <-ctx.Done():
+			return
+		case <-retire:
 			return
 		case <-j.stopClaim:
 			return
@@ -764,10 +989,7 @@ func (j *Jobs) execute(parent context.Context, owner string, job *store.Job) {
 	// resume path. Requeueing the original runner here could submit a duplicate
 	// generation even when the error itself is otherwise retry-safe.
 	if runErr != nil && job.ResumeAttempt == nil && parent.Err() == nil {
-		resumeBudget := j.retryBudgets["resume_media"]
-		if resumeBudget == 0 {
-			resumeBudget = j.maxAttempts
-		}
+		resumeBudget, _ := j.retryBudget("resume_media")
 		if job.Attempts < resumeBudget {
 			if err := j.store.RequeueAcceptedJobForResume(context.Background(), job.ID, owner); err == nil {
 				j.signalWorkers(1)
@@ -793,10 +1015,7 @@ func (j *Jobs) execute(parent context.Context, owner string, job *store.Job) {
 			retryClass = retryClassPreSubmit
 		}
 	}
-	budget := j.retryBudgets[retryClass]
-	if budget == 0 {
-		budget = j.maxAttempts
-	}
+	budget, _ := j.retryBudget(retryClass)
 	if job.ResumeAttempt != nil && safeRetry && parent.Err() == nil && job.Attempts < budget {
 		if err := j.store.RequeueResumableJob(context.Background(), job.ID, owner); err != nil {
 			log.Printf("service: requeue media resume for job %s: %v", job.ID, err)

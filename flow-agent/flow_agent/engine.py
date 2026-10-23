@@ -461,6 +461,27 @@ class FlowEngine:
         except ValueError as exc:
             raise EngineError(command, response.status_code, response.text, "invalid service response") from exc
 
+    async def _service_patch(self, path: str, payload: dict[str, Any]) -> Any:
+        if self.engine_mode != "service" or not self.service_token:
+            raise EngineError([], 503, "", "runtime settings require configured service mode")
+        import httpx
+
+        command = [self.service_url, "PATCH", path]
+        try:
+            response = await (await self._service_client()).patch(
+                f"{self.service_url}{path}",
+                headers={"Authorization": f"Bearer {self.service_token}"},
+                json=payload,
+            )
+        except httpx.HTTPError as exc:
+            raise EngineError(command, -1, "", str(exc)) from exc
+        if response.status_code != 200:
+            raise EngineError(command, response.status_code, "", response.text)
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise EngineError(command, response.status_code, response.text, "invalid service response") from exc
+
     async def enqueue_service_job(
         self, kind: str, payload: dict[str, Any], idempotency_key: Optional[str] = None
     ) -> dict:
@@ -745,6 +766,35 @@ class FlowEngine:
         if self.engine_mode == "service":
             return await self._service_get("/internal/v1/stats")
         return await asyncio.to_thread(self._read_stats)
+
+    async def get_monitor(self, limit: int = 50, status: str = "", kind: str = "",
+                          page: Optional[int] = None, page_size: Optional[int] = None,
+                          request_page: Optional[int] = None, request_page_size: Optional[int] = None) -> dict:
+        """Read queue intake, current jobs, and service latency from Go."""
+        if self.engine_mode != "service":
+            raise EngineError([], 503, "", "the live monitor requires service mode")
+        params = {"limit": str(limit)}
+        if status:
+            params["status"] = status
+        if kind:
+            params["kind"] = kind
+        if page is not None:
+            params["page"] = str(page)
+        if page_size is not None:
+            params["page_size"] = str(page_size)
+        if request_page is not None:
+            params["request_page"] = str(request_page)
+        if request_page_size is not None:
+            params["request_page_size"] = str(request_page_size)
+        return await self._service_get("/internal/v1/monitor", params)
+
+    async def get_runtime_settings(self) -> dict:
+        if self.engine_mode != "service":
+            raise EngineError([], 503, "", "runtime settings require service mode")
+        return await self._service_get("/internal/v1/settings")
+
+    async def update_runtime_settings(self, payload: dict[str, Any]) -> dict:
+        return await self._service_patch("/internal/v1/settings", payload)
 
     @staticmethod
     def _normalize_service_account(payload: dict[str, Any]) -> dict[str, Any]:

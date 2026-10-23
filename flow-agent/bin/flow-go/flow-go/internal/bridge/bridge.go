@@ -75,6 +75,9 @@ type Bridge struct {
 	// Long-lived services use it to invalidate that account's cached runtime.
 	// Set it before Listen starts.
 	OnCookieSync func(CookieUpdate)
+	// OnConnectionChange wakes consumers that select accounts using live bridge
+	// connectivity. It is called after a successful cookie sync and disconnect.
+	OnConnectionChange func()
 
 	mu             sync.RWMutex
 	clients        map[string]*cdp.Client
@@ -332,6 +335,7 @@ func (b *Bridge) onConnect(ctx context.Context, client *cdp.Client) {
 	events, cancel := client.Subscribe(32)
 	go func() {
 		defer cancel()
+		defer b.notifyConnectionChange()
 		for {
 			var ev cdp.Event
 			select {
@@ -586,7 +590,14 @@ func (b *Bridge) persistCookieSnapshot(client *cdp.Client, jar *cookiejar.Jar, b
 			Path: path, SyncedAt: time.Now(),
 		})
 	}
+	b.notifyConnectionChange()
 	return nil
+}
+
+func (b *Bridge) notifyConnectionChange() {
+	if b.OnConnectionChange != nil {
+		b.OnConnectionChange()
+	}
 }
 
 // AccountConnected reports whether the extension client currently bound to an
@@ -625,6 +636,7 @@ func (b *Bridge) AccountView(accountID string) *Bridge {
 	view.cookieSyncs = b.cookieSyncs
 	view.profileOperations = b.profileOperations
 	view.OnCookieSync = b.OnCookieSync
+	view.OnConnectionChange = b.OnConnectionChange
 	if client != nil {
 		view.clients[client.RemoteAddr] = client
 		view.current = client

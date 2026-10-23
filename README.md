@@ -179,6 +179,7 @@ Interactive docs open at **`http://127.0.0.1:8001/docs`**
 | `POST` | `/api/v1/video` | Generate video |
 | `GET` | `/api/v1/balance` | Credit balance |
 | `GET` | `/api/v1/stats` | Generation history |
+| `GET` | `/api/v1/monitor` | Go intake, queue, recent jobs, account readiness and phase latency |
 | `GET` | `/api/v1/projects` | List Flow projects |
 | `GET` | `/api/v1/media/{file}` | Download result |
 | `POST` | `/api/v1/jobs` | Accept an asynchronous service job (202) |

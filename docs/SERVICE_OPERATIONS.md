@@ -129,6 +129,40 @@ authenticated stats access, live-account requirements for strict cookie mode,
 and FastAPI's service-mode health. It never prints the bearer token and does not
 submit a generation request or change intake state.
 
+## Change runtime settings
+
+In the Flow Agent dashboard, open **Cấu hình** to edit settings without
+restarting the Go service. The page reads and updates the running service through
+the existing FastAPI-to-Go service connection. Settings are stored in the
+SQLite `settings` table and override the startup value on later restarts. A
+field reset removes that saved override and restores its current environment or
+CLI default.
+
+Editable values and bounds:
+
+| Setting | Range / values | Effect |
+| --- | --- | --- |
+| Submission concurrency | 1–256 | Concurrent account generation submissions |
+| Queue workers | 1–256 | Durable job workers; a retiring worker finishes its current job |
+| Jobs per account | 1–16 | Concurrent jobs admitted for each account |
+| Media poll concurrency | 1–256 | Concurrent media status polling |
+| Media download concurrency | 1–256 | Concurrent media downloads |
+| Maximum outstanding jobs | 1–100000 | Queue admission capacity |
+| Maximum attempts and retry budgets | 1–20 each | Future job retry decisions |
+| Job retention | 1–3650 days | Terminal job and intake cleanup age |
+| Cookie freshness | `strict` or `cached` | Whether account scheduling requires a live extension connection |
+
+Limits can be reduced while jobs are active. Existing jobs continue, and new
+work stays within the lower limit as active slots become free. Queue worker
+reductions retire workers between jobs. Changes to `--workers` still affect
+startup account bootstrap parallelism only after a service restart; the
+dashboard's submission concurrency is the live setting for generation calls.
+
+The settings API is exposed by the Go service at `/internal/v1/settings` and
+proxied by FastAPI at `/api/v1/settings` (`GET` and `PATCH`). Requests contain
+`values` for partial updates or `reset` with setting keys to restore startup
+defaults. The Go endpoint uses the service's existing internal bearer token.
+
 ## Rollback
 
 1. Stop new API intake while leaving the Go service alive.

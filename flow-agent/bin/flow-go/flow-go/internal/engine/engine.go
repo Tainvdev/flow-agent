@@ -38,6 +38,7 @@ import (
 	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
 	"github.com/kodelyx/flow-go/flow-go/internal/flowapi"
 	"github.com/kodelyx/flow-go/flow-go/internal/httpx"
+	"github.com/kodelyx/flow-go/flow-go/internal/limit"
 	"github.com/kodelyx/flow-go/flow-go/internal/pool"
 	"github.com/kodelyx/flow-go/flow-go/internal/recaptcha"
 	"github.com/kodelyx/flow-go/flow-go/internal/store"
@@ -50,7 +51,9 @@ type Options struct {
 	MediaPollGate chan struct{}
 	// MediaDownloadGate bounds concurrent generated-media downloads across
 	// account runtimes. Nil leaves standalone CLI behavior unchanged.
-	MediaDownloadGate chan struct{}
+	MediaDownloadGate    chan struct{}
+	MediaPollLimiter     *limit.Gate
+	MediaDownloadLimiter *limit.Gate
 	// ProjectID is the Flow project to generate into. This is the caller's
 	// explicit choice and outranks every other source. Empty means "work it
 	// out", which asks the browser and then falls back to DefaultProjectID.
@@ -126,13 +129,15 @@ type Options struct {
 
 // Engine is the running system.
 type Engine struct {
-	store             *store.Store
-	pool              *pool.Pool
-	bridge            *bridge.Bridge
-	hc                *httpx.Client
-	opts              Options
-	mediaPollGate     chan struct{}
-	mediaDownloadGate chan struct{}
+	store                *store.Store
+	pool                 *pool.Pool
+	bridge               *bridge.Bridge
+	hc                   *httpx.Client
+	opts                 Options
+	mediaPollGate        chan struct{}
+	mediaDownloadGate    chan struct{}
+	mediaPollLimiter     *limit.Gate
+	mediaDownloadLimiter *limit.Gate
 
 	mu        sync.RWMutex
 	accountID string
@@ -355,14 +360,19 @@ func (e *Engine) newBatchexecuteClient(jar *cookiejar.Jar, hc *httpx.Client) *ba
 		if browser == nil || !browser.Connected() {
 			return 0, "", fmt.Errorf("engine: this Flow RPC requires a connected browser extension")
 		}
-		var status int
-		var responseText string
+		var handle cdp.FlowRPCHandle
 		err := e.bridge.WithProfileOperation(ctx, browser, func() error {
 			var callErr error
-			status, responseText, callErr = browser.FlowRPC(ctx, requestURL, body, captchaAction, captchaPlaceholder)
+			handle, callErr = browser.FlowRPCStart(ctx, requestURL, body, captchaAction, captchaPlaceholder)
 			return callErr
 		})
-		return status, responseText, err
+		if err != nil {
+			return 0, "", err
+		}
+		if handle.Completed {
+			return handle.Status, handle.Text, nil
+		}
+		return browser.FlowRPCWait(ctx, handle)
 	})
 
 	e.mu.RLock()
@@ -500,14 +510,16 @@ func New(st *store.Store, br *bridge.Bridge, opts Options) (*Engine, error) {
 	}
 
 	return &Engine{
-		store:             st,
-		pool:              pool.New(),
-		bridge:            br,
-		hc:                hc,
-		opts:              opts,
-		mediaPollGate:     opts.MediaPollGate,
-		mediaDownloadGate: opts.MediaDownloadGate,
-		accountIndex:      storedAccountIndex(st, opts.AccountIndex),
+		store:                st,
+		pool:                 pool.New(),
+		bridge:               br,
+		hc:                   hc,
+		opts:                 opts,
+		mediaPollGate:        opts.MediaPollGate,
+		mediaDownloadGate:    opts.MediaDownloadGate,
+		mediaPollLimiter:     opts.MediaPollLimiter,
+		mediaDownloadLimiter: opts.MediaDownloadLimiter,
+		accountIndex:         storedAccountIndex(st, opts.AccountIndex),
 		pacing: newSubmissionPacing(
 			time.Duration(config.RequestMinInterval*float64(time.Second)),
 			maxSubmissionGap),
@@ -4512,7 +4524,7 @@ func (e *Engine) collectVideo(ctx context.Context, client *batchexecute.Client, 
 	lastErr := make(map[string]string, len(mediaIDs))
 
 	for len(pending) > 0 && time.Now().Before(deadline) {
-		releasePoll, pollErr := acquireMediaLimit(ctx, e.mediaPollGate)
+		releasePoll, pollErr := acquireConfiguredMediaLimit(ctx, e.mediaPollLimiter, e.mediaPollGate)
 		if pollErr != nil {
 			return urls, files
 		}
@@ -4957,7 +4969,7 @@ func batchImageModel(name string) string {
 // The signed URL needs no credentials — it was verified to return 200 with no
 // headers at all — so this does not attach cookies.
 func (e *Engine) downloadGenerated(ctx context.Context, item batchexecute.GeneratedMedia, kind, prompt string, generationRow int64) (MediaFile, error) {
-	releaseDownload, err := acquireMediaLimit(ctx, e.mediaDownloadGate)
+	releaseDownload, err := acquireConfiguredMediaLimit(ctx, e.mediaDownloadLimiter, e.mediaDownloadGate)
 	if err != nil {
 		return MediaFile{}, err
 	}

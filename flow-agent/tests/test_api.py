@@ -67,6 +67,10 @@ class FakeEngine:
         self.calls.append(("stats", {}))
         return {"generations": [], "totals": {}}
 
+    async def get_monitor(self, limit=50, status="", kind=""):
+        self.calls.append(("monitor", {"limit": limit, "status": status, "kind": kind}))
+        return {"intake": {"recent": []}, "jobs": [], "service": {}}
+
     async def get_projects(self, cookies=None, account_id=None):
         self.calls.append(("projects", {"cookies": cookies, "account_id": account_id}))
         return self.projects
@@ -130,6 +134,18 @@ def test_balance_refresh_is_passed_through(client):
 def test_stats_route(client):
     assert client.get("/api/v1/stats").status_code == 200
     assert client.get("/v1/stats").status_code == 200
+
+
+def test_monitor_route_passes_filters_to_engine(client):
+    response = client.get("/api/v1/monitor?limit=25&status=running&kind=video")
+    assert response.status_code == 200
+    assert response.json()["jobs"] == []
+    assert ("monitor", {"limit": 25, "status": "running", "kind": "video"}) in client.fake.calls
+
+
+def test_monitor_route_bounds_limit(client):
+    response = client.get("/api/v1/monitor?limit=201")
+    assert response.status_code == 400
 
 
 def test_projects_route_wraps_the_list(client):

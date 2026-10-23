@@ -231,6 +231,27 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 CREATE INDEX IF NOT EXISTS idx_jobs_claim ON jobs(status, lease_until, created_at);
 
+-- One metadata row for each authenticated job intake attempt. Payloads and
+-- credentials are deliberately excluded so rejected requests remain visible
+-- without retaining caller content.
+CREATE TABLE IF NOT EXISTS intake_requests (
+    request_id      TEXT PRIMARY KEY,
+    endpoint        TEXT NOT NULL,
+    kind            TEXT,
+    outcome         TEXT NOT NULL,                -- accepted | replayed | rejected
+    reason          TEXT,
+    http_status     INTEGER NOT NULL,
+    job_id          TEXT,
+    elapsed_ms      REAL NOT NULL DEFAULT 0,
+    received_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_intake_received ON intake_requests(received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_intake_outcome_received ON intake_requests(outcome, received_at DESC);
+
+-- Monitor job listing is ordered by newest submission and often filtered by
+-- status. The claim index above remains dedicated to worker scheduling.
+CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
+
 -- One row per worker execution. Preparing attempts are safe to retry after a
 -- crash; executing attempts are ambiguous unless a completed result was saved.
 CREATE TABLE IF NOT EXISTS job_attempts (

@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	modernsqlite "modernc.org/sqlite" // pure-Go SQLite driver, no cgo
@@ -35,6 +36,7 @@ var schemaSQL string
 type Store struct {
 	db                 *sql.DB
 	path               string
+	settingsMu         sync.RWMutex
 	maxOutstandingJobs int
 }
 
@@ -44,11 +46,15 @@ func (s *Store) SetMaxOutstandingJobs(limit int) error {
 	if limit < 1 {
 		return fmt.Errorf("store: max outstanding jobs must be positive")
 	}
+	s.settingsMu.Lock()
 	s.maxOutstandingJobs = limit
+	s.settingsMu.Unlock()
 	return nil
 }
 
 func (s *Store) queueLimit() int {
+	s.settingsMu.RLock()
+	defer s.settingsMu.RUnlock()
 	if s.maxOutstandingJobs < 1 {
 		return maxOutstandingJobs
 	}
@@ -219,6 +225,7 @@ var addedColumns = []struct{ table, column, decl string }{
 	{"jobs", "payload_version", "INTEGER NOT NULL DEFAULT 1"},
 	{"jobs", "error_code", "INTEGER NOT NULL DEFAULT 0"},
 	{"uploads", "account_id", "TEXT NOT NULL DEFAULT ''"},
+	{"intake_requests", "reason", "TEXT"},
 }
 
 func migrate(db *sql.DB) error {
@@ -1339,6 +1346,53 @@ func (s *Store) SetSetting(key, value string) error {
 	`, key, value)
 	if err != nil {
 		return fmt.Errorf("store: write setting %q: %w", key, err)
+	}
+	return nil
+}
+
+// Settings reads all settings whose key starts with prefix.
+func (s *Store) Settings(prefix string) (map[string]string, error) {
+	rows, err := s.db.Query(`SELECT key, value FROM settings WHERE substr(key, 1, length(?)) = ?`, prefix, prefix)
+	if err != nil {
+		return nil, fmt.Errorf("store: list settings: %w", err)
+	}
+	defer rows.Close()
+	values := make(map[string]string)
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			return nil, fmt.Errorf("store: scan settings: %w", err)
+		}
+		values[key] = value
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: read settings: %w", err)
+	}
+	return values, nil
+}
+
+// ApplySettings writes and deletes settings atomically.
+func (s *Store) ApplySettings(values map[string]string, deletes []string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("store: begin settings update: %w", err)
+	}
+	defer tx.Rollback()
+	for key, value := range values {
+		if _, err := tx.Exec(`
+			INSERT INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+		`, key, value); err != nil {
+			return fmt.Errorf("store: write setting %q: %w", key, err)
+		}
+	}
+	for _, key := range deletes {
+		if _, err := tx.Exec(`DELETE FROM settings WHERE key = ?`, key); err != nil {
+			return fmt.Errorf("store: delete setting %q: %w", key, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit settings update: %w", err)
 	}
 	return nil
 }

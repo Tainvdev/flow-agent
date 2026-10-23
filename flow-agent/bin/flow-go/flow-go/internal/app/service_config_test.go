@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -95,6 +96,26 @@ func TestServiceStatsExposeLatencyByKind(t *testing.T) {
 	for _, key := range []string{"latency", "latency_by_kind"} {
 		if _, ok := body[key]; !ok {
 			t.Errorf("stats response misses %q", key)
+		}
+	}
+	monitorReq, _ := http.NewRequest(http.MethodGet, "http://"+addr+"/internal/v1/monitor?limit=20", nil)
+	monitorReq.Header.Set("Authorization", "Bearer stats-test-token")
+	monitorResponse, err := client.Do(monitorReq)
+	if err != nil {
+		t.Fatalf("request monitor: %v", err)
+	}
+	defer monitorResponse.Body.Close()
+	if monitorResponse.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(monitorResponse.Body)
+		t.Fatalf("monitor status=%d body=%s", monitorResponse.StatusCode, payload)
+	}
+	var monitor map[string]json.RawMessage
+	if err := json.NewDecoder(monitorResponse.Body).Decode(&monitor); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"generated_at", "intake", "jobs", "job_outcomes", "retry_attempts", "service", "latency"} {
+		if _, ok := monitor[key]; !ok {
+			t.Errorf("monitor response misses %q", key)
 		}
 	}
 }

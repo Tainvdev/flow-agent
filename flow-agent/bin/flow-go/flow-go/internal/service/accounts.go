@@ -22,6 +22,7 @@ import (
 	"github.com/kodelyx/flow-go/flow-go/internal/config"
 	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
 	"github.com/kodelyx/flow-go/flow-go/internal/engine"
+	"github.com/kodelyx/flow-go/flow-go/internal/limit"
 	"github.com/kodelyx/flow-go/flow-go/internal/pool"
 	"github.com/kodelyx/flow-go/flow-go/internal/store"
 )
@@ -30,31 +31,33 @@ import (
 // engines. Each engine is built from an explicit bundle and has a private bridge
 // view with no browser clients, so mutable session state cannot cross accounts.
 type AccountManager struct {
-	store             *store.Store
-	bridge            *bridge.Bridge
-	workers           int
-	captchaMode       string
-	strictFresh       bool
-	mu                sync.RWMutex
-	backgroundMu      sync.Mutex
-	backgroundWG      sync.WaitGroup
-	backgroundStop    bool
-	accounts          map[string]*accountRuntime
-	accountGates      map[string]chan struct{}
-	accountRevisions  map[string]uint64
-	runtimeFactory    func(context.Context, string, string, *cookiejar.Bundle, bool) (*accountRuntime, *pool.Worker, error)
-	scheduler         *pool.Pool
-	scheduleWorkers   map[string]*pool.Worker
-	reloadLocks       map[string]*sync.Mutex
-	updates           chan bridge.CookieUpdate
-	global            chan struct{}
-	mediaPollGate     chan struct{}
-	mediaDownloadGate chan struct{}
-	cursor            string
-	done              chan struct{}
-	doneOnce          sync.Once
-	initialized       chan struct{}
-	initOnce          sync.Once
+	store              *store.Store
+	bridge             *bridge.Bridge
+	workers            int
+	captchaMode        string
+	strictFresh        bool
+	runtimeSettingsMu  sync.RWMutex
+	accountConcurrency int
+	mu                 sync.RWMutex
+	backgroundMu       sync.Mutex
+	backgroundWG       sync.WaitGroup
+	backgroundStop     bool
+	accounts           map[string]*accountRuntime
+	accountGates       map[string]*limit.Gate
+	accountRevisions   map[string]uint64
+	runtimeFactory     func(context.Context, string, string, *cookiejar.Bundle, bool) (*accountRuntime, *pool.Worker, error)
+	scheduler          *pool.Pool
+	scheduleWorkers    map[string]*pool.Worker
+	reloadLocks        map[string]*sync.Mutex
+	updates            chan bridge.CookieUpdate
+	global             *limit.Gate
+	mediaPollGate      *limit.Gate
+	mediaDownloadGate  *limit.Gate
+	cursor             string
+	done               chan struct{}
+	doneOnce           sync.Once
+	initialized        chan struct{}
+	initOnce           sync.Once
 }
 
 var errAccountSnapshotSuperseded = errors.New("service: account snapshot superseded by a newer cookie update")
@@ -63,7 +66,7 @@ type accountRuntime struct {
 	id              string
 	path            string
 	engine          *engine.Engine
-	gate            chan struct{}
+	gate            *limit.Gate
 	lastUsed        time.Time
 	snapshot        string
 	schedulerWorker *pool.Worker
@@ -117,13 +120,16 @@ func NewAccountManagerWithMediaLimits(st *store.Store, br *bridge.Bridge, worker
 	}
 	manager := &AccountManager{
 		store: st, bridge: br, workers: workers,
-		strictFresh: !strings.EqualFold(strings.TrimSpace(os.Getenv("FLOW_COOKIE_FRESHNESS")), "cached"),
-		accounts:    make(map[string]*accountRuntime), accountGates: make(map[string]chan struct{}), accountRevisions: make(map[string]uint64),
+		strictFresh:        !strings.EqualFold(strings.TrimSpace(os.Getenv("FLOW_COOKIE_FRESHNESS")), "cached"),
+		accountConcurrency: 1,
+		accounts:           make(map[string]*accountRuntime), accountGates: make(map[string]*limit.Gate), accountRevisions: make(map[string]uint64),
 		scheduler: pool.New(), scheduleWorkers: make(map[string]*pool.Worker),
 		reloadLocks: make(map[string]*sync.Mutex), updates: make(chan bridge.CookieUpdate, 128),
-		global: make(chan struct{}, workers), mediaPollGate: make(chan struct{}, pollLimit),
-		mediaDownloadGate: make(chan struct{}, downloadLimit), done: make(chan struct{}), initialized: make(chan struct{}),
+		done: make(chan struct{}), initialized: make(chan struct{}),
 	}
+	manager.global, _ = limit.New(workers)
+	manager.mediaPollGate, _ = limit.New(pollLimit)
+	manager.mediaDownloadGate, _ = limit.New(downloadLimit)
 	if len(captchaModes) > 0 {
 		manager.captchaMode = captchaModes[0]
 	}
@@ -145,6 +151,69 @@ func (m *AccountManager) Notify(update bridge.CookieUpdate) {
 	case m.updates <- update:
 	case <-m.done:
 	}
+}
+
+// NotifyConnectionChange wakes scheduler waiters after the bridge observes an
+// extension connect or disconnect. Eligibility is checked against live bridge
+// state when each waiter retries.
+func (m *AccountManager) NotifyConnectionChange() {
+	m.scheduler.NotifyAvailabilityChanged()
+}
+
+// ApplyRuntimeSettings updates limits used by already-running account engines.
+// Existing permits remain valid and finish under their original admission.
+func (m *AccountManager) ApplyRuntimeSettings(settings RuntimeSettings) {
+	m.runtimeSettingsMu.Lock()
+	m.accountConcurrency = settings.AccountConcurrency
+	m.strictFresh = strings.EqualFold(settings.CookieFreshness, "strict")
+	m.runtimeSettingsMu.Unlock()
+	_ = m.global.SetLimit(settings.SubmissionConcurrency)
+	_ = m.mediaPollGate.SetLimit(settings.MediaPollConcurrency)
+	_ = m.mediaDownloadGate.SetLimit(settings.MediaDownloadConcurrency)
+	m.mu.RLock()
+	workers := make([]*pool.Worker, 0, len(m.scheduleWorkers))
+	for _, worker := range m.scheduleWorkers {
+		workers = append(workers, worker)
+	}
+	gates := make([]*limit.Gate, 0, len(m.accountGates))
+	for _, gate := range m.accountGates {
+		gates = append(gates, gate)
+	}
+	m.mu.RUnlock()
+	for _, worker := range workers {
+		worker.SetConcurrency(settings.AccountConcurrency)
+	}
+	for _, gate := range gates {
+		_ = gate.SetLimit(settings.AccountConcurrency)
+	}
+	m.scheduler.NotifyAvailabilityChanged()
+}
+
+func (m *AccountManager) accountConcurrencyLimit() int {
+	m.runtimeSettingsMu.RLock()
+	defer m.runtimeSettingsMu.RUnlock()
+	return m.accountConcurrency
+}
+
+func (m *AccountManager) strictCookieFreshness() bool {
+	m.runtimeSettingsMu.RLock()
+	defer m.runtimeSettingsMu.RUnlock()
+	return m.strictFresh
+}
+
+func (m *AccountManager) RuntimeLimitStats() map[string]int {
+	stats := map[string]int{
+		"submission_in_flight":     m.global.Active(),
+		"media_poll_in_flight":     m.mediaPollGate.Active(),
+		"media_download_in_flight": m.mediaDownloadGate.Active(),
+		"account_jobs_in_flight":   0,
+	}
+	m.mu.RLock()
+	for _, gate := range m.accountGates {
+		stats["account_jobs_in_flight"] += gate.Active()
+	}
+	m.mu.RUnlock()
+	return stats
 }
 
 // Start loads persisted accounts and applies live bridge updates until shutdown.
@@ -262,8 +331,8 @@ func (m *AccountManager) buildAccountRuntime(ctx context.Context, id, path strin
 	localBridge := m.bridge.AccountView(id)
 	eng, err := engine.New(m.store, localBridge, engine.Options{
 		AccountID: id, CookieFile: path, DefaultProjectID: config.ProjectID, RefreshCreditsOnBoot: true,
-		CaptchaMode:   m.captchaMode,
-		MediaPollGate: m.mediaPollGate, MediaDownloadGate: m.mediaDownloadGate,
+		CaptchaMode:      m.captchaMode,
+		MediaPollLimiter: m.mediaPollGate, MediaDownloadLimiter: m.mediaDownloadGate,
 		SchedulerOwnsFailover: true,
 	})
 	if err != nil {
@@ -292,7 +361,7 @@ func (m *AccountManager) buildAccountRuntime(ctx context.Context, id, path strin
 	snapshot, _ := json.Marshal(bundle)
 	digest := fmt.Sprintf("%x", sha256.Sum256(snapshot))
 	runtime := &accountRuntime{
-		id: id, path: path, engine: eng, gate: make(chan struct{}, 1), snapshot: digest,
+		id: id, path: path, engine: eng, snapshot: digest,
 	}
 	worker := m.prepareSchedulerWorker(id, eng, clearAuthCooldown)
 	runtime.schedulerWorker = worker
@@ -311,7 +380,7 @@ func (m *AccountManager) prepareSchedulerWorker(id string, eng *engine.Engine, c
 	worker := m.scheduleWorkers[id]
 	if worker == nil {
 		worker = pool.NewWorker(id, nil)
-		worker.Concurrency = 1
+		worker.SetConcurrency(m.accountConcurrencyLimit())
 		m.scheduleWorkers[id] = worker
 	}
 	if observed != nil {
@@ -347,7 +416,7 @@ func (m *AccountManager) publishRuntimeIfCurrent(id string, revision uint64, run
 	if gate == nil {
 		gate = runtime.gate
 		if gate == nil {
-			gate = make(chan struct{}, 1)
+			gate, _ = limit.New(m.accountConcurrencyLimit())
 		}
 		m.accountGates[id] = gate
 	}
@@ -479,7 +548,7 @@ func (m *AccountManager) ReadyAccounts() int {
 		if runtime == nil || runtime.schedulerWorker == nil || runtime.schedulerWorker.State() == pool.StateCircuitOpen {
 			continue
 		}
-		if m.strictFresh && !m.bridge.AccountConnected(id) {
+		if m.strictCookieFreshness() && !m.bridge.AccountConnected(id) {
 			continue
 		}
 		ready++
@@ -490,7 +559,7 @@ func (m *AccountManager) ReadyAccounts() int {
 // RequiresLiveCookieSync reports whether strict freshness requires an online
 // extension connection. Jobs use the persisted account bundle and do not pull a
 // cookie snapshot immediately before submission.
-func (m *AccountManager) RequiresLiveCookieSync() bool { return m.strictFresh }
+func (m *AccountManager) RequiresLiveCookieSync() bool { return m.strictCookieFreshness() }
 
 // ConnectedAccounts reports runtimes with a currently attached extension peer.
 func (m *AccountManager) ConnectedAccounts() int {
@@ -583,15 +652,15 @@ func (m *AccountManager) acquire(ctx context.Context, id string) (*accountRuntim
 				return nil, ctx.Err()
 			}
 		}
-		if m.strictFresh && !m.bridge.AccountConnected(id) {
+		if m.strictCookieFreshness() && !m.bridge.AccountConnected(id) {
 			return nil, fmt.Errorf("service: account %s extension is offline; strict cookie freshness requires a connected extension", id)
 		}
-		select {
-		case runtime.gate <- struct{}{}:
-			return runtime, nil
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		release, err := runtime.gate.Acquire(ctx)
+		if err != nil {
+			return nil, err
 		}
+		_ = release
+		return runtime, nil
 	}
 
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -601,15 +670,15 @@ func (m *AccountManager) acquire(ctx context.Context, id string) (*accountRuntim
 		var best *accountRuntime
 		eligible := 0
 		for _, candidate := range m.accounts {
-			if m.strictFresh && !m.bridge.AccountConnected(candidate.id) {
+			if m.strictCookieFreshness() && !m.bridge.AccountConnected(candidate.id) {
 				continue
 			}
 			eligible++
-			if len(candidate.gate) == cap(candidate.gate) {
+			if candidate.gate.Active() >= candidate.gate.Limit() {
 				continue
 			}
-			if best == nil || len(candidate.gate) < len(best.gate) ||
-				(len(candidate.gate) == len(best.gate) && candidate.lastUsed.Before(best.lastUsed)) {
+			if best == nil || candidate.gate.Active() < best.gate.Active() ||
+				(candidate.gate.Active() == best.gate.Active() && candidate.lastUsed.Before(best.lastUsed)) {
 				best = candidate
 			}
 		}
@@ -630,13 +699,11 @@ func (m *AccountManager) acquire(ctx context.Context, id string) (*accountRuntim
 			}
 		}
 		if best != nil {
-			select {
-			case best.gate <- struct{}{}:
+			if best.gate.TryAcquire() {
 				best.lastUsed = time.Now()
 				m.cursor = best.id
 				m.mu.Unlock()
 				return best, nil
-			default:
 			}
 		}
 		m.mu.Unlock()
@@ -648,7 +715,7 @@ func (m *AccountManager) acquire(ctx context.Context, id string) (*accountRuntim
 	}
 }
 
-func (m *AccountManager) release(runtime *accountRuntime) { <-runtime.gate }
+func (m *AccountManager) release(runtime *accountRuntime) { runtime.gate.Release() }
 
 // Run implements the job Runner used by the durable queue.
 func (m *AccountManager) Run(ctx context.Context, job store.Job) (any, error) {
@@ -853,7 +920,7 @@ func (m *AccountManager) ExpandForQueue(_ context.Context, job store.Job) ([]sto
 		}
 		payload.AccountID = id
 	}
-	if m.strictFresh {
+	if m.strictCookieFreshness() {
 		filtered := ids[:0]
 		for _, id := range ids {
 			if m.bridge.AccountConnected(id) {
@@ -987,14 +1054,13 @@ func (m *AccountManager) runOne(ctx context.Context, jobID, kind string, payload
 	if err := m.validateReferenceOwnership(ctx, runtime.engine, payload); err != nil {
 		return nil, err
 	}
-	select {
-	case m.global <- struct{}{}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	releaseGlobal, err := m.global.Acquire(ctx)
+	if err != nil {
+		return nil, err
 	}
 	var submissionGateOnce sync.Once
 	releaseSubmissionGate := func() {
-		submissionGateOnce.Do(func() { <-m.global })
+		submissionGateOnce.Do(releaseGlobal)
 	}
 	defer releaseSubmissionGate()
 	if progress != nil {
@@ -1217,7 +1283,20 @@ func (m *AccountManager) acquireScheduled(ctx context.Context, accountID string,
 		}
 	}
 	if accountID != "" {
+		if m.strictCookieFreshness() {
+			if !m.bridge.AccountConnected(accountID) {
+				return nil, fmt.Errorf("service: account %s extension is offline; strict cookie freshness requires a connected extension", accountID)
+			}
+			return m.scheduler.AcquireEligible(ctx, cost, func(worker *pool.Worker) bool {
+				return worker.ID == accountID && m.bridge.AccountConnected(worker.ID)
+			})
+		}
 		return m.scheduler.AcquireAccount(ctx, accountID, cost)
+	}
+	if m.strictCookieFreshness() {
+		return m.scheduler.AcquireEligible(ctx, cost, func(worker *pool.Worker) bool {
+			return m.bridge.AccountConnected(worker.ID)
+		})
 	}
 	return m.scheduler.Acquire(ctx, cost)
 }

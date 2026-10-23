@@ -12,6 +12,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 /* ------------------------------------------------------------------ *
@@ -190,6 +192,101 @@ func (c *Client) FlowRPC(ctx context.Context, requestURL, body, captchaAction, c
 		return 0, "", fmt.Errorf("cdp: flow.rpc returned no HTTP status")
 	}
 	return out.Status, out.Text, nil
+}
+
+// FlowRPCHandle identifies a request dispatched by the page whose response is
+// still being collected.
+type FlowRPCHandle struct {
+	RequestID string `json:"request_id"`
+	TabID     int    `json:"tab_id"`
+	Label     string `json:"label"`
+	Completed bool   `json:"completed,omitempty"`
+	Status    int    `json:"status,omitempty"`
+	Text      string `json:"text,omitempty"`
+}
+
+// FlowRPCStart returns after the extension has dispatched the modified fetch.
+// The profile operation lock can then be released while FlowRPCWait collects
+// the response concurrently with later submissions on the same tab.
+func (c *Client) FlowRPCStart(ctx context.Context, requestURL, body, captchaAction, captchaPlaceholder string) (FlowRPCHandle, error) {
+	if !c.hasFlowOps() {
+		return FlowRPCHandle{}, fmt.Errorf("cdp: the attached extension does not implement Flow RPC submission")
+	}
+	c.opsMu.Lock()
+	supported, legacySupported := false, false
+	for _, op := range c.advertised {
+		supported = supported || op == "flow.rpc.start"
+		legacySupported = legacySupported || op == "flow.rpc"
+	}
+	supported = supported && containsFlowOp(c.advertised, "flow.rpc.wait")
+	c.opsMu.Unlock()
+	if !supported {
+		if !legacySupported {
+			return FlowRPCHandle{}, fmt.Errorf("cdp: the attached Flow extension does not implement Flow RPC submission")
+		}
+		status, text, err := c.FlowRPC(ctx, requestURL, body, captchaAction, captchaPlaceholder)
+		if err != nil {
+			return FlowRPCHandle{}, err
+		}
+		label := "video"
+		if captchaAction == "IMAGE_GENERATION" {
+			label = "image"
+		}
+		return FlowRPCHandle{Label: label, Completed: true, Status: status, Text: text}, nil
+	}
+	if captchaAction == "" && captchaPlaceholder == "" {
+		return FlowRPCHandle{}, fmt.Errorf("cdp: split Flow RPC requires inline CAPTCHA parameters")
+	}
+	id := uuid.NewString()
+	var handle FlowRPCHandle
+	err := c.Call(ctx, "flow.rpc.start", map[string]string{
+		"url": requestURL, "body": body, "captcha_action": captchaAction,
+		"captcha_placeholder": captchaPlaceholder, "request_id": id,
+	}, &handle)
+	if err != nil {
+		return FlowRPCHandle{}, err
+	}
+	if handle.RequestID != id || handle.TabID < 0 {
+		return FlowRPCHandle{}, fmt.Errorf("cdp: flow.rpc.start returned an invalid handle")
+	}
+	if handle.Label == "" {
+		if captchaAction == "IMAGE_GENERATION" {
+			handle.Label = "image"
+		} else {
+			handle.Label = "video"
+		}
+	}
+	return handle, nil
+}
+
+// FlowRPCWait collects the response for a request previously dispatched by
+// FlowRPCStart. It does not hold the profile operation lock.
+func (c *Client) FlowRPCWait(ctx context.Context, handle FlowRPCHandle) (int, string, error) {
+	if handle.RequestID == "" || (handle.Label != "image" && handle.Label != "video") {
+		return 0, "", fmt.Errorf("cdp: invalid Flow RPC handle")
+	}
+	var out struct {
+		Status int    `json:"status"`
+		Text   string `json:"text"`
+	}
+	if err := c.Call(ctx, "flow.rpc.wait", map[string]any{
+		"request_id": handle.RequestID, "tab_id": handle.TabID, "label": handle.Label,
+	}, &out); err != nil {
+		return 0, "", err
+	}
+	if out.Status == 0 {
+		return 0, "", fmt.Errorf("cdp: flow.rpc.wait returned no HTTP status")
+	}
+	return out.Status, out.Text, nil
+}
+
+func containsFlowOp(ops []string, target string) bool {
+	for _, op := range ops {
+		if op == target {
+			return true
+		}
+	}
+	return false
 }
 
 // FlowCaptchaResult is either a probe answer or a minted token.

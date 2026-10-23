@@ -291,6 +291,17 @@ func (w *Worker) limit() int {
 	return MaxInFlight
 }
 
+// SetConcurrency updates the worker's admission ceiling without cancelling
+// permits already held.
+func (w *Worker) SetConcurrency(limit int) {
+	if limit < 1 {
+		limit = 1
+	}
+	w.mu.Lock()
+	w.Concurrency = limit
+	w.mu.Unlock()
+}
+
 // Affordable reports whether the worker can pay for a job of the given cost.
 // An unknown balance is treated as affordable: refusing to schedule a worker
 // whose credits have simply not been checked yet would strand capacity.
@@ -591,6 +602,13 @@ func (p *Pool) Acquire(ctx context.Context, cost int) (*Worker, error) {
 	return p.acquireExcluding(ctx, cost, nil)
 }
 
+// AcquireEligible picks a worker only when eligible returns true. Eligibility is
+// checked again on every scheduling pass, so callers can filter workers using
+// live external state such as an attached browser extension.
+func (p *Pool) AcquireEligible(ctx context.Context, cost int, eligible func(*Worker) bool) (*Worker, error) {
+	return p.acquireExcludingEligible(ctx, cost, nil, eligible)
+}
+
 // AcquireAccount reserves a slot on exactly id and never substitutes another account.
 func (p *Pool) AcquireAccount(ctx context.Context, id string, cost int) (*Worker, error) {
 	if id == "" {
@@ -648,18 +666,22 @@ func (e *NoWorkerError) Error() string {
 // acquireExcluding is Acquire with a set of worker IDs to skip. Failover uses it
 // so a worker that already failed this job is not handed back again.
 func (p *Pool) acquireExcluding(ctx context.Context, cost int, exclude map[string]bool) (*Worker, error) {
+	return p.acquireExcludingEligible(ctx, cost, exclude, nil)
+}
+
+func (p *Pool) acquireExcludingEligible(ctx context.Context, cost int, exclude map[string]bool, eligible func(*Worker) bool) (*Worker, error) {
 	deadline := time.Now().Add(AcquireTimeout)
 
 	for {
 		changed, removeWaiter := p.registerWaiter()
-		if w := p.pick(cost, exclude); w != nil {
+		if w := p.pick(cost, exclude, eligible); w != nil {
 			removeWaiter()
 			return w, nil
 		}
 
 		// Waiting only helps if something could free up. Ask before paying for
 		// the wait rather than after it.
-		if err := p.whyNothingAvailable(exclude, cost, deadline); err != nil {
+		if err := p.whyNothingAvailable(exclude, cost, deadline, eligible); err != nil {
 			removeWaiter()
 			return nil, err
 		}
@@ -676,6 +698,9 @@ func (p *Pool) acquireExcluding(ctx context.Context, cost int, exclude map[strin
 		now := time.Now()
 		for _, worker := range p.Workers() {
 			if exclude != nil && exclude[worker.ID] {
+				continue
+			}
+			if eligible != nil && !eligible(worker) {
 				continue
 			}
 			until := worker.parkedUntil()
@@ -720,13 +745,16 @@ func (p *Pool) acquireExcluding(ctx context.Context, cost int, exclude map[strin
 // possibly come back before the deadline, and waiting for it is a guaranteed
 // 30-second failure. Naming when it frees is more useful than making the caller
 // sit through the wait to find out.
-func (p *Pool) whyNothingAvailable(exclude map[string]bool, cost int, deadline time.Time) error {
+func (p *Pool) whyNothingAvailable(exclude map[string]bool, cost int, deadline time.Time, eligible func(*Worker) bool) error {
 	workers := p.Workers()
 
 	var candidates, parked, unaffordable int
 	var earliestFree time.Time
 	for _, w := range workers {
 		if exclude != nil && exclude[w.ID] {
+			continue
+		}
+		if eligible != nil && !eligible(w) {
 			continue
 		}
 		candidates++
@@ -750,6 +778,9 @@ func (p *Pool) whyNothingAvailable(exclude map[string]bool, cost int, deadline t
 	}
 
 	if candidates == 0 {
+		if eligible != nil && len(workers) > 0 {
+			return &NoWorkerError{Reason: "no registered worker currently meets the eligibility requirements"}
+		}
 		if len(workers) == 0 {
 			return &NoWorkerError{
 				Reason: "no account is registered — the engine has not bootstrapped, " +
@@ -800,11 +831,14 @@ func (w *Worker) parkedUntil() time.Time {
 	return time.Time{}
 }
 
-func (p *Pool) pick(cost int, exclude map[string]bool) *Worker {
+func (p *Pool) pick(cost int, exclude map[string]bool, eligible func(*Worker) bool) *Worker {
 	p.mu.Lock()
 	candidates := make([]*Worker, 0, len(p.workers))
 	for _, w := range p.workers {
 		if exclude != nil && exclude[w.ID] {
+			continue
+		}
+		if eligible != nil && !eligible(w) {
 			continue
 		}
 		candidates = append(candidates, w)

@@ -1,10 +1,11 @@
 // chrome.scripting serializes this function, so it cannot refer to module scope.
-export async function prepareRpc(engineBody, label = 'image') {
+export async function prepareRpc(engineBody, label = 'image', requestID = '') {
   const requestedRpc = label === 'image' ? 'ogiZ0b' : null;
   const log = (step, details = {}) => console.info(`[Flow Bridge ${label} RPC]`, step, details);
-  const stateKey = label === 'image' ? '__flowBridgeImageRpc' : '__flowBridgeVideoRpc';
-  const previous = window[stateKey];
-  if (previous && !previous.done) throw new Error(`A ${label} RPC is already pending in this tab`);
+  requestID = String(requestID || '');
+  if (!requestID) throw new Error('A unique Flow RPC request ID is required');
+  const states = window.__flowBridgeRpcStates || (window.__flowBridgeRpcStates = Object.create(null));
+  if (states[requestID]) throw new Error('This Flow RPC request ID is already present in this tab');
 
   const engineForm = new URLSearchParams(engineBody);
   const engineEnvelope = JSON.parse(engineForm.get('f.req') || '');
@@ -71,8 +72,8 @@ export async function prepareRpc(engineBody, label = 'image') {
   });
 
   const originalFetch = window.fetch;
-  const state = { done: false, originalFetch, result: null };
-  window[stateKey] = state;
+  const state = { id: requestID, label, sent: false, done: false, originalFetch, result: null };
+  states[requestID] = state;
 
   const isTargetRequest = (url, method) => {
     try {
@@ -191,7 +192,10 @@ export async function prepareRpc(engineBody, label = 'image') {
         url: targetURL.toString(),
         body: replacement,
       });
-      const response = await originalFetch.call(this, input instanceof Request ? input : targetURL.toString(), init);
+      const responsePromise = originalFetch.call(this, input instanceof Request ? input : targetURL.toString(), init);
+      state.sent = true;
+      log('modified request dispatched', { requestId: requestID, rpc: rpcID });
+      const response = await responsePromise;
       receivedResponse = response;
       const responseText = await response.clone().text();
       state.result = {
