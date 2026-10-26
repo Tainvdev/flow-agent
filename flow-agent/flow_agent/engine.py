@@ -592,6 +592,7 @@ class FlowEngine:
         timeout: Optional[int] = None,
         idempotency_key: Optional[str] = None,
         account_id: Optional[str] = None,
+        reference_data: Optional[list[dict[str, str]]] = None,
     ) -> dict:
         """Generate an image and return the engine's result object.
 
@@ -611,12 +612,19 @@ class FlowEngine:
             }
             if account_id:
                 payload["account_id"] = account_id
+            if reference_data:
+                payload["reference_data"] = reference_data
             if cookies:
                 payload["cookies"] = cookies
             if not download:
                 payload["no_download"] = True
             return await self._run_service_job("image", payload, timeout, idempotency_key)
 
+        if reference_data:
+            raise EngineError(
+                self._command("image", prompt), 422, "",
+                "inline reference images require FLOW_ENGINE_MODE=service",
+            )
         cookies = self._subprocess_cookie_selector(cookies, account_id)
         args: list[Any] = ["image", prompt, aspect]
         if count and count > 1:
@@ -652,6 +660,8 @@ class FlowEngine:
         timeout: Optional[int] = None,
         idempotency_key: Optional[str] = None,
         account_id: Optional[str] = None,
+        reference_data: Optional[list[dict[str, str]]] = None,
+        model: Optional[str] = None,
     ) -> dict:
         """Generate a video and return the engine's result object.
 
@@ -664,16 +674,25 @@ class FlowEngine:
                 "prompt": prompt, "aspect": aspect, "duration": duration,
                 "quality": quality, "count": count, "all_accounts": all_accounts,
             }
+            if model:
+                payload["model"] = model
             if account_id:
                 payload["account_id"] = account_id
             if start_image:
                 payload["start_image"] = start_image
+            if reference_data:
+                payload["reference_data"] = reference_data
             if cookies:
                 payload["cookies"] = cookies
             if not download:
                 payload["no_download"] = True
             return await self._run_service_job("video", payload, timeout, idempotency_key)
 
+        if reference_data:
+            raise EngineError(
+                self._command("generate", prompt), 422, "",
+                "inline reference images require FLOW_ENGINE_MODE=service",
+            )
         cookies = self._subprocess_cookie_selector(cookies, account_id)
         args: list[Any] = ["generate", prompt, aspect, duration, quality]
         if count and count > 1:

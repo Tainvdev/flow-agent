@@ -430,6 +430,8 @@ class APICompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.engine = type("APIEngineStub", (), {})()
         self.engine.generate_image = AsyncMock()
         self.engine.generate_video = AsyncMock()
+        self.engine.enqueue_service_job = AsyncMock()
+        self.engine.get_service_job = AsyncMock()
         self.engine.aclose = AsyncMock()
         self.engine.generate_image.return_value = {
             "job_id": "compat-image", "status": "succeeded",
@@ -524,3 +526,70 @@ class APICompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.engine.generate_image.await_args.kwargs["count"], 2)
         self.assertEqual(self.engine.generate_image.await_args.kwargs["account_id"], "acct-a")
         self.assertEqual(self.engine.generate_video.await_args.kwargs["duration"], "6s")
+
+    async def test_gemini_generate_content_adapts_to_existing_image_engine(self):
+        self.engine.generate_image.return_value = {
+            "job_id": "gemini-image", "status": "succeeded", "media": ["image-uri"],
+        }
+        response = await self.client.post(
+            "/v1beta/models/nano-banano-2.1:generateContent",
+            json={
+                "contents": [{"role": "user", "parts": [
+                    {"text": "draw a fox"},
+                    {"inlineData": {"mimeType": "image/jpeg", "data": "aW1hZ2U="}},
+                ]}],
+                "generationConfig": {"responseModalities": ["IMAGE"], "aspectRatio": "16:9"},
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["candidates"][0]["content"]["parts"][0]["fileData"]["fileUri"], "image-uri")
+        self.engine.generate_image.assert_awaited_once_with(
+            prompt="draw a fox", aspect="16:9", count=1, model="nano_banano_2.1",
+            reference_data=[{"base64": "aW1hZ2U=", "mime_type": "image/jpeg", "file_name": "gemini-reference"}],
+        )
+
+    async def test_gemini_generate_videos_returns_and_polls_long_running_operation(self):
+        self.engine.enqueue_service_job.return_value = {
+            "job_id": "gemini-video", "status": "queued",
+        }
+        response = await self.client.post(
+            "/v1beta/models/omni-1.1-flash:predictLongRunning",
+            json={
+                "instances": [{"prompt": "animate the fox", "referenceImages": [
+                    {"image": {"inlineData": {"mimeType": "image/png", "data": "aW1hZ2U="}}, "referenceType": "asset"},
+                    {"image": {"inlineData": {"mimeType": "image/jpeg", "data": "aW1hZGU="}}, "referenceType": "asset"},
+                ]}],
+                "parameters": {"aspectRatio": "16:9", "durationSeconds": "8", "resolution": "360p"},
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body, {
+            "name": "operations/flow-gemini-video",
+            "done": False,
+            "metadata": {"model": "omni-1.1-flash", "jobId": "gemini-video"},
+        })
+        self.engine.enqueue_service_job.assert_awaited_once_with(
+            "video",
+            {
+                "prompt": "animate the fox", "aspect": "16:9", "duration": "8s",
+                "quality": "360p", "count": 1, "model": "omni_1_1_flash",
+                "start_image": None,
+                "reference_data": [
+                    {"base64": "aW1hZ2U=", "mime_type": "image/png", "file_name": "gemini-reference-1"},
+                    {"base64": "aW1hZGU=", "mime_type": "image/jpeg", "file_name": "gemini-reference-2"},
+                ],
+            }, None,
+        )
+        self.engine.get_service_job.return_value = {
+            "job_id": "gemini-video", "status": "succeeded",
+            "result": {"job_id": "gemini-video", "status": "succeeded", "media": ["video-uri"]},
+        }
+        completed = await self.client.get("/v1beta/operations/flow-gemini-video")
+        self.assertEqual(completed.status_code, 200, completed.text)
+        self.assertTrue(completed.json()["done"])
+        self.assertEqual(
+            completed.json()["response"]["generateVideoResponse"]["generatedSamples"][0]["video"]["uri"],
+            "video-uri",
+        )

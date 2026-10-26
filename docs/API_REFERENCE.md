@@ -41,6 +41,30 @@ All endpoints assume the server is running at its default address.
 | `POST` | `/v1/images/generations` | DALL-E–style image generation |
 | `POST` | `/v1/chat/completions` | Chat completion with image output + SSE support |
 
+### Gemini-Compatible Generation (basic facade)
+
+The Python API also accepts the common Gemini request shapes and translates them
+to the existing Flow engine. It does not add a Gemini upstream client or change
+the Go transport.
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `POST` | `/v1beta/models/{model}:generateContent` | Text-to-image from official `contents`/`generationConfig` |
+| `POST` | `/v1beta/models/{model}:predictLongRunning` | Text-to-video/reference-video from official `instances`/`parameters` |
+
+The image endpoint accepts multiple `contents[].parts[].inlineData` image parts and
+`generationConfig.imageConfig.aspectRatio`. It returns Gemini-style `candidates`
+with `fileData.fileUri` pointing at Flow media. The video endpoint accepts
+`instances[0].image.inlineData` and up to three official `referenceImages` entries;
+their base64 data is forwarded to the existing Go generation service.
+The video endpoint returns a Gemini-style long-running operation with `done: false`.
+Poll `/v1beta/operations/{operation-id}` (or the `/v1/` equivalent) until it
+returns `done: true`; the completed response contains
+`response.generateVideoResponse.generatedSamples[].video.uri`. Gemini model names are accepted for
+client compatibility and are mapped to the existing Flow model catalog:
+`nano-banano-2.1`, `nano-banano-2-lite`, and `nano-banano-pro` for images;
+`omni-1.1-flash`, `veo-3.1-lite`, `veo-3.1-fast`, and `veo-3.1-quality` for video.
+
 ### System Endpoints
 
 | Method | Endpoint | Description |

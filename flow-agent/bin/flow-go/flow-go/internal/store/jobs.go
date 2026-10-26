@@ -80,15 +80,18 @@ type JobEvent struct {
 // IntakeRequest is safe operational metadata for one authenticated request to
 // the durable job intake endpoint. It never contains the request payload.
 type IntakeRequest struct {
-	RequestID  string    `json:"request_id"`
-	Endpoint   string    `json:"endpoint"`
-	Kind       string    `json:"kind,omitempty"`
-	Outcome    string    `json:"outcome"`
-	Reason     string    `json:"reason,omitempty"`
-	HTTPStatus int       `json:"http_status"`
-	JobID      string    `json:"job_id,omitempty"`
-	ElapsedMS  float64   `json:"elapsed_ms"`
-	ReceivedAt time.Time `json:"received_at"`
+	RequestID   string    `json:"request_id"`
+	Endpoint    string    `json:"endpoint"`
+	Kind        string    `json:"kind,omitempty"`
+	Outcome     string    `json:"outcome"`
+	FinalStatus string    `json:"final_status,omitempty"`
+	Reason      string    `json:"reason,omitempty"`
+	HTTPStatus  int       `json:"http_status"`
+	JobID       string    `json:"job_id,omitempty"`
+	Error       string    `json:"error,omitempty"`
+	ErrorCode   int       `json:"error_code,omitempty"`
+	ElapsedMS   float64   `json:"elapsed_ms"`
+	ReceivedAt  time.Time `json:"received_at"`
 }
 
 // MonitorJob is the small, payload-free job row shown in the admin monitor.
@@ -144,9 +147,11 @@ func (s *Store) IntakeRequestsPage(ctx context.Context, limit, offset int) ([]In
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM intake_requests`).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("store: count intake requests: %w", err)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT request_id, endpoint, COALESCE(kind,''), outcome,
-		COALESCE(reason,''), http_status, COALESCE(job_id,''), elapsed_ms, received_at
-		FROM intake_requests ORDER BY received_at DESC, request_id DESC LIMIT ? OFFSET ?`, limit, offset)
+	rows, err := s.db.QueryContext(ctx, `SELECT i.request_id, i.endpoint, COALESCE(i.kind,''), i.outcome,
+		COALESCE(j.status,''), COALESCE(i.reason,''), i.http_status, COALESCE(i.job_id,''),
+		COALESCE(j.error,''), COALESCE(j.error_code,0), i.elapsed_ms, i.received_at
+		FROM intake_requests i LEFT JOIN jobs j ON j.job_id=i.job_id
+		ORDER BY i.received_at DESC, i.request_id DESC LIMIT ? OFFSET ?`, limit, offset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("store: list intake requests: %w", err)
 	}
@@ -155,7 +160,8 @@ func (s *Store) IntakeRequestsPage(ctx context.Context, limit, offset int) ([]In
 	for rows.Next() {
 		var item IntakeRequest
 		if err := rows.Scan(&item.RequestID, &item.Endpoint, &item.Kind, &item.Outcome,
-			&item.Reason, &item.HTTPStatus, &item.JobID, &item.ElapsedMS, &item.ReceivedAt); err != nil {
+			&item.FinalStatus, &item.Reason, &item.HTTPStatus, &item.JobID, &item.Error,
+			&item.ErrorCode, &item.ElapsedMS, &item.ReceivedAt); err != nil {
 			return nil, 0, fmt.Errorf("store: scan intake request: %w", err)
 		}
 		result = append(result, item)

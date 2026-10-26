@@ -168,6 +168,34 @@ class ChatCompletionRequest(BaseModel):
     account_id: Optional[str] = None
 
 
+class GeminiVideoRequest(BaseModel):
+    """Small Gemini Veo-compatible request subset.
+
+    The Python adapter translates this shape to the existing Flow video
+    request. The upstream Go transport remains unchanged.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    instances: list[dict[str, Any]] = Field(default_factory=list)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+GEMINI_IMAGE_MODELS = {
+    "nano-banano-2.1": "nano_banano_2.1",
+    "nano-banano-2-lite": "nano_banana_2_lite",
+    "nano-banano-pro": "nano_banana_pro",
+}
+
+GEMINI_VIDEO_MODELS = {
+    "omni-1.1-flash": "omni_1_1_flash",
+    "omni_1_1_flash": "omni_1_1_flash",
+    "veo-3.1-lite": "360p",
+    "veo-3.1-fast": "720p",
+    "veo-3.1-quality": "720p",
+}
+
+
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
@@ -271,6 +299,179 @@ def _prompt_from_messages(messages: list[ChatMessage]) -> str:
             if joined:
                 return joined
     return ""
+
+
+def _gemini_prompt(payload: dict[str, Any]) -> str:
+    """Extract text from the common Gemini contents/parts request shape."""
+    contents = payload.get("contents")
+    if not isinstance(contents, list):
+        raise HTTPException(status_code=400, detail="contents must be a non-empty array")
+    texts: list[str] = []
+    for content in contents:
+        if not isinstance(content, dict):
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                text = part["text"].strip()
+                if text:
+                    texts.append(text)
+    prompt = "\n".join(texts).strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="contents must contain a text part")
+    return prompt
+
+
+def _gemini_reference_data(payload: dict[str, Any]) -> list[dict[str, str]]:
+    """Convert Gemini inline image parts to the Go service reference contract."""
+    references: list[dict[str, str]] = []
+    contents = payload.get("contents")
+    if not isinstance(contents, list):
+        return references
+    for content in contents:
+        if not isinstance(content, dict) or not isinstance(content.get("parts"), list):
+            continue
+        for part in content["parts"]:
+            if not isinstance(part, dict):
+                continue
+            inline = part.get("inlineData")
+            if not isinstance(inline, dict):
+                continue
+            data = inline.get("data")
+            mime_type = inline.get("mimeType")
+            if not isinstance(data, str) or not data.strip():
+                raise HTTPException(status_code=400, detail="inlineData.data must be non-empty base64")
+            if not isinstance(mime_type, str) or not mime_type.startswith("image/"):
+                raise HTTPException(status_code=400, detail="inlineData.mimeType must be an image MIME type")
+            references.append({"base64": data, "mime_type": mime_type, "file_name": "gemini-reference"})
+    return references
+
+
+def _gemini_video_reference(instance: dict[str, Any]) -> list[dict[str, str]]:
+    """Read the official Veo image/referenceImages input shape."""
+    references: list[dict[str, str]] = []
+    image = instance.get("image") if isinstance(instance, dict) else None
+    if isinstance(image, dict):
+        inline = image.get("inlineData")
+        if isinstance(inline, dict):
+            data, mime_type = inline.get("data"), inline.get("mimeType")
+        else:
+            data, mime_type = image.get("bytesBase64Encoded"), image.get("mimeType")
+        # An image URI is handled by the existing ``start_image`` argument;
+        # only inline image bytes need to be forwarded through reference_data.
+        if data is not None or mime_type is not None:
+            if not isinstance(data, str) or not data.strip() or not isinstance(mime_type, str) or not mime_type.startswith("image/"):
+                raise HTTPException(status_code=400, detail="instances[0].image must contain valid image data and mimeType")
+            references.append({"base64": data, "mime_type": mime_type, "file_name": "gemini-video-image"})
+
+    reference_images = instance.get("referenceImages")
+    if reference_images is not None and not isinstance(reference_images, list):
+        raise HTTPException(status_code=400, detail="instances[0].referenceImages must be an array")
+    if len(reference_images or []) > 3:
+        raise HTTPException(status_code=400, detail="instances[0].referenceImages supports at most 3 images")
+    for index, reference in enumerate(reference_images or []):
+        if not isinstance(reference, dict) or reference.get("referenceType") != "asset":
+            raise HTTPException(status_code=400, detail=f"referenceImages[{index}].referenceType must be 'asset'")
+        ref_image = reference.get("image")
+        inline = ref_image.get("inlineData") if isinstance(ref_image, dict) else None
+        if not isinstance(inline, dict):
+            raise HTTPException(status_code=400, detail=f"referenceImages[{index}].image.inlineData is required")
+        data, mime_type = inline.get("data"), inline.get("mimeType")
+        if not isinstance(data, str) or not data.strip() or not isinstance(mime_type, str) or not mime_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail=f"referenceImages[{index}] must contain valid inlineData")
+        references.append({"base64": data, "mime_type": mime_type, "file_name": f"gemini-reference-{index + 1}"})
+    return references
+
+
+def _gemini_aspect(config: dict[str, Any]) -> str:
+    image_config = config.get("imageConfig")
+    ratio = config.get("aspectRatio")
+    if ratio is None and isinstance(image_config, dict):
+        ratio = image_config.get("aspectRatio")
+    ratio = str(ratio or "1:1").strip().lower()
+    return {"square": "1:1", "landscape": "16:9", "portrait": "9:16"}.get(ratio, ratio)
+
+
+def _gemini_image_model(model: str) -> str:
+    try:
+        return GEMINI_IMAGE_MODELS[model.lower()]
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported Gemini image model {model!r}; use one of {sorted(GEMINI_IMAGE_MODELS)}",
+        ) from exc
+
+
+def _gemini_video_model(model: str, duration: str, has_references: bool, has_start_image: bool) -> tuple[str, str]:
+    try:
+        mapped = GEMINI_VIDEO_MODELS[model.lower()]
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported Gemini video model {model!r}; use one of {sorted(GEMINI_VIDEO_MODELS)}",
+        ) from exc
+    # Omni is an explicit Flow video model. Preserve it exactly so Go can send
+    # the requested key instead of replacing it with a duration family.
+    if mapped == "omni_1_1_flash":
+        return mapped, "720p"
+    quality = mapped
+    # The current Go reference-video catalog has no verified 360p variant;
+    # keep reference-image jobs on the catalogued 720p key.
+    if has_references:
+        quality = "720p"
+    seconds = int(duration)
+    if has_references:
+        family = "abra_r2v"
+    elif has_start_image:
+        family = "abra_i2v"
+    else:
+        family = "abra_t2v"
+    return f"{family}_{seconds}s", quality
+
+
+def _gemini_image_response(model: str, result: dict) -> dict:
+    urls = _image_urls(result)
+    if not urls:
+        raise HTTPException(status_code=502, detail=_no_image_detail(result))
+    parts = [
+        {"fileData": {"mimeType": "image/png", "fileUri": url}}
+        for url in urls
+    ]
+    return {
+        "candidates": [{
+            "content": {"role": "model", "parts": parts},
+            "finishReason": "STOP",
+        }],
+        "modelVersion": model,
+        "usageMetadata": {"promptTokenCount": 0, "candidatesTokenCount": 0, "totalTokenCount": 0},
+        "flow": result,
+    }
+
+
+def _gemini_video_operation(model: str, result: dict, operation_name: Optional[str] = None) -> dict:
+    urls = _image_urls(result)
+    if not urls:
+        raise HTTPException(status_code=502, detail="the engine produced no video")
+    generated = [{"video": {"uri": url, "mimeType": "video/mp4"}} for url in urls]
+    return {
+        "name": operation_name or f"operations/flow-{result.get('job_id', int(time.time() * 1000))}",
+        "done": True,
+        "response": {"generateVideoResponse": {"generatedSamples": generated}},
+        "metadata": {"model": model, "flow": result},
+    }
+
+
+def _gemini_operation_name(job_id: str) -> str:
+    return f"operations/flow-{job_id}"
+
+
+def _gemini_job_id(operation_id: str) -> str:
+    prefix = "flow-"
+    if not operation_id.startswith(prefix) or not operation_id[len(prefix):].strip():
+        raise HTTPException(status_code=404, detail="operation not found")
+    return operation_id[len(prefix):]
 
 
 def _completion_body(model: str, markdown: str) -> dict:
@@ -414,6 +615,152 @@ async def openai_chat(
 
     body = _completion_body(payload.model, markdown)
     return _sse(body) if payload.stream else body
+
+
+# --------------------------------------------------------------------------- #
+# Gemini-compatible facade
+# --------------------------------------------------------------------------- #
+
+
+@app.post("/v1beta/models/{model}:generateContent")
+@app.post("/v1/models/{model}:generateContent")
+async def gemini_generate_content(
+    model: str,
+    payload: dict[str, Any],
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+):
+    """Accept the common Gemini image-generation request shape.
+
+    This is deliberately an adapter, not a second upstream implementation.
+    Gemini model names are accepted for client compatibility; Flow's existing
+    image model selection remains in the Go-backed engine.
+    """
+    prompt = _gemini_prompt(payload)
+    internal_model = _gemini_image_model(model)
+    config = payload.get("generationConfig")
+    if not isinstance(config, dict):
+        config = {}
+    count = config.get("candidateCount", 1)
+    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 4:
+        raise HTTPException(status_code=400, detail="generationConfig.candidateCount must be 1..4")
+    try:
+        retry_key = {"idempotency_key": idempotency_key} if idempotency_key else {}
+        reference_data = _gemini_reference_data(payload)
+        reference_kwargs = {"reference_data": reference_data} if reference_data else {}
+        result = await engine.generate_image(
+            prompt=prompt,
+            aspect=_gemini_aspect(config),
+            count=count,
+            model=internal_model,
+            **reference_kwargs,
+            **retry_key,
+        )
+    except EngineError as exc:
+        raise _engine_http_exception(exc) from exc
+    return _gemini_image_response(model, result)
+
+
+@app.post("/v1beta/models/{model}:predictLongRunning")
+@app.post("/v1/models/{model}:predictLongRunning")
+async def gemini_generate_videos(
+    model: str,
+    payload: GeminiVideoRequest,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+):
+    """Submit a Gemini Veo long-running operation without waiting for the video."""
+    instance = payload.instances[0] if payload.instances else {}
+    prompt = instance.get("prompt") if isinstance(instance, dict) else ""
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise HTTPException(status_code=400, detail="instances[0].prompt is required")
+    params = payload.parameters
+    duration = params.get("durationSeconds", "8")
+    if duration not in ("4", "6", "8"):
+        raise HTTPException(status_code=400, detail="parameters.durationSeconds must be one of '4', '6', or '8'")
+    duration_text = f"{duration}s"
+    quality = str(params.get("resolution", "720p"))
+    count = params.get("numberOfVideos", 1)
+    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 4:
+        raise HTTPException(status_code=400, detail="parameters.numberOfVideos must be an integer from 1 to 4")
+    start_image = None
+    image = instance.get("image") if isinstance(instance, dict) else None
+    if isinstance(image, dict):
+        start_image = image.get("uri")
+    reference_data = _gemini_video_reference(instance)
+    internal_model, model_quality = _gemini_video_model(
+        model,
+        duration,
+        has_references=bool(reference_data),
+        has_start_image=bool(start_image),
+    )
+    if model.lower() in {"omni-1.1-flash", "omni_1_1_flash"} and quality in {"360p", "720p"}:
+        model_quality = quality
+    try:
+        retry_key = {"idempotency_key": idempotency_key} if idempotency_key else {}
+        reference_kwargs = {"reference_data": reference_data} if reference_data else {}
+        accepted = await engine.enqueue_service_job(
+            "video",
+            {
+                "prompt": prompt,
+                "aspect": _gemini_aspect(params),
+                "duration": duration_text,
+                "quality": model_quality,
+                "count": count,
+                "model": internal_model,
+                "start_image": start_image,
+                **reference_kwargs,
+            },
+            idempotency_key,
+        )
+    except EngineError as exc:
+        raise _engine_http_exception(exc) from exc
+    job_id = accepted.get("job_id") if isinstance(accepted, dict) else None
+    if not isinstance(job_id, str) or not job_id.strip():
+        raise HTTPException(status_code=502, detail="service returned no job_id")
+    operation_name = _gemini_operation_name(job_id)
+    return {
+        "name": operation_name,
+        "done": False,
+        "metadata": {"model": model, "jobId": job_id},
+    }
+
+
+@app.get("/v1beta/operations/{operation_id}")
+@app.get("/v1/operations/{operation_id}")
+async def gemini_get_operation(operation_id: str):
+    """Poll a Gemini operation backed by a durable Flow service job."""
+    job_id = _gemini_job_id(operation_id)
+    try:
+        status = await engine.get_service_job(job_id)
+    except EngineError as exc:
+        raise _engine_http_exception(exc) from exc
+
+    operation_name = _gemini_operation_name(job_id)
+    model = str(status.get("result", {}).get("model", "")) if isinstance(status.get("result"), dict) else ""
+    if status.get("status") in {"queued", "running", "accepted", "pending"}:
+        return {"name": operation_name, "done": False, "metadata": {"jobId": job_id}}
+    if status.get("status") == "succeeded":
+        result = status.get("result")
+        if not isinstance(result, dict):
+            raise HTTPException(status_code=502, detail="service returned no video result")
+        try:
+            return _gemini_video_operation(model, result, operation_name)
+        except HTTPException:
+            raise
+    if status.get("status") == "partial":
+        result = status.get("result")
+        if isinstance(result, dict):
+            return _gemini_video_operation(model, result, operation_name)
+    if status.get("status") in {"failed", "cancelled", "submission_unknown"}:
+        return {
+            "name": operation_name,
+            "done": True,
+            "error": {
+                "code": status.get("error_code", 502),
+                "message": status.get("error") or f"job ended with status {status.get('status')}",
+                "status": status.get("status"),
+            },
+        }
+    return {"name": operation_name, "done": False, "metadata": {"jobId": job_id}}
 
 
 # --------------------------------------------------------------------------- #

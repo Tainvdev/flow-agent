@@ -125,7 +125,11 @@ func Build(cfg Config) (*App, error) {
 	// to reach into this package's config for both, which is what kept it from
 	// being a module of its own.
 	br := bridge.NewBridge(targets, domains, config.CookieDir())
-	br.ListenAddr = fmt.Sprintf("127.0.0.1:%d", config.WSPort)
+	bridgeListenAddr := strings.TrimSpace(os.Getenv("FLOW_BRIDGE_LISTEN_ADDR"))
+	if bridgeListenAddr == "" {
+		bridgeListenAddr = fmt.Sprintf("127.0.0.1:%d", config.WSPort)
+	}
+	br.ListenAddr = bridgeListenAddr
 
 	eng, err := engine.New(st, br, engine.Options{
 		ProjectID:    cfg.ProjectID,
