@@ -378,9 +378,7 @@ def test_native_video_route(client):
         "quality": "360p",
         "count": 1,
         "start_image": None,
-        "all_accounts": False,
         "cookies": None,
-        "account_id": None,
     }
     # Verify /v1/generate/video alias
     assert client.post("/v1/generate/video", json={"prompt": "x"}).status_code == 200

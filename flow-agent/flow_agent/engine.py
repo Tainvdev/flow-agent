@@ -21,13 +21,15 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
+from .cluster.errors import EngineError
+
 #: How long a generation may take before it is killed. A video render polls for
 #: minutes, so this is generous by design rather than a hang guard.
 DEFAULT_TIMEOUT = 900
 SERVICE_PAYLOAD_VERSION = 1
 
 
-class EngineError(RuntimeError):
+class _LegacyEngineError(RuntimeError):
     """A Flow engine invocation that did not succeed.
 
     Carries the process's own words rather than a paraphrase. The engine's

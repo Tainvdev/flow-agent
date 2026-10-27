@@ -1,5 +1,10 @@
 # Flow Agent MCP Server Guide
 
+> For the supported multi-node deployment, MCP connects to the FastAPI Gateway.
+> Do not configure `FLOW_SERVICE_URL` in the Gateway container. That legacy
+> configuration is only for MCP attached directly to one native Go node; see
+> `docs/MULTI_NODE_OPERATIONS.md` for the production topology.
+
 Complete integration guide for connecting **Flow Agent** to AI assistants (Claude Desktop, Cursor, Antigravity, Zed, Cline) using the **Model Context Protocol (MCP)**.
 
 ---

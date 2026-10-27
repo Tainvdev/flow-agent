@@ -472,7 +472,7 @@ class APICompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["flow"]["job_id"], "compat-image")
         self.engine.generate_image.assert_awaited_once_with(
             prompt="draw a tree", aspect="1:1", count=1, model="narwhal",
-            all_accounts=False, cookies=None, account_id=None,
+            cookies=None,
             idempotency_key="compat-key",
         )
 
@@ -524,7 +524,7 @@ class APICompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((image.status_code, image.json()), (200, image_result))
         self.assertEqual((video.status_code, video.json()), (200, video_result))
         self.assertEqual(self.engine.generate_image.await_args.kwargs["count"], 2)
-        self.assertEqual(self.engine.generate_image.await_args.kwargs["account_id"], "acct-a")
+        self.assertNotIn("account_id", self.engine.generate_image.await_args.kwargs)
         self.assertEqual(self.engine.generate_video.await_args.kwargs["duration"], "6s")
 
     async def test_gemini_generate_content_adapts_to_existing_image_engine(self):

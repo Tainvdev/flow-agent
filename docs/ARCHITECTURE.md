@@ -1,5 +1,11 @@
 # Flow Agent Architecture
 
+> Current deployment: one FastAPI Gateway plus PostgreSQL and N native Go
+> nodes. The Gateway owns global routing, idempotency, node leases and media
+> proxying; each Go node owns its browser/session, SQLite and local media.
+> Sections below that describe `FLOW_SERVICE_URL` or Python subprocess mode are
+> legacy node-local CLI compatibility, not the Gateway container architecture.
+
 Comprehensive system design, component boundaries, and data flow for **Flow Agent**.
 
 ---

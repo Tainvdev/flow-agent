@@ -1206,6 +1206,28 @@ func (s *Store) RecentMedia(limit int) ([]Media, error) {
 	return out, rows.Err()
 }
 
+// MediaByID returns the local metadata for a media id so the Gateway can stream
+// the asset from the node that produced it. The returned path is never exposed
+// to the caller; the node validates and opens it locally.
+func (s *Store) MediaByID(mediaID string) (Media, error) {
+	var media Media
+	var generationID sql.NullInt64
+	err := s.db.QueryRow(`
+		SELECT generation_id, COALESCE(media_id,''), kind, COALESCE(prompt,''),
+		       COALESCE(file_name,''), COALESCE(file_path,''), COALESCE(url,''),
+		       COALESCE(resolution,''), COALESCE(bytes,0)
+		  FROM media WHERE media_id=? ORDER BY id DESC LIMIT 1
+	`, strings.TrimSpace(mediaID)).Scan(&generationID, &media.MediaID, &media.Kind, &media.Prompt,
+		&media.FileName, &media.FilePath, &media.URL, &media.Resolution, &media.Bytes)
+	if err != nil {
+		return Media{}, err
+	}
+	if generationID.Valid {
+		media.GenerationID = &generationID.Int64
+	}
+	return media, nil
+}
+
 /* ------------------------------------------------------------------ *
  * Uploads
  * ------------------------------------------------------------------ */

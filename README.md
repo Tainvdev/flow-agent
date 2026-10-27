@@ -22,6 +22,19 @@
 
 ---
 
+## Current deployment architecture
+
+The supported production architecture is a FastAPI Gateway plus PostgreSQL,
+with one or more native `flow-go service` processes running on separate node
+machines. The Gateway owns global routing, idempotency, node leases and media
+proxying; each node owns Chrome, cookies, SQLite and local media. Start the
+Gateway with [`deploy/gateway/compose.yaml`](deploy/gateway/compose.yaml) and
+configure native nodes using [`docs/MULTI_NODE_OPERATIONS.md`](docs/MULTI_NODE_OPERATIONS.md).
+
+The older single-machine `FLOW_SERVICE_URL` setup below is retained only for
+node-local CLI compatibility and historical reference; it is not the Gateway
+container deployment.
+
 ## What does it do?
 
 Flow Agent is a **local server and CLI** that connects to Google Flow to generate high-quality AI images and videos. You set it up once, and then you can use it three ways:

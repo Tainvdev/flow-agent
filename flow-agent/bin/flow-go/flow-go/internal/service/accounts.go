@@ -216,6 +216,16 @@ func (m *AccountManager) RuntimeLimitStats() map[string]int {
 	return stats
 }
 
+// ClusterLoad exposes the durable queue pressure needed by the Gateway's
+// cross-node router without exposing account credentials or local storage.
+func (m *AccountManager) ClusterLoad() (active, queued int) {
+	stats, err := m.store.JobQueueStats(context.Background())
+	if err != nil {
+		return m.global.Active(), 0
+	}
+	return int(stats.Running), int(stats.Queued)
+}
+
 // Start loads persisted accounts and applies live bridge updates until shutdown.
 func (m *AccountManager) Start(ctx context.Context) {
 	defer m.doneOnce.Do(func() { close(m.done) })
@@ -570,6 +580,28 @@ func (m *AccountManager) ConnectedAccounts() int {
 		}
 	}
 	return connected
+}
+
+// ClusterAccounts returns credential-free account facts for the Gateway
+// registry. Cookies and browser tokens never leave this node.
+func (m *AccountManager) ClusterAccounts() []map[string]any {
+	ids := m.accountIDs()
+	accounts := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		runtime := m.account(id)
+		if runtime == nil {
+			continue
+		}
+		ready := runtime.schedulerWorker != nil && runtime.schedulerWorker.State() != pool.StateCircuitOpen
+		connected := m.bridge.AccountConnected(id)
+		if m.strictCookieFreshness() && !connected {
+			ready = false
+		}
+		accounts = append(accounts, map[string]any{
+			"account_id": id, "status": "active", "ready": ready, "connected": connected,
+		})
+	}
+	return accounts
 }
 
 // CookieSyncAges reports durable snapshot age per registered account, in

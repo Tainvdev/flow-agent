@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flow Gateway Monitor</title>
+  <style>
+    :root{font-family:Inter,Segoe UI,Arial,sans-serif;color:#172033;background:#f5f7fb}
+    *{box-sizing:border-box}body{margin:0}.wrap{max-width:1400px;margin:auto;padding:24px}
+    header{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:20px}
+    h1{font-size:24px;margin:0 0 5px}h2{font-size:15px;margin:0}.muted{color:#697386;font-size:12px}
+    button,input{font:inherit}button{border:1px solid #d8deea;background:#fff;border-radius:7px;padding:8px 11px;cursor:pointer;color:#25304a}button:hover{background:#f0f3f9}button:disabled{opacity:.5;cursor:not-allowed}
+    input{border:1px solid #d8deea;border-radius:7px;padding:8px 10px;min-width:245px;background:#fff}
+    .tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}
+    .card,.panel{background:#fff;border:1px solid #e0e5ee;border-radius:10px}.card{padding:15px}.label{font-size:11px;color:#697386}.value{font-size:25px;font-weight:700;margin-top:8px}
+    .panel{margin-bottom:14px;overflow:hidden}.panel-head{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;border-bottom:1px solid #edf0f5}.panel-body{padding:14px 16px}
+    .table-wrap{overflow:auto}.table{width:100%;border-collapse:collapse;min-width:760px}.table th{text-align:left;background:#fafbfe;color:#697386;font-size:10px;text-transform:uppercase;padding:10px 12px;white-space:nowrap}.table td{border-top:1px solid #edf0f5;padding:10px 12px;font-size:12px;white-space:nowrap}.mono{font-family:Consolas,monospace;font-size:11px}.pill{display:inline-block;padding:4px 8px;border-radius:20px;font-size:10px;font-weight:700;background:#edf0f5}.online,.succeeded,.accepted{background:#e3f7ec;color:#137948}.offline,.failed,.dispatch_unknown{background:#ffebed;color:#b53242}.draining,.queued,.running,.routing,.waiting_children{background:#fff3d8;color:#956400}.link{border:0;padding:0;background:transparent;color:#3159c8;font-family:Consolas,monospace;font-size:11px}.empty{text-align:center;color:#697386;padding:25px;font-size:12px}.error{color:#b53242;white-space:pre-wrap}
+    .drawer{display:none}.drawer.open{display:block;position:fixed;right:20px;bottom:20px;top:20px;width:min(560px,calc(100vw - 40px));background:#fff;border:1px solid #d8deea;border-radius:10px;box-shadow:0 12px 40px #17203333;z-index:3;overflow:auto}.drawer-head{padding:15px;border-bottom:1px solid #edf0f5;display:flex;justify-content:space-between;gap:10px}.drawer pre{margin:15px;white-space:pre-wrap;overflow-wrap:anywhere;background:#f6f8fb;padding:12px;border-radius:7px;font-size:11px}.status{margin:15px;font-size:12px}
+    @media(max-width:800px){.grid{grid-template-columns:repeat(2,1fr)}.wrap{padding:14px}header{align-items:flex-start;flex-direction:column}}
+  </style>
+</head>
+<body>
+<main class="wrap">
+  <header>
+    <div><h1>Flow Gateway Monitor</h1><div class="muted">Dữ liệu trực tiếp từ PostgreSQL control plane và node registry</div></div>
+    <div class="tools"><input id="token" type="password" placeholder="Gateway secret để drain node"><button id="refresh">Refresh</button><span id="updated" class="muted">Chưa tải dữ liệu</span></div>
+  </header>
+  <section class="grid">
+    <div class="card"><div class="label">Node online</div><div id="online" class="value">--</div></div>
+    <div class="card"><div class="label">Node draining/offline</div><div id="unavailable" class="value">--</div></div>
+    <div class="card"><div class="label">Jobs đang chạy/chờ</div><div id="active" class="value">--</div></div>
+    <div class="card"><div class="label">Jobs lỗi</div><div id="failed" class="value">--</div></div>
+  </section>
+  <section class="panel"><div class="panel-head"><div><h2>Nodes</h2><div class="muted">Heartbeat, capacity, account ownership và trạng thái drain</div></div><span id="node-error" class="muted"></span></div><div class="table-wrap"><table class="table"><thead><tr><th>Node</th><th>Status</th><th>Load</th><th>Accounts</th><th>Last heartbeat</th><th>Action</th></tr></thead><tbody id="nodes"><tr><td colspan="6" class="empty">Đang tải...</td></tr></tbody></table></div></section>
+  <section class="panel"><div class="panel-head"><div><h2>Gateway jobs / request log</h2><div class="muted">Các request đã được ghi trong gateway_jobs, không phải dữ liệu giả</div></div><span id="job-error" class="muted"></span></div><div class="table-wrap"><table class="table"><thead><tr><th>Job ID</th><th>Kind</th><th>Status</th><th>Node</th><th>Account</th><th>Attempts</th><th>Events</th><th>Created</th><th>Error</th></tr></thead><tbody id="jobs"><tr><td colspan="9" class="empty">Đang tải...</td></tr></tbody></table></div></section>
+</main>
+<aside id="drawer" class="drawer"><div class="drawer-head"><div><h2 id="drawer-title">Job</h2><div id="drawer-sub" class="muted"></div></div><button id="close">Đóng</button></div><div id="drawer-status" class="status"></div><pre id="drawer-json"></pre></aside>
+<script>
+const $=id=>document.getElementById(id), fmt=v=>v?new Date(v).toLocaleString():'--';
+const esc=v=>String(v??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let latest=null;
+function pill(v){return `<span class="pill ${esc(String(v||'').toLowerCase())}">${esc(v||'--')}</span>`}
+function auth(){const t=$("token").value.trim();return t?{Authorization:`Bearer ${t}`,"Content-Type":"application/json"}:{"Content-Type":"application/json"}}
+async function load(){
+  try{const r=await fetch('/api/v1/monitor?limit=100');if(!r.ok)throw Error(await r.text());latest=await r.json();render(latest);$("updated").textContent='Cập nhật '+new Date().toLocaleTimeString();$("job-error").textContent=''}catch(e){$("job-error").textContent=e.message;$("updated").textContent='Không tải được dữ liệu'}
+}
+function render(d){
+  const nodes=d.nodes||[], jobs=d.jobs||[], counts=d.job_counts||{};
+  const online=nodes.filter(n=>n.status==='online'&&n.healthy).length;
+  $("online").textContent=online;$("unavailable").textContent=nodes.length-online;
+  $("active").textContent=['queued','running','routing','waiting_children','accepted'].reduce((sum,s)=>sum+Number(counts[s]||0),0);
+  $("failed").textContent=Number(counts.failed||0)+Number(counts.dispatch_unknown||0)+Number(counts.partial||0);
+  $("nodes").innerHTML=nodes.length?nodes.map(n=>`<tr><td class="mono">${esc(n.node_id)}<br><span class="muted">${esc(n.advertise_url)}</span></td><td>${pill(n.status)}</td><td>${esc(n.active_jobs)} / ${esc(n.queued_jobs)} / ${esc(n.max_jobs)}</td><td>${esc((n.accounts||[]).length)}</td><td>${fmt(n.last_heartbeat_at)}</td><td><button data-node="${esc(n.node_id)}" data-status="${n.status==='draining'?'online':'draining'}">${n.status==='draining'?'Enable':'Drain'}</button></td></tr>`).join(''):'<tr><td colspan="6" class="empty">Chưa có node đăng ký</td></tr>';
+  document.querySelectorAll('[data-node]').forEach(b=>b.onclick=()=>setNode(b.dataset.node,b.dataset.status));
+  $("jobs").innerHTML=jobs.length?jobs.map(j=>`<tr><td><button class="link" data-job="${esc(j.job_id)}">${esc(j.job_id)}</button></td><td>${esc(j.kind)}</td><td>${pill(j.status)}</td><td class="mono">${esc(j.node_id||'--')}</td><td class="mono">${esc(j.requested_account||'--')}</td><td>${esc(j.attempt_count)}</td><td>${esc(j.event_count)}</td><td>${fmt(j.created_at)}</td><td class="error">${esc(j.error||'')}</td></tr>`).join(''):'<tr><td colspan="9" class="empty">Chưa có job</td></tr>';
+  document.querySelectorAll('[data-job]').forEach(b=>b.onclick=()=>showJob(b.dataset.job));
+}
+async function setNode(id,status){const r=await fetch('/api/v1/nodes/'+encodeURIComponent(id),{method:'PATCH',headers:auth(),body:JSON.stringify({status})});if(!r.ok)$("node-error").textContent=await r.text();else{$("node-error").textContent='';load()}}
+async function showJob(id){$("drawer").classList.add('open');$("drawer-title").textContent='Job detail';$("drawer-sub").textContent=id;$("drawer-status").textContent='Đang tải...';try{const r=await fetch('/api/v1/jobs/'+encodeURIComponent(id));const d=await r.json();$("drawer-status").innerHTML=`Trạng thái: ${pill(d.status)} · node: ${esc(d.node_id||'--')} · attempts: ${esc(d.attempts)}`;$("drawer-json").textContent=JSON.stringify(d,null,2)}catch(e){$("drawer-status").textContent=e.message}}
+$("refresh").onclick=load;$("close").onclick=()=>$("drawer").classList.remove('open');load();setInterval(load,5000);
+</script>
+</body>
+</html>

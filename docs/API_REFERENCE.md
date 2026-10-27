@@ -669,3 +669,10 @@ curl http://127.0.0.1:8001/health
 export OPENAI_BASE_URL="http://127.0.0.1:8001/v1"
 export OPENAI_API_KEY="not-needed"
 ```
+# Deployment note
+
+The supported deployment is now a Gateway plus PostgreSQL control plane, with
+one or more native Go nodes registered through `/internal/router/v1/nodes/*`.
+The old single `FLOW_SERVICE_URL`/shared-output-directory deployment described
+in older sections is legacy and is not used by the Gateway container.
+

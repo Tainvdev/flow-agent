@@ -2,11 +2,14 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -335,6 +338,9 @@ func (a *App) RunService(ctx context.Context, listenAddr, token string, workers 
 	// bounded drain can finish active jobs before stop() cancels their runtime.
 	serviceCtx, stop := context.WithCancel(context.Background())
 	defer stop()
+	if reporter := service.NewNodeReporter(manager, workers); reporter != nil {
+		go reporter.Start(serviceCtx)
+	}
 	var runtimeSettingsMu sync.RWMutex
 	activeSettings := runtimeSettings
 	activeSources := settingSources
@@ -355,6 +361,116 @@ func (a *App) RunService(ctx context.Context, listenAddr, token string, workers 
 	mux := http.NewServeMux()
 	mux.Handle("/internal/v1/jobs", jobs)
 	mux.Handle("/internal/v1/jobs/", jobs)
+	mux.Handle("/internal/v1/node", service.RequireToken(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		nodeID := strings.TrimSpace(os.Getenv("FLOW_NODE_ID"))
+		if nodeID == "" {
+			nodeID, _ = os.Hostname()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"node_id":            nodeID,
+			"ready_accounts":     manager.ReadyAccounts(),
+			"connected_accounts": manager.ConnectedAccounts(),
+			"accounts":           manager.ClusterAccounts(),
+			"status":             "ok",
+		})
+	})))
+	mux.Handle("/internal/v1/uploads", service.RequireToken(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := r.ParseMultipartForm(128 << 20); err != nil {
+			http.Error(w, "invalid multipart upload", http.StatusBadRequest)
+			return
+		}
+		part, header, err := r.FormFile("file")
+		if err != nil {
+			http.Error(w, "file is required", http.StatusBadRequest)
+			return
+		}
+		defer part.Close()
+		ext := filepath.Ext(header.Filename)
+		if ext == "" {
+			ext = ".mp4"
+		}
+		temp, err := os.CreateTemp(config.OutputDir(), "gateway-upload-*"+ext)
+		if err != nil {
+			http.Error(w, "could not create upload staging file", http.StatusInternalServerError)
+			return
+		}
+		tempPath := temp.Name()
+		if _, err = io.Copy(temp, part); err != nil {
+			temp.Close()
+			_ = os.Remove(tempPath)
+			http.Error(w, "could not store upload", http.StatusInternalServerError)
+			return
+		}
+		if err := temp.Close(); err != nil {
+			_ = os.Remove(tempPath)
+			http.Error(w, "could not close upload", http.StatusInternalServerError)
+			return
+		}
+		payload, _ := json.Marshal(map[string]any{"kind": "upload-video", "payload": map[string]any{
+			"file_path": tempPath, "account_id": r.FormValue("account_id"),
+			"force": strings.EqualFold(r.FormValue("force"), "true"),
+		}})
+		upstream := httptest.NewRequest(http.MethodPost, "/internal/v1/jobs", bytes.NewReader(payload))
+		upstream.Header.Set("Content-Type", "application/json")
+		upstream.Header.Set("Authorization", r.Header.Get("Authorization"))
+		upstream.Header.Set("Idempotency-Key", r.Header.Get("Idempotency-Key"))
+		jobs.ServeHTTP(w, upstream)
+	})))
+	mux.Handle("/internal/v1/media/", service.RequireToken(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mediaID := strings.TrimPrefix(r.URL.Path, "/internal/v1/media/")
+		if mediaID == "" || strings.Contains(mediaID, "/") || strings.Contains(mediaID, "\\") {
+			http.Error(w, "invalid media id", http.StatusBadRequest)
+			return
+		}
+		media, err := a.Store.MediaByID(mediaID)
+		if err != nil {
+			http.Error(w, "media not found", http.StatusNotFound)
+			return
+		}
+		path, err := filepath.Abs(media.FilePath)
+		if err != nil {
+			http.Error(w, "invalid media path", http.StatusInternalServerError)
+			return
+		}
+		root, err := filepath.Abs(config.OutputDir())
+		if err != nil {
+			http.Error(w, "invalid output directory", http.StatusInternalServerError)
+			return
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			http.Error(w, "media path is outside output directory", http.StatusForbidden)
+			return
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			http.Error(w, "media file unavailable", http.StatusNotFound)
+			return
+		}
+		defer file.Close()
+		info, err := file.Stat()
+		if err != nil || info.IsDir() {
+			http.Error(w, "media file unavailable", http.StatusNotFound)
+			return
+		}
+		contentType := "application/octet-stream"
+		if strings.HasSuffix(strings.ToLower(media.FileName), ".mp4") {
+			contentType = "video/mp4"
+		} else if strings.HasSuffix(strings.ToLower(media.FileName), ".jpg") || strings.HasSuffix(strings.ToLower(media.FileName), ".jpeg") {
+			contentType = "image/jpeg"
+		}
+		w.Header().Set("Content-Type", contentType)
+		http.ServeContent(w, r, media.FileName, info.ModTime(), file)
+	})))
 	mux.Handle("/internal/v1/settings", service.RequireToken(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeSettings := func() {
 			runtimeSettingsMu.RLock()

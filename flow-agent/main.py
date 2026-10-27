@@ -12,9 +12,17 @@ import asyncio
 import json
 import sys
 
-from flow_agent import EngineError, FlowEngine
+from flow_agent.cluster.errors import EngineError
 
-engine = FlowEngine()
+engine = None
+
+
+def _engine():
+    global engine
+    if engine is None:
+        from flow_agent import FlowEngine
+        engine = FlowEngine()
+    return engine
 
 
 def _print(value) -> None:
@@ -29,7 +37,7 @@ def _run_async(coro):
         try:
             return await coro
         finally:
-            await engine.aclose()
+            await _engine().aclose()
 
     return asyncio.run(managed())
 
@@ -64,7 +72,7 @@ def cmd_mcp(args) -> int:
 def cmd_image(args) -> int:
     _print(
         _run_async(
-            engine.generate_image(
+            _engine().generate_image(
                 prompt=args.prompt,
                 aspect=args.aspect,
                 count=args.count,
@@ -80,7 +88,7 @@ def cmd_image(args) -> int:
 def cmd_video(args) -> int:
     _print(
         _run_async(
-            engine.generate_video(
+            _engine().generate_video(
                 prompt=args.prompt,
                 aspect=args.aspect,
                 duration=args.duration,
@@ -96,17 +104,17 @@ def cmd_video(args) -> int:
 
 
 def cmd_balance(args) -> int:
-    _print(_run_async(engine.get_balance(refresh=args.refresh)))
+    _print(_run_async(_engine().get_balance(refresh=args.refresh)))
     return 0
 
 
 def cmd_stats(args) -> int:
-    _print(_run_async(engine.get_stats()))
+    _print(_run_async(_engine().get_stats()))
     return 0
 
 
 def cmd_projects(args) -> int:
-    _print(_run_async(engine.get_projects(cookies=args.cookies)))
+    _print(_run_async(_engine().get_projects(cookies=args.cookies)))
     return 0
 
 

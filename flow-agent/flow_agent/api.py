@@ -10,27 +10,49 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import json
+import os
+import hmac
 import re
-import sqlite3
+import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Literal, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from .engine import EngineError, FlowEngine
+from .cluster.errors import EngineError
+from .cluster.db import ControlPlane
+from .cluster.gateway_engine import GatewayEngine
+from .cluster.registry import NodeRegistry
 
-engine = FlowEngine()
+control_plane = ControlPlane()
+engine = GatewayEngine(control_plane)
+node_registry: NodeRegistry | None = None
+
+
+def _gateway_token_valid(request: Request) -> bool:
+    expected = os.getenv("FLOW_GATEWAY_SECRET", "").strip()
+    supplied = request.headers.get("Authorization", "")
+    if not expected or not supplied.startswith("Bearer "):
+        return False
+    return hmac.compare_digest(supplied[7:].strip(), expected)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    global node_registry
+    if os.getenv("DATABASE_URL", "").strip():
+        await control_plane.initialize()
+        node_registry = engine.registry
     try:
         yield
     finally:
+        node_registry = None
+        await control_plane.close()
         close = getattr(engine, "aclose", None)
         if close is not None:
             await close()
@@ -51,6 +73,81 @@ app.add_middleware(
 )
 
 
+def _require_router(request: Request) -> NodeRegistry:
+    if not _gateway_token_valid(request):
+        raise HTTPException(status_code=401, detail="invalid gateway credential")
+    if node_registry is None:
+        raise HTTPException(status_code=503, detail="control plane is unavailable")
+    return node_registry
+
+
+@app.post("/internal/router/v1/nodes/register")
+async def register_node(request: Request):
+    registry = _require_router(request)
+    payload = await request.json()
+    try:
+        node = await registry.register(payload)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "node_id": node.node_id,
+        "status": node.status,
+        "lease_expires_at": node.lease_expires_at,
+    }
+
+
+@app.put("/internal/router/v1/nodes/{node_id}/heartbeat")
+async def heartbeat_node(node_id: str, request: Request):
+    registry = _require_router(request)
+    payload = await request.json()
+    try:
+        node = await registry.heartbeat(node_id, payload)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "node_id": node.node_id,
+        "status": node.status,
+        "lease_expires_at": node.lease_expires_at,
+    }
+
+
+@app.get("/api/v1/nodes")
+async def list_nodes(request: Request):
+    registry = _require_router(request)
+    await registry.mark_stale()
+    nodes = await registry.all()
+    return {
+        "nodes": [
+            {
+                "node_id": node.node_id,
+                "advertise_url": node.advertise_url,
+                "status": node.status if node.healthy else "offline",
+                "max_jobs": node.max_jobs,
+                "active_jobs": node.active_jobs,
+                "queued_jobs": node.queued_jobs,
+                "accounts": list(node.accounts.values()),
+                "last_heartbeat_at": node.last_heartbeat_at,
+                "lease_expires_at": node.lease_expires_at,
+            }
+            for node in nodes
+        ]
+    }
+
+
+@app.patch("/api/v1/nodes/{node_id}")
+async def update_node_status(node_id: str, request: Request):
+    """Drain or re-enable a node without interrupting its running jobs."""
+    registry = _require_router(request)
+    payload = await request.json()
+    try:
+        node = await registry.set_status(node_id, str(payload.get("status", "")).strip())
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if node is None:
+        raise HTTPException(status_code=404, detail="node not found")
+    return {"node_id": node.node_id, "status": node.status, "healthy": node.healthy}
+
+
 # OpenAI's image sizes, and the aspect each one means.
 #
 # The pairs are not invented here: OpenAI's three sizes are 1:1, 3:2 and 2:3, and
@@ -69,24 +166,9 @@ SIZE_TO_ASPECT = {
     "portrait": "9:16",
 }
 
-MEDIA_DIR = engine.output_dir
 BASE_DIR = Path(__file__).resolve().parent
+MEDIA_DIR = Path(os.getenv("FLOW_OUTPUT_DIR", str(BASE_DIR / "output"))).resolve()
 IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-
-def _database_connection() -> sqlite3.Connection:
-    """Open the configured database read-only for the operator dashboard."""
-    connect = getattr(engine, "_connect", None)
-    if connect is not None:
-        return connect()
-    db_path = Path(getattr(engine, "db_path", ""))
-    return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
-
-
-def _json_value(value: Any) -> Any:
-    if isinstance(value, bytes):
-        return {"type": "bytes", "hex": value.hex()}
-    return value
 
 
 # --------------------------------------------------------------------------- #
@@ -110,9 +192,7 @@ class ImageGenerationRequest(BaseModel):
     size: str = "1024x1024"
     response_format: str = "url"
     # Flow-specific, ignored by OpenAI clients.
-    all_accounts: bool = False
     cookies: Optional[str] = None
-    account_id: Optional[str] = None
 
 
 class FlowImageRequest(BaseModel):
@@ -120,9 +200,7 @@ class FlowImageRequest(BaseModel):
     aspect: str = "1:1"
     count: int = Field(default=1, ge=1, le=4)
     model: str = "narwhal"
-    all_accounts: bool = False
     cookies: Optional[str] = None
-    account_id: Optional[str] = None
 
 
 class FlowVideoRequest(BaseModel):
@@ -132,9 +210,7 @@ class FlowVideoRequest(BaseModel):
     quality: str = "720p"
     count: int = Field(default=1, ge=1, le=4)
     start_image: Optional[str] = None
-    all_accounts: bool = False
     cookies: Optional[str] = None
-    account_id: Optional[str] = None
 
 
 class AsyncJobRequest(BaseModel):
@@ -163,9 +239,7 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     # Flow-specific.
     size: str = "1024x1024"
-    all_accounts: bool = False
     cookies: Optional[str] = None
-    account_id: Optional[str] = None
 
 
 class GeminiVideoRequest(BaseModel):
@@ -247,7 +321,7 @@ def _engine_http_exception(exc: EngineError) -> HTTPException:
     )
 
 
-def _image_urls(result: dict) -> list[str]:
+def _image_urls(result: dict, base_url: str = "") -> list[str]:
     """Extract signed Flow image URLs without reading image bytes."""
     urls: list[str] = []
     for item in result.get("media") or []:
@@ -257,7 +331,7 @@ def _image_urls(result: dict) -> list[str]:
             url = item.get("url") or item.get("signed_url") or item.get("download_url")
         else:
             url = None
-        if isinstance(url, str) and url.strip():
+        if isinstance(url, str) and url.strip() and (url.startswith(("http://", "https://", "/")) or not result.get("files")):
             urls.append(url)
 
     # Keep the flat URL view as a fallback for service/CLI results produced by
@@ -268,14 +342,42 @@ def _image_urls(result: dict) -> list[str]:
             if isinstance(url, str) and url.strip():
                 urls.append(url)
 
+    # Compatibility only: legacy local-engine results carried file paths.
+    # Gateway jobs normally return `media` URLs and never enter this branch.
+    if not urls:
+        for item in result.get("files") or []:
+            path = item.get("path") if isinstance(item, dict) else item
+            if isinstance(path, str) and path.strip():
+                url = "/api/v1/media/" + Path(path).name
+                urls.append(base_url.rstrip("/") + url if base_url else url)
+
     return urls
 
 
-def _image_payload(result: dict) -> dict:
+def _image_payload(result: dict, response_format: str = "url", base_url: str = "") -> dict:
     """Turn an engine result into the OpenAI images response."""
     # Image generation keeps Flow's signed URL. The Go engine deliberately does
     # not download image bytes or create local media files.
-    data = [{"url": url} for url in _image_urls(result)]
+    if response_format == "b64_json":
+        data = []
+        for item in result.get("files") or []:
+            path = item.get("path") if isinstance(item, dict) else item
+            if not isinstance(path, str):
+                continue
+            try:
+                import base64
+                encoded = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+            except (OSError, ValueError):
+                continue
+            data.append({"b64_json": encoded})
+        if not data:
+            data = []
+    else:
+        data = []
+        for url in _image_urls(result, base_url):
+            if url.startswith("/") and base_url:
+                url = base_url.rstrip("/") + url
+            data.append({"url": url})
 
     return {"created": int(time.time()), "data": data, "flow": result}
 
@@ -561,15 +663,13 @@ async def openai_images(
             aspect=aspect,
             count=payload.n,
             model=payload.model,
-            all_accounts=payload.all_accounts,
             cookies=payload.cookies,
-            account_id=payload.account_id,
             **retry_key,
         )
     except EngineError as exc:
         raise _engine_http_exception(exc) from exc
 
-    payload_out = _image_payload(result)
+    payload_out = _image_payload(result, payload.response_format, str(request.base_url))
     # A run that produced nothing is not a success. Returning 200 with an empty
     # `data` would tell an OpenAI client the request worked and there simply
     # were no images, which is the opposite of what happened.
@@ -596,15 +696,13 @@ async def openai_chat(
         result = await engine.generate_image(
             prompt=prompt,
             aspect=aspect,
-            all_accounts=payload.all_accounts,
             cookies=payload.cookies,
-            account_id=payload.account_id,
             **retry_key,
         )
     except EngineError as exc:
         raise _engine_http_exception(exc) from exc
 
-    image_urls = _image_urls(result)
+    image_urls = _image_urls(result, str(request.base_url))
     if not image_urls:
         markdown = _no_image_detail(result)
     else:
@@ -770,62 +868,14 @@ async def gemini_get_operation(operation_id: str):
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
+    dashboard_path = BASE_DIR / "dashboard.html"
+    if not dashboard_path.is_file():
+        dashboard_path = BASE_DIR.parent / "dashboard.html"
     return FileResponse(
-        BASE_DIR / "dashboard.html",
+        dashboard_path,
         media_type="text/html",
         headers={"Cache-Control": "no-store"},
     )
-
-
-@app.get("/api/v1/db/tables")
-async def database_tables():
-    """List SQLite tables and row counts without exposing write access."""
-    try:
-        with _database_connection() as conn:
-            tables = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
-            ).fetchall()
-            result = []
-            for (name,) in tables:
-                quoted = '"' + name.replace('"', '""') + '"'
-                count = conn.execute(f"SELECT COUNT(*) FROM {quoted}").fetchone()[0]
-                result.append({"name": name, "count": count})
-        return {"database": str(getattr(engine, "db_path", "")), "tables": result}
-    except (sqlite3.Error, OSError) as exc:
-        raise HTTPException(status_code=503, detail=f"database unavailable: {exc}") from exc
-
-
-@app.get("/api/v1/db/tables/{table_name}")
-async def database_table(table_name: str, page: int = 0, page_size: int = 50, q: str = ""):
-    """Read one SQLite table with bounded pagination and optional text filter."""
-    if not IDENTIFIER.fullmatch(table_name):
-        raise HTTPException(status_code=400, detail="invalid table name")
-    if page < 0 or not 1 <= page_size <= 200:
-        raise HTTPException(status_code=400, detail="page must be >= 0 and page_size must be 1..200")
-    quoted = '"' + table_name.replace('"', '""') + '"'
-    try:
-        with _database_connection() as conn:
-            exists = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table_name,)
-            ).fetchone()
-            if not exists:
-                raise HTTPException(status_code=404, detail="table not found")
-            info = conn.execute(f"PRAGMA table_info({quoted})").fetchall()
-            columns = [row[1] for row in info]
-            where, args = "", []
-            if q.strip() and columns:
-                safe_columns = [f'"{c.replace(chr(34), chr(34) * 2)}"' for c in columns]
-                where = " WHERE " + " OR ".join(f"CAST({c} AS TEXT) LIKE ?" for c in safe_columns)
-                args = [f"%{q}%"] * len(columns)
-            total = conn.execute(f"SELECT COUNT(*) FROM {quoted}{where}", args).fetchone()[0]
-            order = " ORDER BY rowid DESC" if any(row[5] for row in info) else ""
-            rows = conn.execute(f"SELECT * FROM {quoted}{where}{order} LIMIT ? OFFSET ?", [*args, page_size, page * page_size]).fetchall()
-            return {"database": str(getattr(engine, "db_path", "")), "table": table_name, "columns": columns, "rows": [[_json_value(v) for v in row] for row in rows], "page": page, "page_size": page_size, "total": total}
-    except HTTPException:
-        raise
-    except (sqlite3.Error, OSError) as exc:
-        raise HTTPException(status_code=503, detail=f"database unavailable: {exc}") from exc
 
 
 @app.post("/api/v1/jobs")
@@ -863,6 +913,35 @@ async def create_async_job(
     )
 
 
+@app.post("/api/v1/uploads")
+@app.post("/v1/uploads")
+async def upload_video_file(
+    file: UploadFile = File(...),
+    force: bool = Form(default=False),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+):
+    """Stage a client upload briefly, then stream it to the selected Go node."""
+    suffix = Path(file.filename or "upload.mp4").suffix or ".mp4"
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(prefix="gateway-upload-", suffix=suffix, delete=False) as staged:
+            temp_path = staged.name
+            shutil.copyfileobj(file.file, staged)
+        return await engine.upload_video(
+            temp_path, force=force,
+            idempotency_key=idempotency_key,
+        )
+    except EngineError as exc:
+        raise _engine_http_exception(exc) from exc
+    finally:
+        await file.close()
+        if temp_path:
+            try:
+                Path(temp_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 @app.get("/api/v1/jobs/{job_id}")
 async def get_async_job(job_id: str):
     try:
@@ -876,6 +955,16 @@ async def stream_async_job_events(
     job_id: str,
     last_event_id: Optional[str] = Header(default=None, alias="Last-Event-ID"),
 ):
+    if isinstance(engine, GatewayEngine):
+        try:
+            stream = engine.stream_service_job_events(job_id, last_event_id)
+        except EngineError as exc:
+            raise _engine_http_exception(exc) from exc
+        return StreamingResponse(
+            stream,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
     try:
         upstream = await engine.open_service_job_events(job_id, last_event_id)
     except EngineError as exc:
@@ -919,9 +1008,7 @@ async def flow_image(
             aspect=payload.aspect,
             count=payload.count,
             model=payload.model,
-            all_accounts=payload.all_accounts,
             cookies=payload.cookies,
-            account_id=payload.account_id,
             **retry_key,
         )
     except EngineError as exc:
@@ -945,9 +1032,7 @@ async def flow_video(
             quality=payload.quality,
             count=payload.count,
             start_image=payload.start_image,
-            all_accounts=payload.all_accounts,
             cookies=payload.cookies,
-            account_id=payload.account_id,
             **retry_key,
         )
     except EngineError as exc:
@@ -1022,25 +1107,45 @@ async def update_runtime_settings(request: RuntimeSettingsRequest):
 
 @app.get("/v1/projects")
 @app.get("/api/v1/projects")
-async def flow_projects(cookies: Optional[str] = None, account_id: Optional[str] = None):
+async def flow_projects(cookies: Optional[str] = None):
     try:
-        return {"projects": await engine.get_projects(cookies=cookies, account_id=account_id)}
+        return {"projects": await engine.get_projects(cookies=cookies)}
     except EngineError as exc:
         raise _engine_http_exception(exc) from exc
 
 
 @app.get("/v1/media/{filename:path}")
 @app.get("/api/v1/media/{filename:path}")
-async def flow_media(filename: str):
-    """Serve one generated file.
+async def flow_media(filename: str, request: Request):
+    """Proxy media from the node that owns it; Gateway has no shared disk."""
+    if not isinstance(engine, GatewayEngine):
+        candidate = (MEDIA_DIR / filename).resolve()
+        if candidate.parent != MEDIA_DIR.resolve() or not candidate.is_file():
+            raise HTTPException(status_code=404, detail="no such media file")
+        return FileResponse(candidate)
+    try:
+        proxy_headers = {}
+        for header in ("range", "if-range", "if-none-match"):
+            value = request.headers.get(header)
+            if value:
+                proxy_headers[header.title()] = value
+        upstream, metadata = await engine.open_media(filename, proxy_headers)
+    except EngineError as exc:
+        raise _engine_http_exception(exc) from exc
 
-    The name is resolved against the output directory and rejected if it escapes
-    it: this route takes a path from a URL, and `..` in one is the whole attack.
-    """
-    candidate = (MEDIA_DIR / filename).resolve()
-    if candidate.parent != MEDIA_DIR.resolve() or not candidate.is_file():
-        raise HTTPException(status_code=404, detail="no such media file")
-    return FileResponse(candidate)
+    async def stream():
+        try:
+            async for chunk in upstream.aiter_bytes():
+                yield chunk
+        finally:
+            await upstream.aclose()
+
+    headers = {"Cache-Control": "private, max-age=3600", "X-Accel-Buffering": "no"}
+    if metadata.get("file_name"):
+        headers["Content-Disposition"] = f'inline; filename="{metadata["file_name"]}"'
+    if metadata.get("content_type"):
+        headers["Content-Type"] = metadata["content_type"]
+    return StreamingResponse(stream(), headers=headers)
 
 
 @app.get("/health")
@@ -1052,12 +1157,11 @@ async def health():
     else:
         available = getattr(engine, "service_available", None)
         engine_available = await available() if available is not None else bool(engine.available())
-    service_url = getattr(engine, "service_url", "")
+    mode = getattr(engine, "engine_mode", "gateway")
     body = {
         "status": "ok",
         "engine": engine_available,
-        "mode": "service" if service_url else "subprocess",
-        "binary": str(engine.binary),
+        "mode": mode,
     }
     for key in ("ready_accounts", "connected_accounts", "strict_cookie_freshness"):
         if key in details:
